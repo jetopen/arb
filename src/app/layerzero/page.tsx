@@ -55,6 +55,29 @@ function tokenLiquidity(t: LzOftToken, liq: Record<string, number | null>): numb
   return sum;
 }
 
+/**
+ * Liquidity status for the "Has liquidity" filter: "has" (some loaded chain > 0), "none" (all
+ * loaded chains are 0), or "unknown" (nothing loaded yet). The filter hides only "none" so that
+ * not-yet-loaded tokens stay visible while the background warm-up fills them in.
+ */
+function tokenLiqState(
+  t: LzOftToken,
+  liq: Record<string, number | null>
+): "has" | "none" | "unknown" {
+  let loadedAny = false;
+  for (const d of t.deployments) {
+    const k = itemKey(d);
+    // A key is only absent until it's been fetched. GeckoTerminal returns `null` for "no pool"
+    // (not 0), so a present-but-null value means "checked, no liquidity" — NOT unknown.
+    if (!(k in liq)) continue;
+    loadedAny = true;
+    const v = liq[k];
+    if (typeof v === "number" && v > 0) return "has";
+  }
+  // Some chains checked, none had liquidity → "none"; nothing checked yet → "unknown".
+  return loadedAny ? "none" : "unknown";
+}
+
 interface OpenDetail {
   token: LzOftToken;
   ctx: LzDetailContext;
@@ -93,6 +116,51 @@ export default function LayerZeroPage() {
     );
   }, [allTokens]);
 
+  // Liquidity (and the liquidity sort/filter) need data for ALL tokens, but cards only load it
+  // lazily as they scroll into view. When the user opts into a liquidity sort/filter, warm the
+  // full liquidity map in the background (batched; the route is server-cached) so the filter and
+  // sort become globally accurate instead of reflecting only the handful of scrolled cards.
+  const wantLiquidity = filters.hasLiquidityOnly || filters.sort === "liquidity";
+  const liqWarmRef = useRef<Set<string>>(new Set());
+  const [liqWarming, setLiqWarming] = useState(false);
+  useEffect(() => {
+    if (!wantLiquidity || allTokens.length === 0) return;
+    const pending: string[] = [];
+    for (const t of allTokens) {
+      for (const d of t.deployments) {
+        const k = itemKey(d);
+        if (!liqWarmRef.current.has(k)) pending.push(k);
+      }
+    }
+    if (pending.length === 0) return;
+    let cancelled = false;
+    setLiqWarming(true);
+    (async () => {
+      try {
+        for (let i = 0; i < pending.length && !cancelled; i += 50) {
+          const batch = pending.slice(i, i + 50);
+          try {
+            const res = await fetch(`/api/lz/liquidity?items=${encodeURIComponent(batch.join(","))}`);
+            if (res.ok) {
+              const data = (await res.json()) as Record<string, number | null>;
+              if (cancelled) return;
+              onLiquidity(data);
+              for (const k of batch) liqWarmRef.current.add(k);
+            }
+          } catch {
+            /* best-effort warm-up; ignore a failed batch */
+          }
+        }
+      } finally {
+        if (!cancelled) setLiqWarming(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      setLiqWarming(false);
+    };
+  }, [wantLiquidity, allTokens, onLiquidity]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const list = allTokens.filter((t) => {
@@ -110,7 +178,7 @@ export default function LayerZeroPage() {
       if (filters.chain && !t.deployments.some((d) => d.chainKey === filters.chain)) return false;
       if (filters.evmOnly && !hasEvm(t)) return false;
       if (!matchEndpoint(t, filters.endpoint)) return false;
-      if (filters.hasLiquidityOnly && tokenLiquidity(t, liqMap) <= 0) return false;
+      if (filters.hasLiquidityOnly && tokenLiqState(t, liqMap) === "none") return false;
       return true;
     });
 
@@ -225,6 +293,11 @@ export default function LayerZeroPage() {
           className="w-full rounded-md border border-border bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30"
         />
         <FilterBar value={filters} onChange={setFilters} chains={chainOptions} />
+        {liqWarming && (
+          <p className="text-xs text-muted">
+            Loading liquidity across all chains to refine the liquidity filter &amp; sort…
+          </p>
+        )}
       </div>
 
       {error ? (
