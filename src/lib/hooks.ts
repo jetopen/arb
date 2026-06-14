@@ -198,6 +198,21 @@ export type LzCexResponse = Record<string, Record<string, unknown> | null>;
 export type LzLogosResponse = Record<string, string | null>;
 
 /**
+ * The /api/lz/price route returns a metrics object per item
+ * (`{ priceUsd, liquidityUsd, volumeH24Usd, fdvUsd } | null`); the UI only needs the spot
+ * price, so flatten each entry to its `priceUsd` number (null when missing/non-numeric).
+ */
+const priceFetcher = async (url: string): Promise<LzPriceResponse | null> => {
+  const raw = await softFetcher<Record<string, { priceUsd?: number | null } | null>>(url);
+  if (!raw) return null;
+  const out: LzPriceResponse = {};
+  for (const [k, v] of Object.entries(raw)) {
+    out[k] = v && typeof v.priceUsd === "number" ? v.priceUsd : null;
+  }
+  return out;
+};
+
+/**
  * Batched per-token spot price; each item keyed as `${chainKey}:${tradeAddress}`.
  * Graceful: a missing route or failure resolves to `null` data, treated as "no price".
  */
@@ -205,7 +220,7 @@ export function useLzPrice(items: string[]) {
   const key = items.length
     ? `/api/lz/price?items=${encodeURIComponent(items.join(","))}`
     : null;
-  return useSWR<LzPriceResponse | null>(key, softFetcher, {
+  return useSWR<LzPriceResponse | null>(key, priceFetcher, {
     revalidateOnFocus: false,
     dedupingInterval: 300_000,
   });
