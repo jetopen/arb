@@ -85,13 +85,21 @@ export function cexFlagsFor(
   if (!cex) return [];
   const entry = cex[symbol] ?? cex[symbol.toUpperCase()] ?? cex[symbol.toLowerCase()];
   if (!entry || typeof entry !== "object") return [];
+  const e = entry as Record<string, unknown>;
+  // Actual route shape: { listedOn: string[], prices: { gate?, mexc?, bitget? } }.
+  const listedOn = Array.isArray(e.listedOn) ? (e.listedOn as unknown[]).map(String) : [];
+  const prices =
+    e.prices && typeof e.prices === "object" ? (e.prices as Record<string, unknown>) : {};
   const out: { key: string; label: string }[] = [];
   for (const v of CEX_VENUES) {
-    const raw = (entry as Record<string, unknown>)[v.key];
-    // truthy boolean, a URL string, or an object marks a listing.
-    if (raw === true || (typeof raw === "string" && raw.length > 0) || (raw && typeof raw === "object")) {
-      out.push(v);
-    }
+    const top = e[v.key]; // tolerant: also accept a top-level flag/value
+    const listed =
+      listedOn.includes(v.key) ||
+      prices[v.key] != null ||
+      top === true ||
+      (typeof top === "string" && top.length > 0) ||
+      (!!top && typeof top === "object");
+    if (listed) out.push(v);
   }
   return out;
 }
