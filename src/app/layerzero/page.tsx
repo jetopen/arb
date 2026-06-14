@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLzOfts } from "@/lib/hooks";
 import type { LzOftToken } from "@/lib/layerzero/types";
 import { StatsHeader, type LzStats } from "@/components/lz/stats";
@@ -14,7 +14,7 @@ import { TokenCard, itemKey } from "@/components/lz/token-card";
 import { TokenDetail, type LzDetailContext } from "@/components/lz/token-detail";
 import { ExportButton, type LzExportRow } from "@/components/lz/export-button";
 
-const MAX_CARDS = 48;
+const STEP = 24; // tokens revealed per batch (progressive infinite scroll)
 
 /** True when the token's deployments include an EVM chain. */
 function hasEvm(t: LzOftToken): boolean {
@@ -125,7 +125,36 @@ export default function LayerZeroPage() {
     });
   }, [allTokens, search, filters, liqMap]);
 
-  const shown = filtered.slice(0, MAX_CARDS);
+  // Progressive reveal: render a growing slice; the bottom sentinel reveals the next batch as
+  // you scroll, so all matching tokens are browsable. Enrichment (liquidity/price/CEX/logo) stays
+  // in-view-gated per card, so showing everything never fires more than the on-screen cards' calls.
+  const [visibleCount, setVisibleCount] = useState(STEP);
+  // Reset to the first batch whenever the result set changes (new search / filter / sort).
+  useEffect(() => {
+    setVisibleCount(STEP);
+  }, [search, filters]);
+
+  const shown = filtered.slice(0, visibleCount);
+  const hasMore = visibleCount < filtered.length;
+
+  // Auto-reveal the next batch when the sentinel scrolls near the viewport.
+  const hasMoreRef = useRef(hasMore);
+  hasMoreRef.current = hasMore;
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting) && hasMoreRef.current) {
+          setVisibleCount((c) => c + STEP);
+        }
+      },
+      { rootMargin: "600px" }
+    );
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [filtered.length]);
 
   // Stats over the shown tokens.
   const stats = useMemo<LzStats>(() => {
@@ -217,10 +246,21 @@ export default function LayerZeroPage() {
               />
             ))}
           </div>
-          {filtered.length > shown.length && (
-            <div className="text-xs text-muted">
-              Showing {shown.length} of {filtered.length} — search or filter to narrow.
+          {hasMore ? (
+            <div ref={sentinelRef} className="flex justify-center py-3">
+              <button
+                onClick={() => setVisibleCount((c) => c + STEP)}
+                className="rounded-md border border-border px-4 py-2 text-sm text-muted hover:bg-muted/50"
+              >
+                Load more — showing {shown.length} of {filtered.length}
+              </button>
             </div>
+          ) : (
+            filtered.length > 0 && (
+              <div className="py-3 text-center text-xs text-muted">
+                All {filtered.length} tokens shown
+              </div>
+            )
           )}
         </>
       )}
