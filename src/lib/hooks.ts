@@ -175,6 +175,64 @@ export function useLzLiquidity(items: string[]) {
   });
 }
 
+/**
+ * Tolerant fetcher for the optional price/cex/logo endpoints. These routes live on sibling
+ * branches not yet merged here, so they 404 at runtime — return null instead of throwing so the
+ * UI degrades gracefully (column/badge/logo simply omitted) rather than surfacing an error.
+ */
+const softFetcher = async <T>(url: string): Promise<T | null> => {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+};
+
+/** Map of `${chainKey}:${tradeAddress}` -> USD price (null when unknown). */
+export type LzPriceResponse = Record<string, number | null>;
+/** Per-symbol CEX listing flags; tolerant of either booleans or truthy values per venue. */
+export type LzCexResponse = Record<string, Record<string, unknown> | null>;
+/** Map of `${chainKey}:${tradeAddress}` (or symbol) -> logo URL (null when unknown). */
+export type LzLogosResponse = Record<string, string | null>;
+
+/**
+ * Batched per-token spot price; each item keyed as `${chainKey}:${tradeAddress}`.
+ * Graceful: a missing route or failure resolves to `null` data, treated as "no price".
+ */
+export function useLzPrice(items: string[]) {
+  const key = items.length
+    ? `/api/lz/price?items=${encodeURIComponent(items.join(","))}`
+    : null;
+  return useSWR<LzPriceResponse | null>(key, softFetcher, {
+    revalidateOnFocus: false,
+    dedupingInterval: 300_000,
+  });
+}
+
+/** Batched per-symbol CEX listing badges. Graceful: failure resolves to "no data". */
+export function useLzCex(symbols: string[]) {
+  const key = symbols.length
+    ? `/api/lz/cex?symbols=${encodeURIComponent(symbols.join(","))}`
+    : null;
+  return useSWR<LzCexResponse | null>(key, softFetcher, {
+    revalidateOnFocus: false,
+    dedupingInterval: 600_000,
+  });
+}
+
+/** Batched token logos keyed as `${chainKey}:${tradeAddress}` or by symbol. Graceful on failure. */
+export function useLzLogos(items: string[]) {
+  const key = items.length
+    ? `/api/lz/logo?items=${encodeURIComponent(items.join(","))}`
+    : null;
+  return useSWR<LzLogosResponse | null>(key, softFetcher, {
+    revalidateOnFocus: false,
+    dedupingInterval: 600_000,
+  });
+}
+
 // --- Symbiosis Octopool scanner ---
 import type { SymOpportunity } from "./symbiosis/types";
 
