@@ -10,6 +10,7 @@ import {
 } from "../onchain/debridge-gate";
 import { isEvmDeportChain, EVM_DEPORT_CHAINS } from "./registry";
 import { getTokenListForChain } from "../api-client";
+import { deriveFamiliesFromEvents, mergeEventReps, type DerivedEvents } from "./events-graph";
 
 export interface TokenMeta {
   symbol?: string;
@@ -210,9 +211,24 @@ export async function buildLockGraph(
     })
   );
 
-  // ---- PASS 4: assemble (pure) ----
+  // ---- PASS 4: assemble on-chain EVM families (pure) ----
+  const onChain = assembleFamilies(raw, metaByKey);
+
+  // ---- PASS 5: merge the event-sourced, chain-complete family set (non-EVM reps + token-list-omitted
+  // families) from the persisted dePort submission-log index. Best-effort: the event index is optional,
+  // so a failure or empty index leaves the on-chain graph unchanged. ----
+  let derived: DerivedEvents = { repsByDebridgeId: new Map(), families: [] };
+  try {
+    derived = await deriveFamiliesFromEvents();
+  } catch {
+    // Event-index derive failed (e.g. arb_derive_families hit its statement timeout under backfill load).
+    // This silently drops EVERY non-EVM/Solana family from coverage, so flag the build as partial instead
+    // of letting the UI report full coverage — the exact silent-drop migration 0005 was written to avoid.
+    partial = true;
+  }
+
   return {
-    families: assembleFamilies(raw, metaByKey),
+    families: mergeEventReps(onChain, derived),
     builtAt: Date.now(),
     chainsScanned,
     partial,

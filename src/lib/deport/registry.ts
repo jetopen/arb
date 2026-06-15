@@ -13,6 +13,8 @@
  * The registry is keyed by `internalId` because that is the value the deBridge surfaces speak.
  */
 
+import { getChainName } from "../chains";
+
 export interface DeportChain {
   /** deBridge internal chain id — what the HTTP APIs and getNativeInfo use. */
   internalId: number;
@@ -78,9 +80,10 @@ export function deBridgeGate(internalId: number): string {
   return byInternalId.get(internalId)?.gate ?? DEFAULT_GATE;
 }
 
-/** Human-readable chain name for a deBridge internal chain id. */
+/** Human-readable chain name for a deBridge internal chain id. Falls back to the broader chains.ts
+ *  registry (covers non-EVM display chains like Solana) before the generic "Chain <id>". */
 export function chainName(internalId: number): string {
-  return byInternalId.get(internalId)?.name ?? `Chain ${internalId}`;
+  return byInternalId.get(internalId)?.name ?? getChainName(internalId);
 }
 
 /**
