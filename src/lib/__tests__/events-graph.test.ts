@@ -65,4 +65,33 @@ describe("mergeEventReps", () => {
     expect(merged).toHaveLength(1);
     expect(merged[0].debridgeId).toBe("0xNEW");
   });
+
+  it("restores native metadata when an on-chain family has NO native-root rep (home chain unscanned)", () => {
+    // Forward-expansion built this family from deAsset reps only (home chain failed discovery), so its
+    // header symbol fell back to the deAsset "deUSDT". The event family carries the real native "USDT".
+    const onChain: Family[] = [
+      { debridgeId: "0xT", nativeChainId: 1, nativeAddress: "0xnative", symbol: "deUSDT", decimals: 18, nativeOnHomeChain: true,
+        reps: [{ internalChainId: 56, address: "0xdeasset", isNativeRoot: false, symbol: "deUSDT", decimals: 18 }] },
+    ];
+    const derived: DerivedEvents = {
+      repsByDebridgeId: new Map(),
+      families: [{ debridgeId: "0xT", nativeChainId: 1, nativeAddress: "0xnative", symbol: "USDT", name: "Tether USD", decimals: 18, nativeOnHomeChain: true, reps: [] }],
+    };
+    const merged = mergeEventReps(onChain, derived);
+    expect(merged[0].symbol).toBe("USDT"); // restored from the event family's native metadata
+    expect(merged[0].name).toBe("Tether USD");
+  });
+
+  it("does NOT override on-chain native metadata when a native-root rep IS present", () => {
+    const onChain: Family[] = [
+      { debridgeId: "0xT", nativeChainId: 56, nativeAddress: "0xbnb", symbol: "USDT", decimals: 18, nativeOnHomeChain: true,
+        reps: [{ internalChainId: 56, address: "0xbnb", isNativeRoot: true, symbol: "USDT", decimals: 18 }] },
+    ];
+    const derived: DerivedEvents = {
+      repsByDebridgeId: new Map(),
+      families: [fam("0xT", [{ internalChainId: 56, address: "0xbnb", isNativeRoot: true, symbol: "EVENT-WRONG" }])],
+    };
+    const merged = mergeEventReps(onChain, derived);
+    expect(merged[0].symbol).toBe("USDT"); // on-chain native metadata stays authoritative
+  });
 });

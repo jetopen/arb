@@ -109,8 +109,20 @@ export function mergeEventReps(onChain: Family[], derived: DerivedEvents): Famil
   const byId = new Map<string, Family>(
     onChain.map((f) => [f.debridgeId.toLowerCase(), { ...f, reps: [...f.reps] }])
   );
+  const evFamById = new Map(derived.families.map((f) => [f.debridgeId.toLowerCase(), f]));
   // Augment known families with any event reps they lack (e.g. a Solana leg of an EVM-native family).
   for (const [id, fam] of byId) {
+    // Restore native-token metadata when on-chain assembly couldn't resolve the native root. This happens
+    // for an event-only family that was forward-expanded (PASS 2) only on its deAsset chains because its
+    // HOME chain's discovery scan failed — assembleFamilies then took symbol/name/decimals from a deAsset
+    // rep (e.g. "deUSDT") instead of the native token. The event family carries the real native metadata.
+    // Checked BEFORE the rep augment below adds the native-root rep, so the "no native root" test is valid.
+    const ev = evFamById.get(id);
+    if (ev && !fam.reps.some((r) => r.isNativeRoot)) {
+      fam.symbol = ev.symbol ?? fam.symbol;
+      fam.name = ev.name ?? fam.name;
+      fam.decimals = ev.decimals ?? fam.decimals;
+    }
     const evReps = derived.repsByDebridgeId.get(id);
     if (!evReps) continue;
     const have = new Set(fam.reps.map((r) => `${r.internalChainId}:${r.address.toLowerCase()}`));

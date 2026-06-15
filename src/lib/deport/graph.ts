@@ -134,12 +134,52 @@ export function fillMeta(
 }
 
 /**
- * Build the lock-graph live in four passes:
- *  1. DISCOVERY  — per-chain token-list -> multicall getNativeInfo -> the family universe (debridgeIds).
- *  2. FORWARD    — for each discovered chain, multicall getDebridge(debridgeId) over that universe to
- *                  find EVERY deployed rep, including the (majority) that no token-list carries.
- *  3. META FILL  — read decimals()/symbol() on-chain for forward-found reps absent from token-lists.
- *  4. ASSEMBLE   — group the merged reps by debridgeId (pure).
+ * PURE: the debridgeId universe to forward-expand (getDebridge) over every scanned chain. Built from the
+ * token-list-discovered reps PLUS event-derived families, so families no token-list carried still get their
+ * on-chain EVM reps resolved — including RECEIVE-ONLY chains, whose deAsset address the submission log never
+ * carries (getEvents only records the SOURCE-chain token). Only EVM-native event families can be added: a
+ * non-hex (non-EVM, e.g. Solana base58) native address can't seed computeDebridgeId, so it is skipped — those
+ * families keep the event-merge path (PASS 5), which preserves their canonical native leg. Deduped by
+ * debridgeId (first writer wins; for EVM the discovered and event native addresses are byte-identical
+ * lowercase hex, so the ordering is immaterial — the isEvmDeportChain filter, not the dedup order, is what
+ * keeps non-EVM native legs out).
+ */
+export function forwardUniverse(discovered: RawDeAsset[], eventFamilies: Family[]): FamilyKey[] {
+  const keys = new Map<string, FamilyKey>();
+  const add = (nativeChainId: number, nativeAddress: string) => {
+    try {
+      const id = computeDebridgeId(nativeChainId, nativeAddress as Hex);
+      const k = id.toLowerCase();
+      if (!keys.has(k)) keys.set(k, { debridgeId: id, nativeChainId, nativeAddress });
+    } catch {
+      /* DEFENSE (not the filter): a malformed native address shouldn't reach here, but if one ever does,
+         skip that single family rather than aborting the whole graph build — matching the best-effort,
+         flag-partial posture of every other pass. The isEvmDeportChain check below is the real guard. */
+    }
+  };
+  // Discovered reps always carry a raw-hex native address (from getNativeInfo) — add them all.
+  for (const r of discovered) add(r.nativeChainId, r.nativeAddress);
+  // Event families: ONLY EVM-native ones. Their canonical native address IS raw hex (computeDebridgeId can
+  // anchor it and the assemble regroup stays correct). A non-EVM native (Solana base58, etc.) would corrupt
+  // both anchoring and the native leg, so it is left to the event-merge path (PASS 5), which preserves the
+  // canonical native address. NB computeDebridgeId does NOT throw on a base58 string — it silently hashes it
+  // wrong — so this MUST be an explicit chain-kind check; the try/catch above is resilience, not a filter.
+  for (const f of eventFamilies) {
+    if (isEvmDeportChain(f.nativeChainId)) add(f.nativeChainId, f.nativeAddress);
+  }
+  return [...keys.values()];
+}
+
+/**
+ * Build the lock-graph live:
+ *  1. DISCOVERY   — per-chain token-list -> multicall getNativeInfo -> the family universe (debridgeIds).
+ *  -  EVENT SEED  — derive the event-sourced family set; its EVM-native families WIDEN the universe so
+ *                   families no token-list carried still get forward-expanded.
+ *  2. FORWARD     — for each scanned chain, multicall getDebridge(debridgeId) over that (widened) universe
+ *                   to find EVERY deployed rep, including the (majority) that no token-list carries.
+ *  3. META FILL   — read decimals()/symbol() on-chain for forward-found reps absent from token-lists.
+ *  4. ASSEMBLE    — group the merged reps by debridgeId (pure).
+ *  5. EVENT MERGE — overlay event-sourced reps on-chain enumeration can't reach (chiefly non-EVM/Solana).
  * Chains are scanned concurrently per pass, so wall-time ≈ the slowest single chain, not the sum.
  */
 export async function buildLockGraph(
@@ -163,15 +203,21 @@ export async function buildLockGraph(
     chainsScanned.push(s.internalChainId);
   }
 
-  // The family universe: one FamilyKey per distinct debridgeId (lock origin).
-  const familyKeys = new Map<string, FamilyKey>();
-  for (const r of discovered) {
-    const id = computeDebridgeId(r.nativeChainId, r.nativeAddress as Hex);
-    if (!familyKeys.has(id)) {
-      familyKeys.set(id, { debridgeId: id, nativeChainId: r.nativeChainId, nativeAddress: r.nativeAddress });
-    }
+  // ---- EVENT SEED: derive the event-sourced family set up front (best-effort). Used both to WIDEN the
+  // forward-pass universe (below) with families no token-list carried, and to merge non-EVM reps after
+  // assembly (PASS 5). A failure (e.g. the derive RPC timing out) drops non-EVM/Solana coverage, so flag
+  // the build partial — the exact silent-drop migration 0005 was written to avoid. ----
+  let derived: DerivedEvents = { repsByDebridgeId: new Map(), families: [] };
+  try {
+    derived = await deriveFamiliesFromEvents();
+  } catch {
+    partial = true;
   }
-  const families = [...familyKeys.values()];
+
+  // The family universe to forward-expand: discovered debridgeIds PLUS EVM-native event-only families
+  // (forwardUniverse skips non-EVM natives). getDebridge then resolves their on-chain EVM reps, including
+  // the receive-only chains the submission log can't carry a deAsset address for.
+  const families = forwardUniverse(discovered, derived.families);
 
   // ---- PASS 2: forward expansion (only over chains discovery succeeded on) ----
   const forwardByChain = await Promise.all(
@@ -214,19 +260,9 @@ export async function buildLockGraph(
   // ---- PASS 4: assemble on-chain EVM families (pure) ----
   const onChain = assembleFamilies(raw, metaByKey);
 
-  // ---- PASS 5: merge the event-sourced, chain-complete family set (non-EVM reps + token-list-omitted
-  // families) from the persisted dePort submission-log index. Best-effort: the event index is optional,
-  // so a failure or empty index leaves the on-chain graph unchanged. ----
-  let derived: DerivedEvents = { repsByDebridgeId: new Map(), families: [] };
-  try {
-    derived = await deriveFamiliesFromEvents();
-  } catch {
-    // Event-index derive failed (e.g. arb_derive_families hit its statement timeout under backfill load).
-    // This silently drops EVERY non-EVM/Solana family from coverage, so flag the build as partial instead
-    // of letting the UI report full coverage — the exact silent-drop migration 0005 was written to avoid.
-    partial = true;
-  }
-
+  // ---- PASS 5: merge the event-sourced reps onto the assembled on-chain graph. The event set was derived
+  // up front (and seeded the forward pass); here it overlays the reps on-chain enumeration can't reach —
+  // chiefly non-EVM/Solana reps, plus the native metadata of event-only families. ----
   return {
     families: mergeEventReps(onChain, derived),
     builtAt: Date.now(),
