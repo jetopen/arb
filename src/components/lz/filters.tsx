@@ -21,7 +21,9 @@ export const DEFAULT_LZ_FILTERS: LzFilterState = {
   hasLiquidityOnly: false,
   evmOnly: false,
   endpoint: "all",
-  sort: "liquidity",
+  // Default to a deterministic sort: "liquidity" depends on lazily-loaded data, so it would
+  // reshuffle as values stream in and would warm the full liquidity map on every page load.
+  sort: "chains",
 };
 
 export interface ChainOption {

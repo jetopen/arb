@@ -14,6 +14,7 @@ import { TokenCard, itemKey } from "@/components/lz/token-card";
 import { TokenDetail, type LzDetailContext } from "@/components/lz/token-detail";
 import { CardGridSkeleton } from "@/components/ui/skeleton";
 import { ExportButton, type LzExportRow } from "@/components/lz/export-button";
+import { lzGtSlug } from "@/lib/layerzero/chains";
 
 const STEP = 24; // tokens revealed per batch (progressive infinite scroll)
 
@@ -46,6 +47,29 @@ function mergeMap(
   return changed ? next : prev;
 }
 
+/**
+ * Like mergeMap, but UPGRADE-ONLY for liquidity: never overwrite a known positive value with
+ * null. A throttled/failed refetch returns null (indistinguishable from "no pool"), and the
+ * warm-up re-requests keys the in-view cards already resolved — without this guard a 429 on that
+ * refetch would clobber a real number and wrongly drop the token from the "Has liquidity" filter.
+ */
+function mergeLiquidity(
+  prev: Record<string, number | null>,
+  partial: Record<string, number | null>
+): Record<string, number | null> {
+  let changed = false;
+  const next = { ...prev };
+  for (const [k, v] of Object.entries(partial)) {
+    const cur = next[k];
+    if (typeof cur === "number" && cur > 0 && v == null) continue; // keep the known-good value
+    if (cur !== v) {
+      next[k] = v;
+      changed = true;
+    }
+  }
+  return changed ? next : prev;
+}
+
 /** Sum of known (loaded) liquidity for a token, from the accumulated liquidity map. */
 function tokenLiquidity(t: LzOftToken, liq: Record<string, number | null>): number {
   let sum = 0;
@@ -54,6 +78,32 @@ function tokenLiquidity(t: LzOftToken, liq: Record<string, number | null>): numb
     if (typeof v === "number") sum += v;
   }
   return sum;
+}
+
+/**
+ * Liquidity status for the "Has liquidity" filter: "has" (some loaded chain > 0), "none" (all
+ * loaded chains are 0), or "unknown" (nothing loaded yet). The filter hides only "none" so that
+ * not-yet-loaded tokens stay visible while the background warm-up fills them in.
+ */
+function tokenLiqState(
+  t: LzOftToken,
+  liq: Record<string, number | null>
+): "has" | "none" | "unknown" {
+  let checkableLoaded = false;
+  for (const d of t.deployments) {
+    // Chains with no GeckoTerminal slug can't be queried, so a null there means "can't know",
+    // NOT "no liquidity" — skip them, or a token only on un-queryable chains is wrongly "none".
+    if (!lzGtSlug(d.chainKey)) continue;
+    const k = itemKey(d);
+    // A queryable key is absent only until it's been fetched. GeckoTerminal returns `null` for
+    // "no pool" (not 0), so a present-but-null value means "checked, no liquidity" — NOT unknown.
+    if (!(k in liq)) continue;
+    checkableLoaded = true;
+    const v = liq[k];
+    if (typeof v === "number" && v > 0) return "has";
+  }
+  // Every queryable chain came back empty → "none"; nothing queryable was loaded → "unknown".
+  return checkableLoaded ? "none" : "unknown";
 }
 
 interface OpenDetail {
@@ -73,7 +123,7 @@ export default function LayerZeroPage() {
   const [priceMap, setPriceMap] = useState<Record<string, number | null>>({});
 
   const onLiquidity = useCallback((partial: Record<string, number | null>) => {
-    setLiqMap((prev) => mergeMap(prev, partial));
+    setLiqMap((prev) => mergeLiquidity(prev, partial));
   }, []);
   const onPrice = useCallback((partial: Record<string, number | null>) => {
     setPriceMap((prev) => mergeMap(prev, partial));
@@ -94,6 +144,56 @@ export default function LayerZeroPage() {
     );
   }, [allTokens]);
 
+  // Liquidity (and the liquidity sort/filter) need data for ALL tokens, but cards only load it
+  // lazily as they scroll into view. When the user opts into a liquidity sort/filter, warm the
+  // full liquidity map in the background (batched; the route is server-cached) so the filter and
+  // sort become globally accurate instead of reflecting only the handful of scrolled cards.
+  const wantLiquidity = filters.hasLiquidityOnly || filters.sort === "liquidity";
+  const liqWarmRef = useRef<Set<string>>(new Set());
+  const [liqWarming, setLiqWarming] = useState(false);
+  useEffect(() => {
+    if (!wantLiquidity || allTokens.length === 0) return;
+    const pending: string[] = [];
+    for (const t of allTokens) {
+      for (const d of t.deployments) {
+        // Only warm chains we can actually query; un-queryable chains stay "unknown" anyway.
+        if (!lzGtSlug(d.chainKey)) continue;
+        const k = itemKey(d);
+        if (!liqWarmRef.current.has(k)) pending.push(k);
+      }
+    }
+    if (pending.length === 0) return;
+    let cancelled = false;
+    setLiqWarming(true);
+    // 50-item batches drained by a few concurrent workers so the filter/sort converge quickly
+    // instead of serializing dozens of round-trips.
+    const batches: string[][] = [];
+    for (let i = 0; i < pending.length; i += 50) batches.push(pending.slice(i, i + 50));
+    let cursor = 0;
+    const worker = async () => {
+      while (!cancelled && cursor < batches.length) {
+        const batch = batches[cursor++];
+        try {
+          const res = await fetch(`/api/lz/liquidity?items=${encodeURIComponent(batch.join(","))}`);
+          if (!res.ok) continue;
+          const data = (await res.json()) as Record<string, number | null>;
+          if (cancelled) return;
+          onLiquidity(data);
+          for (const k of batch) liqWarmRef.current.add(k);
+        } catch {
+          /* best-effort warm-up; ignore a failed batch */
+        }
+      }
+    };
+    Promise.all(Array.from({ length: Math.min(3, batches.length) }, worker)).finally(() => {
+      if (!cancelled) setLiqWarming(false);
+    });
+    return () => {
+      cancelled = true;
+      setLiqWarming(false);
+    };
+  }, [wantLiquidity, allTokens, onLiquidity]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const list = allTokens.filter((t) => {
@@ -111,7 +211,7 @@ export default function LayerZeroPage() {
       if (filters.chain && !t.deployments.some((d) => d.chainKey === filters.chain)) return false;
       if (filters.evmOnly && !hasEvm(t)) return false;
       if (!matchEndpoint(t, filters.endpoint)) return false;
-      if (filters.hasLiquidityOnly && tokenLiquidity(t, liqMap) <= 0) return false;
+      if (filters.hasLiquidityOnly && tokenLiqState(t, liqMap) === "none") return false;
       return true;
     });
 
@@ -226,6 +326,11 @@ export default function LayerZeroPage() {
           className="w-full rounded-md border border-border bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30"
         />
         <FilterBar value={filters} onChange={setFilters} chains={chainOptions} />
+        {liqWarming && (
+          <p className="text-xs text-muted">
+            Loading liquidity across all chains to refine the liquidity filter &amp; sort…
+          </p>
+        )}
       </div>
 
       {error ? (
@@ -237,9 +342,9 @@ export default function LayerZeroPage() {
       ) : (
         <>
           <div className="grid gap-4 md:grid-cols-2">
-            {shown.map((t, i) => (
+            {shown.map((t) => (
               <TokenCard
-                key={`${t.symbol}-${i}`}
+                key={`${t.symbol}-${t.endpointVersion}-${t.deployments[0]?.address ?? ""}`}
                 token={t}
                 onLiquidity={onLiquidity}
                 onPrice={onPrice}
