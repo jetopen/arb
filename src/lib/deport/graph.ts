@@ -199,7 +199,11 @@ export async function buildLockGraph(
   await Promise.all(
     [...missingByChain].map(async ([cid, addrs]) => {
       try {
-        fillMeta(metaByKey, cid, await enumerateErc20Meta(cid, [...addrs]));
+        const { meta, ok } = await enumerateErc20Meta(cid, [...addrs]);
+        fillMeta(metaByKey, cid, meta);
+        // A transport-level metadata failure (fix #7) means some reps' decimals never resolved and
+        // get silently dropped from scanning — surface that as partial instead of claiming full coverage.
+        if (!ok) partial = true;
       } catch {
         partial = true; // best-effort; reps without resolvable decimals are excluded from scanning
       }

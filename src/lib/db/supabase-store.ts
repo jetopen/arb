@@ -147,13 +147,16 @@ export class SupabaseStore implements Store {
   }
 
   async requeueFresh(ids: string[]): Promise<void> {
-    // Null out lastScannedAt so the time-ordered dequeue (nulls first) scans these next — used to
-    // surface the proven-productive routes immediately on re-seed instead of after a full backlog pass.
+    // Warm-start priority only (fix #1/#2): bump proven routes to the proven-priority marker so the
+    // time-ordered dequeue (last_scanned_at, then priority desc) prefers them among equally-stale peers.
+    // Deliberately does NOT reset last_scanned_at — nulling it would shove the whole proven set to the
+    // front (`nulls first`) and starve never-scanned routes. And does NOT touch leased_until — clearing
+    // a lease would release units a concurrent /api/arb/scan is mid-processing → double-processing.
     for (let i = 0; i < ids.length; i += 500) {
       const slice = ids.slice(i, i + 500);
       const { error } = await this.db
         .from("arb_work_queue")
-        .update({ last_scanned_at: null, leased_until: null })
+        .update({ priority: 1 })
         .in("id", slice);
       if (error) throw new Error(`requeueFresh: ${error.message}`);
     }
@@ -162,7 +165,14 @@ export class SupabaseStore implements Store {
   async knownUnitIds(): Promise<Set<string>> {
     // Routes that have ever produced a quote (have an opportunity row) — the realized-quotability set
     // used to warm-start priority. Bounded select; the productive set is small relative to the queue.
-    const { data, error } = await this.db.from("arb_opportunities").select("id").limit(5000);
+    // Order by computed_at desc (fix #6): without an explicit order the 5000-row cap truncates an
+    // arbitrary slice once the table grows past it (and diverges run-to-run / from MemoryStore).
+    // Ordering keeps the freshest rows; the Set de-dupes (ids are PK-unique, but be defensive).
+    const { data, error } = await this.db
+      .from("arb_opportunities")
+      .select("id")
+      .order("computed_at", { ascending: false })
+      .limit(5000);
     if (error) throw new Error(`knownUnitIds: ${error.message}`);
     return new Set((data ?? []).map((r: any) => r.id as string));
   }

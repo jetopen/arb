@@ -138,7 +138,7 @@ describe("enumerateDebridgeReps (forward getDebridge)", () => {
 });
 
 describe("enumerateErc20Meta", () => {
-  it("decodes interleaved decimals/symbol, leaves a failed read undefined, keys by lowercased address", async () => {
+  it("decodes interleaved decimals/symbol, leaves a failed read undefined, keys by lowercased address; ok stays true on a per-call revert", async () => {
     // contracts are [a0.decimals, a0.symbol, a1.decimals, a1.symbol]; fail a1's decimals (index 2).
     __setPublicClient(56, {
       multicall: async ({ contracts }: { contracts: Array<{ functionName: string }> }) =>
@@ -148,11 +148,28 @@ describe("enumerateErc20Meta", () => {
         }),
     } as unknown as PublicClient);
 
-    const m = await enumerateErc20Meta(56, [
+    const { meta, ok } = await enumerateErc20Meta(56, [
       "0xAAA0000000000000000000000000000000000001",
       "0xBBB0000000000000000000000000000000000002",
     ]);
-    expect(m.get("0xaaa0000000000000000000000000000000000001")).toEqual({ decimals: 18, symbol: "SYM" });
-    expect(m.get("0xbbb0000000000000000000000000000000000002")).toEqual({ decimals: undefined, symbol: "SYM" });
+    expect(meta.get("0xaaa0000000000000000000000000000000000001")).toEqual({ decimals: 18, symbol: "SYM" });
+    expect(meta.get("0xbbb0000000000000000000000000000000000002")).toEqual({ decimals: undefined, symbol: "SYM" });
+    // A per-call revert (allowFailure) is NOT a transport failure — coverage is still complete.
+    expect(ok).toBe(true);
+  });
+
+  it("reports ok:false when even a floor-sized multicall chunk throws (transport failure → graph goes partial)", async () => {
+    // Always-throwing transport: the halving ladder bottoms out at the floor and reports not-ok,
+    // surfacing that some reps' decimals never resolved (instead of silently claiming full coverage).
+    __setPublicClient(56, {
+      multicall: async () => {
+        throw new Error("rpc down");
+      },
+    } as unknown as PublicClient);
+
+    const { meta, ok } = await enumerateErc20Meta(56, ["0xAAA0000000000000000000000000000000000001"]);
+    expect(ok).toBe(false);
+    // Still address-keyed with undefined fields (never throws), so callers can degrade gracefully.
+    expect(meta.get("0xaaa0000000000000000000000000000000000001")).toEqual({ decimals: undefined, symbol: undefined });
   });
 });

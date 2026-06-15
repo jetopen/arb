@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { MemoryStore } from "../db/store";
+import { MemoryStore, parsePenaltyMs, DEAD_ROUTE_PENALTY_MS } from "../db/store";
 import type { Opportunity, ScanUnit } from "../types";
 
 function opp(id: string, netEdgePct: number, over: Partial<Opportunity> = {}): Opportunity {
@@ -139,12 +139,37 @@ describe("MemoryStore adaptive demotion + realized quotability", () => {
     expect((await s.dequeue(1))[0].debridgeId).toBe("proven"); // proven cycles, deadx is in the future
   });
 
-  it("requeueFresh moves a route to the front of the time-ordered queue", async () => {
+  it("requeueFresh bumps priority so a proven route wins the tie-break among equally-stale peers", async () => {
     const s = new MemoryStore();
     await s.enqueue([u("a"), u("b")]);
-    await s.dequeue(2); // both get lastScannedAt = now
-    await s.requeueFresh(["b:1:56:1000:redemption"]); // b reset to null → sorts first
-    expect((await s.dequeue(1))[0].debridgeId).toBe("b");
+    await s.dequeue(2); // both get the SAME lastScannedAt = now
+    await s.requeueFresh(["b:1:56:1000:redemption"]); // b → priority 1; a stays 0
+    expect((await s.dequeue(1))[0].debridgeId).toBe("b"); // equal staleness, higher priority wins
+  });
+
+  it("requeueFresh does NOT reset lastScannedAt — proven routes can't starve a never-scanned route (fix #2)", async () => {
+    const s = new MemoryStore();
+    await s.enqueue([u("proven")]);
+    await s.dequeue(1); // proven scanned: lastScannedAt = now
+    await s.enqueue([u("fresh")]); // a newly-discovered, never-scanned route (lastScannedAt = null)
+    await s.requeueFresh(["proven:1:56:1000:redemption"]); // warm-start the proven route
+    // The never-scanned route still sorts first (null < now); the warm-start must NOT have jumped
+    // the proven route ahead of it by nulling its timestamp.
+    expect((await s.dequeue(1))[0].debridgeId).toBe("fresh");
+  });
+
+  it("dequeue freshness gate holds the penalty even when the live set is smaller than the batch (fix #3)", async () => {
+    const s = new MemoryStore();
+    await s.enqueue([u("live"), u("dead")]);
+    await s.dequeue(2);
+    await s.markScanned([
+      { unit: u("live"), live: true },
+      { unit: u("dead"), live: false }, // demoted to now + 6h
+    ]);
+    // Ask for a batch BIGGER than the eligible set: the demoted route must NOT be re-dequeued to fill
+    // it. Only "live" (and not "dead", which is in the future) comes back.
+    const batch = await s.dequeue(5);
+    expect(batch.map((b) => b.debridgeId)).toEqual(["live"]);
   });
 
   it("knownUnitIds returns the ids of routes that have produced a quote", async () => {
@@ -154,6 +179,25 @@ describe("MemoryStore adaptive demotion + realized quotability", () => {
     const known = await s.knownUnitIds();
     expect(known.has("0xabc:1:56:1000:redemption")).toBe(true);
     expect(known.size).toBe(1);
+  });
+});
+
+describe("DEAD_ROUTE_PENALTY_MS env parsing (fix #5)", () => {
+  it("falls back to the default for a non-numeric / empty / negative override (never NaN)", () => {
+    const DEFAULT = 6 * 60 * 60 * 1000;
+    expect(parsePenaltyMs(undefined, DEFAULT)).toBe(DEFAULT); // unset
+    expect(parsePenaltyMs("6h", DEFAULT)).toBe(DEFAULT); // non-numeric -> would be NaN -> RangeError
+    expect(parsePenaltyMs("abc", DEFAULT)).toBe(DEFAULT);
+    expect(parsePenaltyMs("-1000", DEFAULT)).toBe(DEFAULT); // negative rejected
+    expect(parsePenaltyMs("", DEFAULT)).toBe(0); // empty string parses to 0 (preserves prior semantics)
+    expect(parsePenaltyMs("1800000", DEFAULT)).toBe(1_800_000); // valid override honored
+  });
+
+  it("the exported constant is always a finite, non-negative number", () => {
+    expect(Number.isFinite(DEAD_ROUTE_PENALTY_MS)).toBe(true);
+    expect(DEAD_ROUTE_PENALTY_MS).toBeGreaterThanOrEqual(0);
+    // The whole point: new Date(now + penalty).toISOString() must never throw RangeError.
+    expect(() => new Date(Date.now() + DEAD_ROUTE_PENALTY_MS).toISOString()).not.toThrow();
   });
 });
 

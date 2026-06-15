@@ -226,11 +226,15 @@ export async function enumerateDebridgeReps(
  * On-chain ERC20 metadata for addresses no token-list covers (forward-found reps). Address-keyed
  * (lowercased); a token whose decimals()/symbol() reverts yields the field as undefined rather than
  * throwing. decimals is what matters — the scanner needs it to confirm a family's 1:1 raw move is safe.
+ *
+ * Returns `{ meta, ok }` (fix #7): `ok` is false when even a floor-sized chunk could not be fetched
+ * (a TRANSPORT failure, not a per-token revert). Surfacing it lets the graph mark itself `partial`
+ * instead of silently dropping reps whose decimals never resolved while claiming full coverage.
  */
 export async function enumerateErc20Meta(
   internalChainId: number,
   addresses: string[]
-): Promise<Map<string, { symbol?: string; decimals?: number }>> {
+): Promise<{ meta: Map<string, { symbol?: string; decimals?: number }>; ok: boolean }> {
   const client = getPublicClient(internalChainId);
   const uniq = [...new Set(addresses.map((a) => a.toLowerCase()))];
   // 2 contracts per address (decimals, symbol); laddering over contracts keeps the count exact.
@@ -238,18 +242,18 @@ export async function enumerateErc20Meta(
     { address: addr as Address, abi: ERC20_META_ABI, functionName: "decimals" as const },
     { address: addr as Address, abi: ERC20_META_ABI, functionName: "symbol" as const },
   ]);
-  const { results } = await chunkedMulticall(client, contracts);
+  const { results, ok } = await chunkedMulticall(client, contracts);
 
-  const out = new Map<string, { symbol?: string; decimals?: number }>();
+  const meta = new Map<string, { symbol?: string; decimals?: number }>();
   uniq.forEach((addr, k) => {
     const dec = results[k * 2];
     const sym = results[k * 2 + 1];
-    out.set(addr, {
+    meta.set(addr, {
       decimals: dec?.status === "success" ? Number(dec.result) : undefined,
       symbol: sym?.status === "success" ? String(sym.result) : undefined,
     });
   });
-  return out;
+  return { meta, ok };
 }
 
 /** Live flat redemption fee (native wei) for an asset on a chain; throws on RPC failure (caller falls back). */
