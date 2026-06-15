@@ -56,9 +56,32 @@ describe("enumerateUnits", () => {
     expect(units).toHaveLength(2); // 1 rep × 1 probe size × 2 directions
   });
 
-  it("skips families whose home chain is not quotable", () => {
-    const solanaHome = fam({ nativeChainId: 7565164, nativeOnHomeChain: false });
-    expect(enumerateUnits(graphOf([solanaHome]), [1000])).toHaveLength(0);
+  it("skips families whose home chain has no USDC base (non-quotable)", () => {
+    // Tron (internal id 100000026) has no USDC base in BASE_USDC → not quotable → skipped.
+    const tronHome = fam({ nativeChainId: 100000026, nativeOnHomeChain: false });
+    expect(enumerateUnits(graphOf([tronHome]), [1000])).toHaveLength(0);
+  });
+
+  it("scans a Solana-native family when ARB_SCAN_SOLANA is on, skips it when off", () => {
+    const solFam = fam({
+      nativeChainId: 7565164,
+      nativeAddress: "0xsol",
+      reps: [
+        { internalChainId: 7565164, address: "0xsol", isNativeRoot: true, decimals: 18 },
+        { internalChainId: 42161, address: "0xdeasset", isNativeRoot: false, decimals: 18 },
+      ],
+    });
+    const prev = process.env.ARB_SCAN_SOLANA;
+    try {
+      delete process.env.ARB_SCAN_SOLANA; // default → enabled
+      expect(enumerateUnits(graphOf([solFam]), [1000])).toHaveLength(2); // both directions of the one rep
+      process.env.ARB_SCAN_SOLANA = "false"; // kill-switch
+      expect(enumerateUnits(graphOf([solFam]), [1000])).toHaveLength(0);
+    } finally {
+      // Restore even if an assertion throws, so ARB_SCAN_SOLANA='false' never leaks into later tests.
+      if (prev === undefined) delete process.env.ARB_SCAN_SOLANA;
+      else process.env.ARB_SCAN_SOLANA = prev;
+    }
   });
 
   it("skips reps with unknown or mismatched decimals (the 1:1 raw move would be unsafe)", () => {

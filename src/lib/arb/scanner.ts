@@ -3,8 +3,8 @@ import type { VerifyArgs } from "../quotes/verify";
 import type { Store, ScanRunRecord } from "../db/store";
 import type { RpmBudget } from "./budget";
 import { redemptionEdge } from "./edge";
-import { baseToken, tierToBaseUnits } from "./base-tokens";
-import { isEvmDeportChain } from "../deport/registry";
+import { baseToken, tierToBaseUnits, isQuotableChain } from "./base-tokens";
+import { SOLANA_INTERNAL_ID } from "../deport/address-codec";
 
 /**
  * The scanner probes ONE small notional per route, not a tier ladder — this is a SPREAD screener.
@@ -30,6 +30,16 @@ export const SCAN_NOTIONAL_USD = parseNotional(process.env.ARB_SCAN_NOTIONAL_USD
  */
 export const DEFAULT_TIERS = [SCAN_NOTIONAL_USD];
 
+/** Solana scanning is gated by ARB_SCAN_SOLANA (default on) — a no-deploy kill-switch if Jupiter throttles. */
+function solanaScanEnabled(): boolean {
+  return process.env.ARB_SCAN_SOLANA !== "false";
+}
+/** A chain the scan path can DEX-quote: any chain with a USDC base, minus Solana when ARB_SCAN_SOLANA=false. */
+function scannableChain(internalChainId: number): boolean {
+  if (internalChainId === SOLANA_INTERNAL_ID && !solanaScanEnabled()) return false;
+  return isQuotableChain(internalChainId);
+}
+
 /**
  * PURE: expand the lock-graph into redemption scan-units. For every (rep, home) pair we emit BOTH
  * directions, because a depeg can sit on either side:
@@ -39,11 +49,11 @@ export const DEFAULT_TIERS = [SCAN_NOTIONAL_USD];
 export function enumerateUnits(graph: LockGraph, tiers: number[] = DEFAULT_TIERS): ScanUnit[] {
   const units: ScanUnit[] = [];
   for (const f of graph.families) {
-    if (!f.nativeOnHomeChain || !baseToken(f.nativeChainId)) continue; // need a quotable home leg
+    if (!scannableChain(f.nativeChainId)) continue; // need a quotable home leg (EVM, or Solana when enabled)
     if (f.decimals === undefined) continue; // can't confirm the 1:1 raw move is decimal-safe
     for (const rep of f.reps) {
       if (rep.internalChainId === f.nativeChainId) continue;
-      if (!isEvmDeportChain(rep.internalChainId) || !baseToken(rep.internalChainId)) continue;
+      if (!scannableChain(rep.internalChainId)) continue;
       // The dePort move passes raw token units 1:1 between rep and native root, so the two legs MUST
       // share decimals or the sell leg is mis-scaled into a phantom spread. Forward-found reps can now
       // surface a non-standard deployment, so require a known, matching decimals before scanning.
@@ -95,6 +105,13 @@ export async function scanUnit(unit: ScanUnit, deps: ScanDeps): Promise<ScanUnit
   const sellBase = baseToken(unit.sellChainId);
   if (!family || !buyBase || !sellBase) return { opportunity: null, quotesSpent: 0, live: false };
 
+  // Re-check quotability at dispatch, not just at enumeration: a unit enqueued while ARB_SCAN_SOLANA was
+  // on persists in the store, so without this guard flipping the kill-switch OFF would still hand a queued
+  // Solana unit to Jupiter. scannableChain reads the env per-call, so the switch is honored immediately.
+  if (!scannableChain(unit.buyChainId) || !scannableChain(unit.sellChainId)) {
+    return { opportunity: null, quotesSpent: 0, live: false };
+  }
+
   const buyToken = memberAddress(family, unit.buyChainId);
   const sellToken = memberAddress(family, unit.sellChainId);
   if (!buyToken || !sellToken) return { opportunity: null, quotesSpent: 0, live: false };
@@ -139,6 +156,8 @@ export async function scanUnit(unit: ScanUnit, deps: ScanDeps): Promise<ScanUnit
         amountInUsdcUnits: amountIn,
         debridgeBuyAmountOutUsd: buyLeg.amountOutUsd,
         tierUsd: unit.tierUsd,
+        buyAmountOut: buyLeg.amountOut,
+        buyTokenDecimals: family.decimals,
       });
     } catch {
       /* verification is an optional corroboration; absence just leaves the row unverified */

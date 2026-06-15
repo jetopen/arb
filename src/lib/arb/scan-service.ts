@@ -1,11 +1,13 @@
 import type { Hex } from "viem";
 import { getLockGraph } from "../deport/graph";
 import { fetchDexQuote } from "../quotes/debridge";
+import { fetchJupiterQuote } from "../quotes/jupiter";
+import { SOLANA_INTERNAL_ID } from "../deport/address-codec";
 import { getFixedFeeUsd } from "../deport/fees";
 import { getNativeUsd } from "../quotes/native-price";
-import { verifyCandidate } from "../quotes/verify";
+import { verifyCandidate, verifySolanaCandidate } from "../quotes/verify";
 import { fetchKyberQuote } from "../quotes/kyberswap";
-import { getPoolLiquidityUsd } from "../liquidity/geckoterminal";
+import { getPoolLiquidityUsd, getTokenStats } from "../liquidity/geckoterminal";
 import { getStore } from "../db/store";
 import { supabaseConfigured } from "../db/supabase";
 import { chainName } from "../deport/registry";
@@ -37,9 +39,13 @@ export async function buildScanDeps(): Promise<ScanDeps> {
   const apiKey = process.env.DEBRIDGE_API_KEY || undefined;
   return {
     getFamily: (id) => famMap.get(id),
-    fetchQuote: (c, i, o, a) => fetchDexQuote(c, i, o, a, apiKey),
+    fetchQuote: (c, i, o, a) =>
+      c === SOLANA_INTERNAL_ID ? fetchJupiterQuote(i, o, a) : fetchDexQuote(c, i, o, a, apiKey),
     getFeeUsd: async (chainId, dbId) => getFixedFeeUsd(chainId, dbId as Hex, await getNativeUsd(chainId)),
-    verify: (args) => verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd }),
+    verify: (args) =>
+      args.buyChainId === SOLANA_INTERNAL_ID
+        ? verifySolanaCandidate(args, { getTokenStats })
+        : verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd }),
     store,
     budget: getBudget(),
     concurrency: Number(process.env.ARB_SCAN_CONCURRENCY ?? 8),
@@ -83,7 +89,8 @@ export async function runOptimize(debridgeId: string, buyChainId: number, sellCh
   return optimizeRoute(
     { debridgeId, buyChainId, sellChainId, buyToken, sellToken, symbol: family.symbol },
     {
-      fetchQuote: (c, i, o, a) => fetchDexQuote(c, i, o, a, apiKey),
+      fetchQuote: (c, i, o, a) =>
+        c === SOLANA_INTERNAL_ID ? fetchJupiterQuote(i, o, a) : fetchDexQuote(c, i, o, a, apiKey),
       getFeeUsd: async (chainId, dbId) => getFixedFeeUsd(chainId, dbId as Hex, await getNativeUsd(chainId)),
     }
   );

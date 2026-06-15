@@ -9,6 +9,9 @@ export interface VerifyArgs {
   /** deBridge's buy-leg output value in USD (what we cross-check against). */
   debridgeBuyAmountOutUsd: number;
   tierUsd: number;
+  /** Buy-leg token output in raw units + its decimals (Solana verify computes effective price from these). */
+  buyAmountOut?: string;
+  buyTokenDecimals?: number;
 }
 
 export interface VerifyDeps {
@@ -84,6 +87,83 @@ export async function verifyCandidate(args: VerifyArgs, deps: VerifyDeps): Promi
   return {
     verified: true,
     sourcesAgreed: ["debridge", "kyberswap"],
+    quoteDisagreementBps: disagreementBps,
+    liquidityUsd,
+  };
+}
+
+export interface SolanaVerifyDeps {
+  /** One GeckoTerminal token fetch → both the pool reserve (liquidity gate) and the spot price
+   *  (cross-check). Combined so each candidate makes ONE GT request, not two identical ones. */
+  getTokenStats: (chainId: number, tokenAddr: string) => Promise<{ liquidityUsd: number | null; priceUsd: number | null } | null>;
+  /**
+   * Max |effective price − GeckoTerminal spot| / spot, in bps. Looser than the EVM path (200) on purpose:
+   * the Solana cross-check is a routed quote (Jupiter) vs a SPOT price (GeckoTerminal), so genuine size
+   * impact on thin pools can't be netted out — we tolerate it but still reject grossly mispriced/phantom
+   * routes. Default 1500 (15%).
+   */
+  toleranceBps?: number;
+  minLiquidityMultiple?: number;
+}
+
+/**
+ * Corroborate a profitable Solana-leg candidate, mirroring verifyCandidate with Solana sources:
+ *  1. Liquidity gate — GeckoTerminal pool reserve must be ≥ tier.
+ *  2. Cross-check — Jupiter's effective buy price (USDC paid / tokens received) must agree with
+ *     GeckoTerminal's market spot price within tolerance.
+ * Missing liquidity/price or a mismatch leaves it UNVERIFIED (shown, not badged), never silently verified.
+ */
+export async function verifySolanaCandidate(args: VerifyArgs, deps: SolanaVerifyDeps): Promise<Verification> {
+  const tolerance = deps.toleranceBps ?? 1500;
+  const minMult = deps.minLiquidityMultiple ?? 1;
+
+  // Single GeckoTerminal fetch supplies both the reserve and the spot price.
+  let stats: { liquidityUsd: number | null; priceUsd: number | null } | null = null;
+  try {
+    stats = await deps.getTokenStats(args.buyChainId, args.buyTokenAddress);
+  } catch {
+    stats = null;
+  }
+  const liquidityUsd = stats?.liquidityUsd ?? null;
+  if (liquidityUsd != null && liquidityUsd < args.tierUsd * minMult) {
+    return {
+      verified: false,
+      sourcesAgreed: ["jupiter"],
+      quoteDisagreementBps: null,
+      liquidityUsd,
+      rejectReason: `liquidity $${Math.round(liquidityUsd)} < tier $${args.tierUsd}`,
+    };
+  }
+
+  const gtPrice = stats?.priceUsd ?? null;
+  const tokensOut =
+    args.buyAmountOut != null && args.buyTokenDecimals != null
+      ? Number(args.buyAmountOut) / 10 ** args.buyTokenDecimals
+      : 0;
+  const paidUsd = args.amountInUsdcUnits ? Number(args.amountInUsdcUnits) / 1e6 : args.tierUsd;
+  if (gtPrice == null || gtPrice <= 0 || tokensOut <= 0 || paidUsd <= 0) {
+    return {
+      verified: false,
+      sourcesAgreed: ["jupiter"],
+      quoteDisagreementBps: null,
+      liquidityUsd,
+      rejectReason: "no independent cross-check available",
+    };
+  }
+  const effectivePrice = paidUsd / tokensOut;
+  const disagreementBps = (Math.abs(effectivePrice - gtPrice) / gtPrice) * 10_000;
+  if (disagreementBps > tolerance) {
+    return {
+      verified: false,
+      sourcesAgreed: ["jupiter"],
+      quoteDisagreementBps: disagreementBps,
+      liquidityUsd,
+      rejectReason: `price vs market off ${Math.round(disagreementBps)}bps`,
+    };
+  }
+  return {
+    verified: true,
+    sourcesAgreed: ["jupiter", "geckoterminal"],
     quoteDisagreementBps: disagreementBps,
     liquidityUsd,
   };

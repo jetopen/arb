@@ -3,6 +3,8 @@
  * Note BNB Chain USDC is 18 decimals (not 6). HyperEVM is intentionally omitted — no canonical
  * USDC we can rely on yet, so it is excluded as a buy/sell base in Phase 1.
  */
+import { SOLANA_USDC_MINT } from "../deport/address-codec";
+
 export interface BaseToken {
   address: string;
   decimals: number;
@@ -19,10 +21,18 @@ export const BASE_USDC: Record<number, BaseToken> = {
   59144: { address: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff", decimals: 6 },
   100000019: { address: "0xc21223249ca28397b4b6541dffaecc539bff0c59", decimals: 6 }, // Cronos
   100000023: { address: "0x09bc4e0d864854c6afb6eb9a9cdf58ac190d0df9", decimals: 6 }, // Mantle
+  // Solana USDC (SPL) — a base58 mint, case-sensitive (do NOT lowercase). Quoted via Jupiter, not deBridge.
+  // Address comes from the shared SOLANA_USDC_MINT constant so it can't drift from the Jupiter quoter.
+  7565164: { address: SOLANA_USDC_MINT, decimals: 6 },
 };
 
 export function baseToken(internalChainId: number): BaseToken | undefined {
   return BASE_USDC[internalChainId];
+}
+
+/** True when we can DEX-quote USDC↔token on this chain (it has a USDC base): the EVM dePort chains + Solana. */
+export function isQuotableChain(internalChainId: number): boolean {
+  return BASE_USDC[internalChainId] !== undefined;
 }
 
 /** tier (USD) expressed in the chain's USDC base units, as a decimal string. */

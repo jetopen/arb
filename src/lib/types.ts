@@ -171,7 +171,7 @@ export interface DexQuote {
   priceImpactBps: number;
   gasUsd: number;
   recommendedSlippageBps: number;
-  source: "debridge" | "kyberswap" | "onchain";
+  source: "debridge" | "kyberswap" | "onchain" | "jupiter";
 }
 
 export type ArbKind = "redemption" | "cross_rep";

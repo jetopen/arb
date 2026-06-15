@@ -19,6 +19,7 @@ export const DOC_FIXED_FEE_NATIVE: Record<number, number> = {
   100000019: 15, // Cronos (CRO)
   100000023: 2, // Mantle (MNT) — approximate
   100000022: 0.05, // HyperEVM (HYPE) — approximate
+  7565164: 0.01, // Solana (SOL) — approximate; refine with the real dePort fee
 };
 
 /** PURE: convert a native-wei fee to USD. */

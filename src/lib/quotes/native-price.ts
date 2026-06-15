@@ -15,6 +15,11 @@ const LLAMA_SLUG: Record<number, string> = {
   100000022: "hyperliquid",
 };
 
+/** Direct DefiLlama coin keys for chains whose native price isn't the EVM zero-address (e.g. Solana). */
+const LLAMA_KEY: Record<number, string> = {
+  7565164: "coingecko:solana", // SOL
+};
+
 const cache = new Map<number, { usd: number; expiry: number }>();
 const TTL = 5 * 60 * 1000;
 
@@ -35,8 +40,8 @@ export async function getNativeUsd(internalChainId: number): Promise<number> {
   if (hit && Date.now() < hit.expiry) return hit.usd;
 
   const slug = LLAMA_SLUG[internalChainId];
-  if (!slug) return 0; // statically unknown chain — nothing to cache, cheap to re-check
-  const key = `${slug}:0x0000000000000000000000000000000000000000`;
+  const key = LLAMA_KEY[internalChainId] ?? (slug ? `${slug}:0x0000000000000000000000000000000000000000` : undefined);
+  if (!key) return 0; // statically unknown chain — nothing to cache, cheap to re-check
   try {
     const res = await fetchWithRetry(
       `https://coins.llama.fi/prices/current/${key}`,

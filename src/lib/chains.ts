@@ -60,7 +60,8 @@ export function getExplorerAddressUrl(chainId: number, address: string): string 
   const chain = chainMap.get(chainId);
   if (!chain) return "";
   const base = chain.explorerTxUrl.replace(/\/tx$/, "");
-  return `${base}/address/${address}`;
+  const path = chainId === 7565164 ? "account" : "address"; // Solscan uses /account/<pubkey>
+  return `${base}/${path}/${address}`;
 }
 
 export function getChainColor(id: number): string {
