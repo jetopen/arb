@@ -9,15 +9,32 @@ export const dynamic = "force-dynamic";
 const CACHE_TTL = 300_000; // 5 min
 const MAX_ITEMS = 60;
 const MAX_CACHE = 5000;
-const cache = new Map<string, { value: number | null; expiry: number }>();
+type LiqEntry = { value: number | null; expiry: number };
+const cache = new Map<string, LiqEntry>();
 
-/** Store a liquidity result, bounding the cache: sweep expired entries when full, hard-clear if still over. */
-function rememberLiq(key: string, value: number | null) {
-  if (cache.size >= MAX_CACHE) {
-    const now = Date.now();
-    for (const [k, v] of cache) if (v.expiry <= now) cache.delete(k);
-    if (cache.size >= MAX_CACHE) cache.clear();
+/**
+ * PURE: bound a Map's size in place. First sweep expired entries; if still at/over `max`, evict the
+ * OLDEST entries (a Map preserves insertion order, so the front keys are oldest) until size drops
+ * below the bound — dropping at least ~10% so this amortizes instead of running every insert.
+ *
+ * Fix #11: the previous code did `cache.clear()` here, wiping all ~5000 fresh entries and triggering a
+ * re-fetch storm against rate-limited GeckoTerminal. Evicting only the oldest slice keeps the cache warm.
+ */
+export function evictToBound(map: Map<string, LiqEntry>, max: number, now: number = Date.now()): void {
+  if (map.size < max) return;
+  for (const [k, v] of map) if (v.expiry <= now) map.delete(k);
+  if (map.size < max) return;
+  // Still full of fresh entries: drop the oldest ~10% (at least 1) by insertion order.
+  const target = max - Math.max(1, Math.ceil(max * 0.1));
+  for (const k of map.keys()) {
+    if (map.size <= target) break;
+    map.delete(k);
   }
+}
+
+/** Store a liquidity result, bounding the cache to MAX_CACHE via oldest-first eviction. */
+function rememberLiq(key: string, value: number | null) {
+  evictToBound(cache, MAX_CACHE);
   cache.set(key, { value, expiry: Date.now() + CACHE_TTL });
 }
 

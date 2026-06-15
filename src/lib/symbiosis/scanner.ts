@@ -1,4 +1,4 @@
-import type { SymRouteRaw, SymOpportunity } from "./types";
+import type { SymRouteRaw, SymOpportunity, SymToken } from "./types";
 
 /** Symbiosis chain id → display name (spans many chains beyond the dePort set). */
 const CHAIN_NAMES: Record<number, string> = {
@@ -21,19 +21,42 @@ export function isEvmChain(chainId: number): boolean {
 
 const BTC_RE = /btc/i;
 
-/** PURE: parse a raw feed route into a UI opportunity (size = input notional in USD). */
-export function mapRoute(r: SymRouteRaw): SymOpportunity {
-  const tin = r.tokenAmountIn;
-  const tout = r.tokenAmountOut;
+/** A feed token leg is usable only if its address is a string and amount/price/decimals are finite. */
+function isValidLeg(t: (SymToken & { amount: string }) | null | undefined): t is SymToken & { amount: string } {
+  return (
+    !!t &&
+    typeof t.address === "string" &&
+    t.address.length > 0 &&
+    Number.isFinite(Number(t.amount)) &&
+    Number.isFinite(t.priceUsd) &&
+    Number.isFinite(t.decimals) &&
+    Number.isFinite(t.chainId)
+  );
+}
+
+/**
+ * PURE: parse a raw feed route into a UI opportunity (size = input notional in USD).
+ * Returns null for a malformed feed row (fix #10): the Symbiosis feed is untrusted, so a null address
+ * or non-numeric amount/price must SKIP the row (filtered out by mapRoutes) rather than throw on
+ * `.toLowerCase()` / yield a `$NaN` size and 500 the whole /api/arb/symbiosis response.
+ */
+export function mapRoute(r: SymRouteRaw): SymOpportunity | null {
+  const tin = r?.tokenAmountIn;
+  const tout = r?.tokenAmountOut;
+  if (!isValidLeg(tin) || !isValidLeg(tout) || !Number.isFinite(r?.profitBps)) return null;
+
   const sizeUsd = (Number(tin.amount) / 10 ** tin.decimals) * tin.priceUsd;
+  if (!Number.isFinite(sizeUsd)) return null; // belt-and-suspenders against overflow/odd inputs
+  const inSymbol = tin.symbol ?? "";
+  const outSymbol = tout.symbol ?? "";
   return {
     id: `${tin.chainId}:${tin.address.toLowerCase()}->${tout.chainId}:${tout.address.toLowerCase()}`,
-    inSymbol: tin.symbol,
+    inSymbol,
     inChainId: tin.chainId,
     inAddress: tin.address,
     inDecimals: tin.decimals,
     inPriceUsd: tin.priceUsd,
-    outSymbol: tout.symbol,
+    outSymbol,
     outChainId: tout.chainId,
     outAddress: tout.address,
     outDecimals: tout.decimals,
@@ -41,13 +64,16 @@ export function mapRoute(r: SymRouteRaw): SymOpportunity {
     profitBps: r.profitBps,
     sizeUsd,
     evmOnly: isEvmChain(tin.chainId) && isEvmChain(tout.chainId),
-    btcFamily: BTC_RE.test(tin.symbol) && BTC_RE.test(tout.symbol),
+    btcFamily: BTC_RE.test(inSymbol) && BTC_RE.test(outSymbol),
   };
 }
 
-/** PURE: map + rank by spread descending. */
+/** PURE: map + rank by spread descending, dropping malformed feed rows (mapRoute → null). */
 export function mapRoutes(routes: SymRouteRaw[]): SymOpportunity[] {
-  return routes.map(mapRoute).sort((a, b) => b.profitBps - a.profitBps);
+  return routes
+    .map(mapRoute)
+    .filter((o): o is SymOpportunity => o !== null)
+    .sort((a, b) => b.profitBps - a.profitBps);
 }
 
 /** Base units for a USD clip of the input token. Returns "0" on any non-finite/garbage input

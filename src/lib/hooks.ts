@@ -187,6 +187,9 @@ export function useTrackedFamilies(opts: { page?: number; take?: number; multiCh
   return useSWR<GraphDetailResponse>(`/api/arb/graph?${p.toString()}`, fetcher, {
     revalidateOnFocus: false,
     dedupingInterval: 60_000,
+    // Toggling "Multi-chain only" (or paging) changes the SWR key; keepPreviousData keeps the prior
+    // rows visible during the refetch instead of dropping to a full skeleton each time (fix #12).
+    keepPreviousData: true,
   });
 }
 

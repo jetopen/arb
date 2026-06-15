@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getStore } from "@/lib/db/store";
+import { getStore, DEAD_ROUTE_PENALTY_MS, parsePenaltyMs } from "@/lib/db/store";
 import type { OpportunityFilter } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -15,9 +15,12 @@ export async function GET(request: NextRequest) {
       return Number.isFinite(v) ? v : undefined;
     };
     // Freshness gate so stale persistent rows (a route no longer being scanned) can't rank forever.
-    // Default 1h; override via ?maxAgeMs= or ARB_OPP_MAX_AGE_MS env. maxAgeMs<=0 disables the gate.
+    // Default aligned to the scan cadence / dead-route penalty (6h) — a 1h default hid still-valid
+    // opportunities whenever the queue is large and scans cycle slower than 1h (the normal case, fix #8).
+    // Override via ?maxAgeMs= or ARB_OPP_MAX_AGE_MS env; maxAgeMs<=0 disables the gate. The env is parsed
+    // defensively (falls back to 6h on a non-numeric value rather than NaN → silently disabling the gate).
     const maxAgeParam = finite("maxAgeMs");
-    const maxAgeMs = maxAgeParam ?? Number(process.env.ARB_OPP_MAX_AGE_MS ?? "3600000");
+    const maxAgeMs = maxAgeParam ?? parsePenaltyMs(process.env.ARB_OPP_MAX_AGE_MS, DEAD_ROUTE_PENALTY_MS);
     const filter: OpportunityFilter = {
       minNetPct: finite("minNetPct"),
       tierUsd: finite("tier"),

@@ -18,26 +18,52 @@ const gToWg: SymRouteRaw = {
 describe("symbiosis mapRoute", () => {
   it("parses a route into an opportunity with USD size and flags", () => {
     const o = mapRoute(btcbToWbtc);
-    expect(o.inSymbol).toBe("BTCB");
-    expect(o.outSymbol).toBe("WBTC");
-    expect(o.profitBps).toBeCloseTo(15.47, 2);
+    expect(o).not.toBeNull();
+    expect(o!.inSymbol).toBe("BTCB");
+    expect(o!.outSymbol).toBe("WBTC");
+    expect(o!.profitBps).toBeCloseTo(15.47, 2);
     // 0.1 BTCB × $63779 ≈ $6,378
-    expect(o.sizeUsd).toBeCloseTo(6377.9, 0);
-    expect(o.btcFamily).toBe(true);
-    expect(o.evmOnly).toBe(true); // 56 and 4200 are both EVM
-    expect(o.id).toContain("56:");
+    expect(o!.sizeUsd).toBeCloseTo(6377.9, 0);
+    expect(o!.btcFamily).toBe(true);
+    expect(o!.evmOnly).toBe(true); // 56 and 4200 are both EVM
+    expect(o!.id).toContain("56:");
   });
 
   it("flags non-BTC routes correctly", () => {
     const o = mapRoute(gToWg);
-    expect(o.btcFamily).toBe(false);
-    expect(o.sizeUsd).toBeCloseTo(6875, -2);
+    expect(o).not.toBeNull();
+    expect(o!.btcFamily).toBe(false);
+    expect(o!.sizeUsd).toBeCloseTo(6875, -2);
   });
 
   it("mapRoutes ranks by spread descending", () => {
     const ranked = mapRoutes([btcbToWbtc, gToWg]);
     expect(ranked[0].inSymbol).toBe("G"); // 87 bps > 15 bps
     expect(ranked[1].inSymbol).toBe("BTCB");
+  });
+
+  it("returns null for malformed rows and mapRoutes skips them instead of crashing (fix #10)", () => {
+    // null address would throw on .toLowerCase(); non-numeric amount would yield $NaN.
+    const nullAddr = {
+      tokenAmountIn: { symbol: "X", address: null as unknown as string, amount: "100", chainId: 56, decimals: 18, priceUsd: 1 },
+      tokenAmountOut: { symbol: "Y", address: "0xabc", amount: "100", chainId: 1, decimals: 18, priceUsd: 1 },
+      profitBps: 10,
+    } as unknown as SymRouteRaw;
+    const badAmount = {
+      tokenAmountIn: { symbol: "X", address: "0xaaa", amount: "not-a-number", chainId: 56, decimals: 18, priceUsd: 1 },
+      tokenAmountOut: { symbol: "Y", address: "0xbbb", amount: "100", chainId: 1, decimals: 18, priceUsd: 1 },
+      profitBps: 20,
+    } as unknown as SymRouteRaw;
+    const missingLeg = { tokenAmountOut: btcbToWbtc.tokenAmountOut, profitBps: 5 } as unknown as SymRouteRaw;
+
+    expect(mapRoute(nullAddr)).toBeNull();
+    expect(mapRoute(badAmount)).toBeNull();
+    expect(mapRoute(missingLeg)).toBeNull();
+
+    // One malformed row mixed with two valid ones must NOT crash mapRoutes; it drops the bad row.
+    const ranked = mapRoutes([btcbToWbtc, nullAddr, gToWg, badAmount]);
+    expect(ranked).toHaveLength(2);
+    expect(ranked.map((r) => r.inSymbol)).toEqual(["G", "BTCB"]);
   });
 });
 

@@ -160,14 +160,19 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T) => P
 /** Reserve budget, dequeue up to n units, scan with bounded concurrency, persist results. */
 export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord> {
   const startedAt = Date.now();
+  // Honor the RPM budget (fix #4): only scan what the budget can grant. Each unit costs 2 quotes, so
+  // we can afford floor(available/2) units this tick; never dequeue/scan more than that.
   const affordable = Math.floor(deps.budget.available() / 2);
   const count = Math.min(n, affordable);
   let units: ScanUnit[] = [];
   if (count > 0) {
     units = await deps.store.dequeue(count);
-    // Reserve for the units actually dequeued (dequeue may return fewer than `count`), so we don't
-    // burn RPM tokens for phantom units. units.length ≤ count ≤ affordable, so this always succeeds.
-    if (units.length > 0) deps.budget.tryAcquire(units.length * 2);
+    // Reserve for the units actually dequeued (dequeue may return fewer than `count`). units.length ≤
+    // count ≤ affordable, so tryAcquire should always succeed — but RESPECT the boolean: if a concurrent
+    // scan drained the bucket between available() and here, do NOT scan this tick (skip both scanning
+    // and markScanned). The units keep their refreshed lastScannedAt and simply cycle next tick; the
+    // point is that concurrent scans never over-spend the RPM budget.
+    if (units.length > 0 && !deps.budget.tryAcquire(units.length * 2)) units = [];
   }
 
   const results = await mapPool(units, deps.concurrency ?? 8, (u) =>
@@ -197,8 +202,10 @@ export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord
  * units are deduped / have only their priority updated), so calling this on every graph (re)build
  * adds newly-discovered families' units without disturbing the cycling state of existing ones.
  *
- * Priority = realized quotability: a route that has ever produced a quote (has an opportunity row)
- * is warm-started to the front. Rep count is deliberately NOT used — the most-replicated assets are
+ * Priority = realized quotability: a route that has ever produced a quote (has an opportunity row) is
+ * warm-started by PRIORITY (preferred among equally-stale peers in the dequeue tie-break), not by
+ * resetting its scan time — so a 6h rebuild can't shove the whole proven set ahead of never-scanned
+ * routes and starve them (fix #2). Rep count is deliberately NOT used — the most-replicated assets are
  * canonical wrapped natives (WETH/WBNB/…) that are efficiently priced and mostly un-quotable on their
  * secondary-chain reps, so rep-count priority front-loaded exactly the dead routes. Steady-state
  * demotion of dead routes is handled separately by markScanned (see DEAD_ROUTE_PENALTY_MS).
@@ -212,8 +219,9 @@ export async function seedQueue(store: Store, graph: LockGraph, tiers: number[] 
   const units = enumerateUnits(graph, tiers);
   const known = await store.knownUnitIds().catch(() => new Set<string>());
   await store.enqueue(units, (u) => (known.has(opportunityId(u)) ? 1 : 0));
-  // Surface the proven-productive routes at the front of the queue so they're re-scanned (and go
-  // fresh) immediately, rather than starving behind a full pass over the no-liquidity backlog.
+  // Warm-start the proven-productive routes' PRIORITY (not their scan time) so they win the dequeue
+  // tie-break among equally-stale peers. This preserves each route's lastScannedAt — re-seeding on a
+  // 6h rebuild no longer re-floods the queue front and starves never-scanned routes (fix #2).
   if (known.size > 0) await store.requeueFresh([...known]).catch(() => {});
   return units.length;
 }

@@ -17,22 +17,25 @@ const LLAMA_SLUG: Record<number, string> = {
 
 const cache = new Map<number, { usd: number; expiry: number }>();
 const TTL = 5 * 60 * 1000;
-const NEG_TTL = 30 * 1000; // short negative-cache so an upstream outage can't trigger a refetch storm
 
-// Caches both hits and misses (getNativeUsd runs per scan unit; without a negative cache an outage
-// would re-hit coins.llama.fi for every unit in the batch).
+// Cache ONLY successful, positive prices (fix #9). A transient DefiLlama failure used to be cached as
+// usd:0 for a short TTL; downstream getFixedFeeUsd then returned fee=0 for that whole window, inflating
+// netUsd and flipping borderline routes to "profitable". Caching only positive results means a failure
+// returns 0 once (the caller's own fee fallback handles it) and the very next call retries — no sticky
+// $0 window. The retry burst within a single batch is far cheaper than a window of phantom-profit rows.
 function remember(internalChainId: number, usd: number): number {
-  cache.set(internalChainId, { usd, expiry: Date.now() + (usd > 0 ? TTL : NEG_TTL) });
+  if (usd > 0) cache.set(internalChainId, { usd, expiry: Date.now() + TTL });
   return usd;
 }
 
-/** Native gas-token USD price (for converting dePort fixed fees to USD). Cached 5m; 0 if unavailable. */
+/** Native gas-token USD price (for converting dePort fixed fees to USD). Successful prices cached 5m;
+ * returns 0 (uncached) when unavailable so the next call retries. */
 export async function getNativeUsd(internalChainId: number): Promise<number> {
   const hit = cache.get(internalChainId);
   if (hit && Date.now() < hit.expiry) return hit.usd;
 
   const slug = LLAMA_SLUG[internalChainId];
-  if (!slug) return remember(internalChainId, 0);
+  if (!slug) return 0; // statically unknown chain — nothing to cache, cheap to re-check
   const key = `${slug}:0x0000000000000000000000000000000000000000`;
   try {
     const res = await fetchWithRetry(
@@ -40,10 +43,11 @@ export async function getNativeUsd(internalChainId: number): Promise<number> {
       { method: "GET" },
       { maxRetries: 1 }
     );
-    if (!res.ok) return remember(internalChainId, 0);
+    if (!res.ok) return 0; // transient failure: do NOT cache, let the next call retry
     const json = (await res.json()) as { coins?: Record<string, { price?: number }> };
+    // remember() only writes the cache when price > 0, so a missing/zero price is also not cached.
     return remember(internalChainId, json.coins?.[key]?.price ?? 0);
   } catch {
-    return remember(internalChainId, 0);
+    return 0; // transient failure: do NOT cache, let the next call retry
   }
 }

@@ -21,8 +21,20 @@ export interface ScanOutcome {
  * How far into the future a dead route's `lastScannedAt` is pushed so the time-ordered dequeue stops
  * re-scanning it. A no-liquidity wrapped-deAsset retries roughly every penalty window (liquidity can
  * appear later), instead of burning a quote every cycle. Override via env for tuning.
+ *
+ * Parsed defensively (fix #5): a non-numeric override (e.g. "6h") would otherwise be NaN, which throws
+ * a RangeError in `new Date(now + NaN).toISOString()` (500s every scan) and corrupts MemoryStore
+ * ordering. Fall back to the 6h default unless the env is a finite, non-negative number.
  */
-export const DEAD_ROUTE_PENALTY_MS = Number(process.env.ARB_DEAD_ROUTE_PENALTY_MS ?? 6 * 60 * 60 * 1000);
+const DEFAULT_DEAD_ROUTE_PENALTY_MS = 6 * 60 * 60 * 1000;
+
+/** Defensively parse a penalty-ms env override; falls back to `fallback` unless `raw` is finite & >= 0. */
+export function parsePenaltyMs(raw: string | undefined, fallback = DEFAULT_DEAD_ROUTE_PENALTY_MS): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+export const DEAD_ROUTE_PENALTY_MS = parsePenaltyMs(process.env.ARB_DEAD_ROUTE_PENALTY_MS);
 
 export interface Store {
   upsertOpportunities(opps: Opportunity[]): Promise<void>;
@@ -31,7 +43,12 @@ export interface Store {
   dequeue(n: number): Promise<ScanUnit[]>;
   /** Record per-unit scan outcomes: live (and proven) routes cycle normally, unproven-dead get demoted. */
   markScanned(outcomes: ScanOutcome[]): Promise<void>;
-  /** Reset these units' lastScannedAt so the time-ordered dequeue scans them next (front of the line). */
+  /**
+   * Warm-start priority for these units (proven-productive routes) so they're preferred among
+   * equally-stale peers in the time-ordered dequeue. Does NOT reset lastScannedAt (that would let the
+   * whole proven set jump the queue and starve never-scanned routes) and does NOT touch leases (that
+   * would release units a concurrent scan is mid-processing → double-processing). Priority bump only.
+   */
   requeueFresh(ids: string[]): Promise<void>;
   /** Ids of routes that have ever produced a quote (an opportunity row) — the realized-quotability set. */
   knownUnitIds(): Promise<Set<string>>;
@@ -113,13 +130,17 @@ export class MemoryStore implements Store {
 
   async dequeue(n: number): Promise<ScanUnit[]> {
     // Mirror arb_dequeue_work: least-recently-scanned first (fair cycling), priority breaks ties.
-    const sorted = [...this.queue].sort((a, b) => {
+    const now = Date.now();
+    // Freshness gate (fix #3): a route demoted into the future (lastScannedAt = now + penalty) is NOT
+    // eligible until that time passes — otherwise a small queue re-dequeues it immediately and the
+    // dead-route penalty never holds. Only null (never scanned) or past timestamps are eligible.
+    const eligible = this.queue.filter((i) => i.lastScannedAt === null || i.lastScannedAt <= now);
+    const sorted = eligible.sort((a, b) => {
       const at = a.lastScannedAt ?? -Infinity;
       const bt = b.lastScannedAt ?? -Infinity;
       return at !== bt ? at - bt : b.priority - a.priority;
     });
     const batch = sorted.slice(0, Math.max(0, n));
-    const now = Date.now();
     for (const item of batch) item.lastScannedAt = now;
     return batch.map((i) => i.unit);
   }
@@ -139,9 +160,12 @@ export class MemoryStore implements Store {
   }
 
   async requeueFresh(ids: string[]): Promise<void> {
+    // Warm-start priority only (fix #1/#2): bump proven routes to the proven-priority marker so they
+    // win the dequeue tie-break against equally-stale peers. Deliberately does NOT reset lastScannedAt
+    // (would let the whole proven set jump ahead of never-scanned routes) nor touch leases.
     const set = new Set(ids);
     for (const item of this.queue) {
-      if (set.has(unitKey(item.unit))) item.lastScannedAt = null;
+      if (set.has(unitKey(item.unit))) item.priority = Math.max(item.priority, 1);
     }
   }
 
