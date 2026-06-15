@@ -12,6 +12,7 @@ import {
 } from "@/components/lz/filters";
 import { TokenCard, itemKey } from "@/components/lz/token-card";
 import { TokenDetail, type LzDetailContext } from "@/components/lz/token-detail";
+import { CardGridSkeleton } from "@/components/ui/skeleton";
 import { ExportButton, type LzExportRow } from "@/components/lz/export-button";
 
 const STEP = 24; // tokens revealed per batch (progressive infinite scroll)
@@ -230,7 +231,7 @@ export default function LayerZeroPage() {
       {error ? (
         <div className="text-sm text-red-600">Failed to load OFT list: {error.message}</div>
       ) : isLoading ? (
-        <div className="text-sm text-muted">Loading LayerZero OFTs…</div>
+        <CardGridSkeleton count={6} />
       ) : shown.length === 0 ? (
         <div className="text-sm text-muted">No tokens match these filters.</div>
       ) : (

@@ -14,11 +14,16 @@ export async function GET(request: NextRequest) {
       const v = Number(searchParams.get(key));
       return Number.isFinite(v) ? v : undefined;
     };
+    // Freshness gate so stale persistent rows (a route no longer being scanned) can't rank forever.
+    // Default 1h; override via ?maxAgeMs= or ARB_OPP_MAX_AGE_MS env. maxAgeMs<=0 disables the gate.
+    const maxAgeParam = finite("maxAgeMs");
+    const maxAgeMs = maxAgeParam ?? Number(process.env.ARB_OPP_MAX_AGE_MS ?? "3600000");
     const filter: OpportunityFilter = {
       minNetPct: finite("minNetPct"),
       tierUsd: finite("tier"),
       chainId: finite("chainId"),
       verifiedOnly: searchParams.get("verifiedOnly") === "true",
+      maxAgeMs: maxAgeMs > 0 ? maxAgeMs : undefined,
       page: Math.max(1, finite("page") ?? 1),
       take: Math.min(Math.max(1, finite("take") ?? 50), 200),
     };

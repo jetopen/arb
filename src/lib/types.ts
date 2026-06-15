@@ -240,6 +240,8 @@ export interface OpportunityFilter {
   tierUsd?: number;
   chainId?: number;
   verifiedOnly?: boolean;
+  /** Exclude opportunities whose computedAt is older than this many ms (freshness gate). */
+  maxAgeMs?: number;
   page?: number;
   take?: number;
 }

@@ -52,4 +52,21 @@ describe("parseEstimation", () => {
     expect(q.tokenIn).toBe("0xusdc");
     expect(q.source).toBe("debridge");
   });
+
+  it("tolerates a malformed aggregator amount without throwing", () => {
+    const raw = {
+      estimation: {
+        tokenIn: { amount: "1000", approximateUsdValue: 1000 },
+        tokenOut: { amount: "6000", approximateUsdValue: 1000 },
+        comparedAggregators: [
+          { name: "bad", amount: "1.5e21", priceDrop: 0, approximateUsdValue: 0 }, // non-integer string
+          { name: "empty", amount: "", priceDrop: 0, approximateUsdValue: 0 },
+          { name: "good", amount: "6000", priceDrop: 0, approximateUsdValue: 1000 },
+        ],
+      },
+    };
+    const ctx = { internalChainId: 1, tokenIn: "0xa", tokenOut: "0xb" };
+    expect(() => parseEstimation(raw, ctx)).not.toThrow();
+    expect(parseEstimation(raw, ctx).amountOut).toBe("6000"); // from tokenOut, selection didn't crash
+  });
 });

@@ -1,10 +1,14 @@
-import { keccak256, encodePacked, type Hex, type Address } from "viem";
+import { keccak256, encodePacked, type Hex, type Address, type PublicClient } from "viem";
 import { getPublicClient } from "./client";
 import { deBridgeGate } from "../deport/registry";
 
 /**
  * Minimal deBridgeGate (DMP) ABI — only the reads we need.
  *  - getNativeInfo: reverse-lookup a deAsset -> its lock origin (zero for non-deBridge tokens).
+ *  - getDebridge: FORWARD-lookup a debridgeId -> whether the family has a representation on THIS chain
+ *    and its address there (`tokenAddress`), regardless of token-listing. This is the public getter for
+ *    `mapping(bytes32 => DebridgeInfo)`; the struct flattens to a 7-field tuple. It is the only way to
+ *    enumerate deAssets that the per-chain token-list omits (the bulk of them).
  *  - getDebridgeChainAssetFixedFee: live flat redemption fee, in native wei.
  */
 export const GATE_ABI = [
@@ -20,6 +24,21 @@ export const GATE_ABI = [
   },
   {
     type: "function",
+    name: "getDebridge",
+    stateMutability: "view",
+    inputs: [{ name: "debridgeId", type: "bytes32" }],
+    outputs: [
+      { name: "chainId", type: "uint256" }, // native (origin) internal id — same value on every chain
+      { name: "maxAmount", type: "uint256" },
+      { name: "balance", type: "uint256" },
+      { name: "lockedInStrategies", type: "uint256" },
+      { name: "tokenAddress", type: "address" }, // this family's address ON THE QUERIED CHAIN
+      { name: "minReservesBps", type: "uint16" },
+      { name: "exist", type: "bool" },
+    ],
+  },
+  {
+    type: "function",
     name: "getDebridgeChainAssetFixedFee",
     stateMutability: "view",
     inputs: [
@@ -29,6 +48,14 @@ export const GATE_ABI = [
     outputs: [{ name: "", type: "uint256" }],
   },
 ] as const;
+
+/** ERC20 metadata — read on-chain for forward-found reps that no token-list covers. */
+export const ERC20_META_ABI = [
+  { type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint8" }] },
+  { type: "function", name: "symbol", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "string" }] },
+] as const;
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 /**
  * debridgeId = keccak256(abi.encodePacked(uint256 nativeChainId, bytes nativeAddress)).
@@ -86,6 +113,142 @@ export async function enumerateNativeInfo(
       });
     });
   }
+  return out;
+}
+
+/** A discovered dePort family's identity — the input universe for forward enumeration. */
+export interface FamilyKey {
+  debridgeId: Hex;
+  /** lock-origin internal chain id (from discovery) */
+  nativeChainId: number;
+  /** lock-origin token address, lowercased (from discovery; getDebridge does not return it) */
+  nativeAddress: string;
+}
+
+/** getDebridge returns a 7-field struct ≈224 B/result; wide multicalls overflow public-RPC response limits. */
+const REP_CHUNK = 120;
+const REP_CHUNK_FLOOR = 15;
+
+type McResult = { status: "success"; result: unknown } | { status: "failure"; error?: unknown };
+
+/**
+ * Multicall `contracts` with a halving fallback ladder. On a TRANSPORT-level failure (the whole
+ * eth_call throws — typically a response too large for a public RPC) the slice is split in half and
+ * each half retried, down to REP_CHUNK_FLOOR. Per-call reverts are NOT failures (allowFailure:true
+ * tolerates a chain simply lacking a rep). Returns exactly one result per CONTRACT, in order, plus an
+ * `ok` flag that is false only when even a floor-sized chunk could not be fetched (→ graph goes partial).
+ * Laddering over contracts (not over logical items) keeps the result count exact when an item maps to
+ * several contracts (e.g. ERC20 decimals+symbol).
+ */
+async function multicallLadder<C>(
+  client: PublicClient,
+  contracts: readonly C[]
+): Promise<{ results: McResult[]; ok: boolean }> {
+  const run = (sub: readonly C[]) =>
+    client.multicall({
+      contracts: sub as never,
+      allowFailure: true,
+    }) as unknown as Promise<McResult[]>;
+
+  const attempt = async (slice: readonly C[]): Promise<{ results: McResult[]; ok: boolean }> => {
+    try {
+      return { results: await run(slice), ok: true };
+    } catch {
+      if (slice.length <= REP_CHUNK_FLOOR) {
+        return { results: slice.map(() => ({ status: "failure" as const })), ok: false };
+      }
+      const mid = Math.ceil(slice.length / 2);
+      const a = await attempt(slice.slice(0, mid));
+      const b = await attempt(slice.slice(mid));
+      return { results: [...a.results, ...b.results], ok: a.ok && b.ok };
+    }
+  };
+  return attempt(contracts);
+}
+
+/** Pre-chunk to REP_CHUNK, ladder each chunk, return all results in order + a combined ok flag. */
+async function chunkedMulticall<C>(
+  client: PublicClient,
+  contracts: C[]
+): Promise<{ results: McResult[]; ok: boolean }> {
+  const results: McResult[] = [];
+  let ok = true;
+  for (let i = 0; i < contracts.length; i += REP_CHUNK) {
+    const r = await multicallLadder(client, contracts.slice(i, i + REP_CHUNK));
+    if (!r.ok) ok = false;
+    results.push(...r.results);
+  }
+  return { results, ok };
+}
+
+/**
+ * FORWARD enumeration: for each known debridgeId, ask `internalChainId` whether the family has a
+ * representation there (`exist`) and its address (`tokenAddress`) — independent of any token-list.
+ * Emits a RawDeAsset for every (chain, family) where exist==true AND the struct's native chainId
+ * matches the family's discovered nativeChainId (cross-check guard), carrying nativeAddress through.
+ */
+export async function enumerateDebridgeReps(
+  internalChainId: number,
+  families: FamilyKey[]
+): Promise<{ reps: RawDeAsset[]; ok: boolean }> {
+  const client = getPublicClient(internalChainId);
+  const gate = deBridgeGate(internalChainId) as Address;
+  const contracts = families.map((f) => ({
+    address: gate,
+    abi: GATE_ABI,
+    functionName: "getDebridge" as const,
+    args: [f.debridgeId],
+  }));
+  const { results, ok } = await chunkedMulticall(client, contracts);
+
+  const reps: RawDeAsset[] = [];
+  results.forEach((r, j) => {
+    if (r.status !== "success") return;
+    const [chainId, , , , tokenAddress, , exist] = r.result as readonly [
+      bigint, bigint, bigint, bigint, Address, number, boolean
+    ];
+    if (!exist) return;
+    const fam = families[j];
+    if (Number(chainId) !== fam.nativeChainId) return; // not this family's record
+    const addr = (tokenAddress ?? "").toLowerCase();
+    if (!addr || addr === ZERO_ADDRESS) return;
+    reps.push({
+      internalChainId,
+      address: addr,
+      nativeChainId: fam.nativeChainId,
+      nativeAddress: fam.nativeAddress.toLowerCase(),
+    });
+  });
+  return { reps, ok };
+}
+
+/**
+ * On-chain ERC20 metadata for addresses no token-list covers (forward-found reps). Address-keyed
+ * (lowercased); a token whose decimals()/symbol() reverts yields the field as undefined rather than
+ * throwing. decimals is what matters — the scanner needs it to confirm a family's 1:1 raw move is safe.
+ */
+export async function enumerateErc20Meta(
+  internalChainId: number,
+  addresses: string[]
+): Promise<Map<string, { symbol?: string; decimals?: number }>> {
+  const client = getPublicClient(internalChainId);
+  const uniq = [...new Set(addresses.map((a) => a.toLowerCase()))];
+  // 2 contracts per address (decimals, symbol); laddering over contracts keeps the count exact.
+  const contracts = uniq.flatMap((addr) => [
+    { address: addr as Address, abi: ERC20_META_ABI, functionName: "decimals" as const },
+    { address: addr as Address, abi: ERC20_META_ABI, functionName: "symbol" as const },
+  ]);
+  const { results } = await chunkedMulticall(client, contracts);
+
+  const out = new Map<string, { symbol?: string; decimals?: number }>();
+  uniq.forEach((addr, k) => {
+    const dec = results[k * 2];
+    const sym = results[k * 2 + 1];
+    out.set(addr, {
+      decimals: dec?.status === "success" ? Number(dec.result) : undefined,
+      symbol: sym?.status === "success" ? String(sym.result) : undefined,
+    });
+  });
   return out;
 }
 

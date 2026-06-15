@@ -10,7 +10,8 @@ interface SizePoint { usd: number; q: SymQuote | null }
 
 export function SymDetail({ opp, onClose }: { opp: SymOpportunity; onClose: () => void }) {
   const [visible, setVisible] = useState(false);
-  const [points, setPoints] = useState<SizePoint[] | null>(null);
+  // Keyed by opp.id so a stale fetch for a previously-selected route can't render under this header.
+  const [result, setResult] = useState<{ key: string; points: SizePoint[] } | null>(null);
 
   useEffect(() => {
     requestAnimationFrame(() => setVisible(true));
@@ -33,14 +34,17 @@ export function SymDetail({ opp, onClose }: { opp: SymOpportunity; onClose: () =
       `/api/arb/symbiosis/quote?inAddr=${opp.inAddress}&inChain=${opp.inChainId}&inDec=${opp.inDecimals}` +
       `&inSym=${encodeURIComponent(opp.inSymbol)}&outAddr=${opp.outAddress}&outChain=${opp.outChainId}` +
       `&outDec=${opp.outDecimals}&outSym=${encodeURIComponent(opp.outSymbol)}&inPrice=${opp.inPriceUsd}&usd=${usd}`;
+    const key = opp.id;
     Promise.all(
       SIZES.map((usd) =>
         fetch(url(usd)).then((r) => r.json()).then((d) => ({ usd, q: (d.quote ?? null) as SymQuote | null })).catch(() => ({ usd, q: null }))
       )
-    ).then((pts) => alive && setPoints(pts));
+    ).then((points) => alive && setResult({ key, points }));
     return () => { alive = false; };
   }, [opp.id, opp.inAddress, opp.inChainId, opp.inDecimals, opp.inSymbol, opp.outAddress, opp.outChainId, opp.outDecimals, opp.outSymbol, opp.inPriceUsd]);
 
+  const loading = !result || result.key !== opp.id; // derived — true until THIS route resolves
+  const points = loading ? null : result.points;
   const best = points?.filter((p) => p.q).sort((a, b) => (b.q!.netBps) - (a.q!.netBps))[0];
 
   return (

@@ -33,8 +33,17 @@ export function parseEstimation(
   const amountIn = e.tokenIn?.amount ?? "0";
   const amountOut = e.tokenOut?.amount ?? "0";
   const aggs = e.comparedAggregators ?? [];
+  // Aggregator amounts are normally integer wei strings; guard so a malformed value (decimal,
+  // scientific, empty) can't throw out of this pure helper and kill the whole quote.
+  const toBig = (s: string): bigint => {
+    try {
+      return BigInt(s);
+    } catch {
+      return -1n;
+    }
+  };
   const best = aggs.reduce<AggregatorRoute | null>(
-    (acc, a) => (acc === null || BigInt(a.amount) > BigInt(acc.amount) ? a : acc),
+    (acc, a) => (acc === null || toBig(a.amount) > toBig(acc.amount) ? a : acc),
     null
   );
   const slippagePct = e.recommendedSlippage ?? e.slippage ?? 0;

@@ -87,4 +87,87 @@ describe("MemoryStore work queue", () => {
     await s.recordScanRun({ startedAt: 1, finishedAt: 2, unitsProcessed: 3, quotesSpent: 6, opportunitiesFound: 1, partial: false });
     expect((await s.lastScanRun())?.opportunitiesFound).toBe(1);
   });
+
+  it("honors priorityOf and dequeues least-recently-scanned first, priority breaks ties", async () => {
+    const s = new MemoryStore();
+    const u = (id: string): ScanUnit => ({ debridgeId: id, buyChainId: 1, sellChainId: 56, tierUsd: 1000, kind: "redemption" });
+    const prio: Record<string, number> = { a: 1, b: 3, c: 2 };
+    await s.enqueue([u("a"), u("b"), u("c")], (x) => prio[x.debridgeId]);
+    // all unscanned → highest priority first
+    expect((await s.dequeue(1))[0].debridgeId).toBe("b"); // 3
+    expect((await s.dequeue(1))[0].debridgeId).toBe("c"); // 2 (b already scanned)
+    expect((await s.dequeue(1))[0].debridgeId).toBe("a"); // 1
+    // all scanned now → least-recently (b was first) cycles back
+    expect((await s.dequeue(1))[0].debridgeId).toBe("b");
+  });
+
+  it("enqueue updates priority on conflict (parity with ON CONFLICT DO UPDATE)", async () => {
+    const s = new MemoryStore();
+    const u = (id: string): ScanUnit => ({ debridgeId: id, buyChainId: 1, sellChainId: 56, tierUsd: 1000, kind: "redemption" });
+    await s.enqueue([u("a"), u("b")], () => 1);
+    await s.enqueue([u("a")], () => 5); // raise a's priority, no duplicate
+    expect(await s.queueSize()).toBe(2);
+    expect((await s.dequeue(1))[0].debridgeId).toBe("a"); // 5 > 1
+  });
+});
+
+describe("MemoryStore adaptive demotion + realized quotability", () => {
+  const u = (id: string): ScanUnit => ({ debridgeId: id, buyChainId: 1, sellChainId: 56, tierUsd: 1000, kind: "redemption" });
+
+  it("markScanned demotes dead routes so live routes are dequeued first next cycle", async () => {
+    const s = new MemoryStore();
+    await s.enqueue([u("live"), u("dead")]);
+    await s.dequeue(2); // both unscanned -> both returned, lastScannedAt set
+    await s.markScanned([
+      { unit: u("live"), live: true },
+      { unit: u("dead"), live: false }, // pushed ~6h into the future
+    ]);
+    // live route (lastScannedAt = now) sorts before the demoted dead route (now + penalty)
+    expect((await s.dequeue(1))[0].debridgeId).toBe("live");
+    expect((await s.dequeue(1))[0].debridgeId).toBe("live"); // dead route still skipped
+  });
+
+  it("does NOT demote a proven route on a single failure (transient-blip protection)", async () => {
+    const s = new MemoryStore();
+    await s.enqueue([u("proven"), u("deadx")]);
+    await s.upsertOpportunities([opp("proven:1:56:1000:redemption", 0.3)]); // proven route
+    await s.dequeue(2);
+    await s.markScanned([
+      { unit: u("proven"), live: false }, // failed this scan, but proven before → kept
+      { unit: u("deadx"), live: false }, // never proven → demoted
+    ]);
+    expect((await s.dequeue(1))[0].debridgeId).toBe("proven"); // proven cycles, deadx is in the future
+  });
+
+  it("requeueFresh moves a route to the front of the time-ordered queue", async () => {
+    const s = new MemoryStore();
+    await s.enqueue([u("a"), u("b")]);
+    await s.dequeue(2); // both get lastScannedAt = now
+    await s.requeueFresh(["b:1:56:1000:redemption"]); // b reset to null → sorts first
+    expect((await s.dequeue(1))[0].debridgeId).toBe("b");
+  });
+
+  it("knownUnitIds returns the ids of routes that have produced a quote", async () => {
+    const s = new MemoryStore();
+    expect((await s.knownUnitIds()).size).toBe(0);
+    await s.upsertOpportunities([opp("0xabc:1:56:1000:redemption", 0.5)]);
+    const known = await s.knownUnitIds();
+    expect(known.has("0xabc:1:56:1000:redemption")).toBe(true);
+    expect(known.size).toBe(1);
+  });
+});
+
+describe("MemoryStore freshness gate (maxAgeMs)", () => {
+  it("excludes opportunities older than the cutoff", async () => {
+    const s = new MemoryStore();
+    const fresh = opp("fresh", 1);
+    fresh.computedAt = Date.now();
+    const stale = opp("stale", 9); // higher edge, but old
+    stale.computedAt = Date.now() - 2 * 3_600_000; // 2h
+    await s.upsertOpportunities([fresh, stale]);
+    expect((await s.topOpportunities({})).total).toBe(2); // no gate → both
+    const recent = await s.topOpportunities({ maxAgeMs: 3_600_000 }); // 1h
+    expect(recent.total).toBe(1);
+    expect(recent.opportunities[0].id).toBe("fresh"); // stale dropped despite higher edge
+  });
 });

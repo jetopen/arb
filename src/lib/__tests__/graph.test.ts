@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { assembleFamilies, multiChainFamilies, type TokenMeta } from "../deport/graph";
+import { assembleFamilies, multiChainFamilies, mergeForwardReps, fillMeta, type TokenMeta } from "../deport/graph";
 import { computeDebridgeId, type RawDeAsset } from "../onchain/debridge-gate";
 
 // A token natively on chain 56, its address.
@@ -72,6 +72,66 @@ describe("assembleFamilies", () => {
     );
     expect(families).toHaveLength(2);
     expect(multiChainFamilies(families)).toHaveLength(1);
+  });
+});
+
+describe("forward-expansion merge (the lock-graph rebuild)", () => {
+  const ARB = "0x912ce59144191c1204e64559fe8253a0e49e6548"; // Arbitrum-native ARB
+
+  it("merges discovery + forward reps into ONE family spanning all chains (the ARB regression)", () => {
+    // Discovery only saw ARB on its home chain (the only chain where it is token-listed).
+    const discovered: RawDeAsset[] = [
+      { internalChainId: 42161, address: ARB, nativeChainId: 42161, nativeAddress: ARB },
+    ];
+    // Forward getDebridge found ARB deAssets on 4 more chains that no token-list carries.
+    const forward: RawDeAsset[] = [
+      { internalChainId: 1, address: "0xa1", nativeChainId: 42161, nativeAddress: ARB },
+      { internalChainId: 56, address: "0xa2", nativeChainId: 42161, nativeAddress: ARB },
+      { internalChainId: 137, address: "0xa3", nativeChainId: 42161, nativeAddress: ARB },
+      { internalChainId: 8453, address: "0xa4", nativeChainId: 42161, nativeAddress: ARB },
+    ];
+    const families = assembleFamilies(
+      mergeForwardReps(discovered, forward),
+      meta([[42161, ARB, { symbol: "ARB", decimals: 18 }]])
+    );
+    expect(families).toHaveLength(1);
+    expect(families[0].reps).toHaveLength(5);
+    expect(new Set(families[0].reps.map((r) => r.internalChainId)).size).toBe(5);
+    expect(families[0].reps.filter((r) => r.isNativeRoot)).toHaveLength(1);
+    expect(multiChainFamilies(families)).toHaveLength(1); // was 0 before the forward pass
+  });
+
+  it("dedupes a rep present in BOTH discovery and forward (token-listed AND found via getDebridge)", () => {
+    const DEASSET_56 = "0xa2";
+    const discovered: RawDeAsset[] = [
+      { internalChainId: 42161, address: ARB, nativeChainId: 42161, nativeAddress: ARB },
+      { internalChainId: 56, address: DEASSET_56, nativeChainId: 42161, nativeAddress: ARB },
+    ];
+    const forward: RawDeAsset[] = [
+      { internalChainId: 56, address: DEASSET_56, nativeChainId: 42161, nativeAddress: ARB },
+    ];
+    const [f] = assembleFamilies(mergeForwardReps(discovered, forward), new Map());
+    expect(f.reps).toHaveLength(2); // not 3 — assembleFamilies dedupes by (chain,address)
+  });
+
+  it("fillMeta supplies decimals/symbol for forward reps without clobbering token-list values", () => {
+    const metaByKey = meta([[42161, ARB, { symbol: "ARB", decimals: 18 }]]);
+    // forward rep on chain 1 has no token-list entry → on-chain read provides its meta.
+    fillMeta(metaByKey, 1, new Map([["0xa1", { symbol: "ARB", decimals: 18 }]]));
+    // a differing on-chain read for the already-known root must NOT overwrite the token-list value.
+    fillMeta(metaByKey, 42161, new Map([[ARB, { symbol: "WRONG", decimals: 6 }]]));
+
+    const raw: RawDeAsset[] = [
+      { internalChainId: 42161, address: ARB, nativeChainId: 42161, nativeAddress: ARB },
+      { internalChainId: 1, address: "0xa1", nativeChainId: 42161, nativeAddress: ARB },
+    ];
+    const [f] = assembleFamilies(raw, metaByKey);
+    const root = f.reps.find((r) => r.isNativeRoot)!;
+    const rep1 = f.reps.find((r) => r.internalChainId === 1)!;
+    expect(root.decimals).toBe(18); // token-list wins
+    expect(root.symbol).toBe("ARB");
+    expect(rep1.decimals).toBe(18); // filled from on-chain
+    expect(rep1.symbol).toBe("ARB");
   });
 });
 

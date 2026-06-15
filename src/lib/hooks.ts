@@ -150,6 +150,46 @@ export function useLockGraphSummary() {
   });
 }
 
+export interface TrackedRep {
+  internalChainId: number;
+  chainName: string;
+  address: string;
+  isNativeRoot: boolean;
+  symbol?: string;
+  decimals?: number;
+}
+
+export interface TrackedFamily {
+  debridgeId: string;
+  symbol?: string;
+  nativeChainId: number;
+  nativeChainName: string;
+  repCount: number;
+  reps: TrackedRep[];
+}
+
+export interface GraphDetailResponse {
+  families: TrackedFamily[];
+  total: number;
+  page: number;
+  take: number;
+  partial: boolean;
+  builtAt: number;
+  chainsScanned: number[];
+}
+
+/** Browsable tracked dePort asset set (families + per-chain reps). Reuses the server-cached graph. */
+export function useTrackedFamilies(opts: { page?: number; take?: number; multiChainOnly?: boolean } = {}) {
+  const p = new URLSearchParams({ detail: "1" });
+  if (opts.page) p.set("page", String(opts.page));
+  if (opts.take) p.set("take", String(opts.take));
+  if (opts.multiChainOnly) p.set("multiChainOnly", "1");
+  return useSWR<GraphDetailResponse>(`/api/arb/graph?${p.toString()}`, fetcher, {
+    revalidateOnFocus: false,
+    dedupingInterval: 60_000,
+  });
+}
+
 // --- LayerZero OFT tracker ---
 import type { LzOftsResponse, LzLiquidityResponse } from "./layerzero/types";
 

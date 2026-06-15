@@ -24,7 +24,8 @@ export async function GET(request: NextRequest) {
     };
     const usd = Number(sp.get("usd") ?? "1000");
     const inPrice = Number(sp.get("inPrice"));
-    if (!inTok.address || !outTok.address || !Number.isFinite(inTok.chainId) || !Number.isFinite(inPrice) || inPrice <= 0) {
+    const allFinite = [inTok.chainId, inTok.decimals, outTok.chainId, outTok.decimals, inPrice, usd].every(Number.isFinite);
+    if (!inTok.address || !outTok.address || !allFinite || inPrice <= 0 || usd <= 0) {
       return NextResponse.json({ error: "missing/invalid token params" }, { status: 400 });
     }
     const amount = clipToBaseUnits(usd, inPrice, inTok.decimals);

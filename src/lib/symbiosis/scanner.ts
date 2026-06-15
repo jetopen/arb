@@ -50,9 +50,13 @@ export function mapRoutes(routes: SymRouteRaw[]): SymOpportunity[] {
   return routes.map(mapRoute).sort((a, b) => b.profitBps - a.profitBps);
 }
 
-/** Base units for a USD clip of the input token. */
+/** Base units for a USD clip of the input token. Returns "0" on any non-finite/garbage input
+ * (never throws — `BigInt(Math.floor(Infinity|NaN))` would otherwise RangeError). */
 export function clipToBaseUnits(usd: number, priceUsd: number, decimals: number): string {
-  if (priceUsd <= 0) return "0";
-  const tokens = usd / priceUsd;
-  return BigInt(Math.floor(tokens * 10 ** decimals)).toString();
+  if (!(priceUsd > 0) || !Number.isFinite(usd) || !Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
+    return "0";
+  }
+  const scaled = Math.floor((usd / priceUsd) * 10 ** decimals);
+  if (!Number.isFinite(scaled)) return "0";
+  return BigInt(scaled).toString();
 }

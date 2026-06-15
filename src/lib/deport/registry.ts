@@ -83,10 +83,18 @@ export function chainName(internalId: number): string {
   return byInternalId.get(internalId)?.name ?? `Chain ${internalId}`;
 }
 
-/** Resolve the RPC url: env RPC_URL_<evmChainId> wins, else the registry default. */
+/**
+ * Resolve the RPC url, most-specific first:
+ *   DEPORT_RPC_URL_<evmChainId>  — a graph-build endpoint (forward getDebridge is the heaviest path;
+ *                                  drop a paid/archival URL here for reliable full coverage), then
+ *   RPC_URL_<evmChainId>         — a general override, then
+ *   chain.defaultRpcUrl          — the public default.
+ */
 export function getRpcUrl(internalId: number): string {
   const chain = byInternalId.get(internalId);
   if (!chain) throw new Error(`Unknown dePort chain internalId=${internalId}`);
+  const deport = process.env[`DEPORT_RPC_URL_${chain.evmChainId}`];
+  if (deport && deport.length > 0) return deport;
   const override = process.env[`RPC_URL_${chain.evmChainId}`];
   return override && override.length > 0 ? override : chain.defaultRpcUrl;
 }

@@ -11,10 +11,11 @@ function fam(over: Partial<Family>): Family {
     nativeChainId: 56, // BSC home (quotable, has base)
     nativeAddress: "0xnative",
     symbol: "TKN",
+    decimals: 18,
     nativeOnHomeChain: true,
     reps: [
-      { internalChainId: 56, address: "0xnative", isNativeRoot: true },
-      { internalChainId: 42161, address: "0xdeasset", isNativeRoot: false }, // deAsset on Arbitrum
+      { internalChainId: 56, address: "0xnative", isNativeRoot: true, decimals: 18 },
+      { internalChainId: 42161, address: "0xdeasset", isNativeRoot: false, decimals: 18 }, // deAsset on Arbitrum
     ],
     ...over,
   };
@@ -53,6 +54,29 @@ describe("enumerateUnits", () => {
   it("skips families whose home chain is not quotable", () => {
     const solanaHome = fam({ nativeChainId: 7565164, nativeOnHomeChain: false });
     expect(enumerateUnits(graphOf([solanaHome]), [1000])).toHaveLength(0);
+  });
+
+  it("skips reps with unknown or mismatched decimals (the 1:1 raw move would be unsafe)", () => {
+    // rep decimals differ from the native root → mis-scaled sell leg → skip
+    const mismatched = fam({
+      reps: [
+        { internalChainId: 56, address: "0xnative", isNativeRoot: true, decimals: 18 },
+        { internalChainId: 42161, address: "0xdeasset", isNativeRoot: false, decimals: 6 },
+      ],
+    });
+    expect(enumerateUnits(graphOf([mismatched]), [1000])).toHaveLength(0);
+
+    // rep decimals unknown (forward-found, ERC20 read failed) → skip
+    const unknownRep = fam({
+      reps: [
+        { internalChainId: 56, address: "0xnative", isNativeRoot: true, decimals: 18 },
+        { internalChainId: 42161, address: "0xdeasset", isNativeRoot: false },
+      ],
+    });
+    expect(enumerateUnits(graphOf([unknownRep]), [1000])).toHaveLength(0);
+
+    // family decimals unknown → skip the whole family
+    expect(enumerateUnits(graphOf([fam({ decimals: undefined })]), [1000])).toHaveLength(0);
   });
 });
 
@@ -110,6 +134,33 @@ describe("scanUnit", () => {
     expect(opportunity!.edge.profitable).toBe(false);
     expect(opportunity!.verification).toBeNull();
     expect(verifyCalls).toBe(0);
+  });
+
+  const route = { debridgeId: "0xfam", buyChainId: 42161, sellChainId: 56, tierUsd: 10000, kind: "redemption" as const };
+
+  it("reports live:true when both legs quote", async () => {
+    const r = await scanUnit(route, deps());
+    expect(r.live).toBe(true);
+    expect(r.opportunity).not.toBeNull();
+  });
+
+  it("reports live:false (no opportunity) when a leg has no route (amountOut 0)", async () => {
+    const r = await scanUnit(route, deps({ fetchQuote: async () => quote({ amountOut: "0" }) }));
+    expect(r.live).toBe(false);
+    expect(r.opportunity).toBeNull();
+  });
+
+  it("reports live:false when a quote throws (dead pool / aggregator 500) without propagating", async () => {
+    const r = await scanUnit(
+      route,
+      deps({
+        fetchQuote: async () => {
+          throw new Error("estimation 500 for chain");
+        },
+      })
+    );
+    expect(r.live).toBe(false);
+    expect(r.opportunity).toBeNull();
   });
 });
 

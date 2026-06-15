@@ -62,4 +62,13 @@ describe("symbiosis helpers", () => {
     expect(Number(units) / 1e18).toBeCloseTo(50 / 63779, 9);
     expect(clipToBaseUnits(100, 0, 18)).toBe("0");
   });
+
+  it("clipToBaseUnits returns '0' on non-finite/garbage input instead of throwing", () => {
+    expect(() => clipToBaseUnits(Infinity, 1, 18)).not.toThrow();
+    expect(clipToBaseUnits(Infinity, 1, 18)).toBe("0"); // usd=1e400 -> Infinity
+    expect(clipToBaseUnits(50, 1, NaN)).toBe("0"); // missing/garbage decimals
+    expect(clipToBaseUnits(50, 1, 400)).toBe("0"); // decimals too large -> overflow guard
+    expect(clipToBaseUnits(50, -5, 18)).toBe("0"); // negative price
+    expect(() => clipToBaseUnits(1e30, 1e-30, 18)).not.toThrow();
+  });
 });

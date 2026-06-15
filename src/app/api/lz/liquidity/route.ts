@@ -8,7 +8,18 @@ export const dynamic = "force-dynamic";
 
 const CACHE_TTL = 300_000; // 5 min
 const MAX_ITEMS = 60;
+const MAX_CACHE = 5000;
 const cache = new Map<string, { value: number | null; expiry: number }>();
+
+/** Store a liquidity result, bounding the cache: sweep expired entries when full, hard-clear if still over. */
+function rememberLiq(key: string, value: number | null) {
+  if (cache.size >= MAX_CACHE) {
+    const now = Date.now();
+    for (const [k, v] of cache) if (v.expiry <= now) cache.delete(k);
+    if (cache.size >= MAX_CACHE) cache.clear();
+  }
+  cache.set(key, { value, expiry: Date.now() + CACHE_TTL });
+}
 
 /** Pool liquidity (USD) for one `${chainKey}:${address}`; null when slug unknown or no data. */
 async function liquidityFor(chainKey: string, address: string): Promise<number | null> {
@@ -70,7 +81,7 @@ export async function GET(request: NextRequest) {
       const chainKey = key.slice(0, sep);
       const address = key.slice(sep + 1);
       const value = await liquidityFor(chainKey, address);
-      cache.set(key, { value, expiry: Date.now() + CACHE_TTL });
+      rememberLiq(key, value);
       out[key] = value;
     });
 

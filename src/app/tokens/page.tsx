@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useTokens } from "@/lib/hooks";
 import { getChainName } from "@/lib/chains";
+import { CardGridSkeleton } from "@/components/ui/skeleton";
 import type { TokenInfo } from "@/lib/types";
 
 function CopyButton({ text }: { text: string }) {
@@ -108,7 +109,7 @@ export default function TokensPage() {
       </div>
 
       {isLoading ? (
-        <div className="text-sm text-muted">Loading tokens...</div>
+        <CardGridSkeleton count={6} />
       ) : grouped.length === 0 ? (
         <div className="text-sm text-muted">No tokens found</div>
       ) : (

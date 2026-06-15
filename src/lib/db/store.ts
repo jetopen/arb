@@ -10,11 +10,31 @@ export interface ScanRunRecord {
   partial: boolean;
 }
 
+/** Per-unit result fed back after a batch so the queue can demote routes that can't be quoted. */
+export interface ScanOutcome {
+  unit: ScanUnit;
+  /** true when BOTH legs returned a real (non-zero, non-throwing) quote — i.e. the route has liquidity. */
+  live: boolean;
+}
+
+/**
+ * How far into the future a dead route's `lastScannedAt` is pushed so the time-ordered dequeue stops
+ * re-scanning it. A no-liquidity wrapped-deAsset retries roughly every penalty window (liquidity can
+ * appear later), instead of burning a quote every cycle. Override via env for tuning.
+ */
+export const DEAD_ROUTE_PENALTY_MS = Number(process.env.ARB_DEAD_ROUTE_PENALTY_MS ?? 6 * 60 * 60 * 1000);
+
 export interface Store {
   upsertOpportunities(opps: Opportunity[]): Promise<void>;
   topOpportunities(filter: OpportunityFilter): Promise<{ opportunities: Opportunity[]; total: number }>;
   enqueue(units: ScanUnit[], priorityOf?: (u: ScanUnit) => number): Promise<void>;
   dequeue(n: number): Promise<ScanUnit[]>;
+  /** Record per-unit scan outcomes: live (and proven) routes cycle normally, unproven-dead get demoted. */
+  markScanned(outcomes: ScanOutcome[]): Promise<void>;
+  /** Reset these units' lastScannedAt so the time-ordered dequeue scans them next (front of the line). */
+  requeueFresh(ids: string[]): Promise<void>;
+  /** Ids of routes that have ever produced a quote (an opportunity row) — the realized-quotability set. */
+  knownUnitIds(): Promise<Set<string>>;
   queueSize(): Promise<number>;
   recordScanRun(run: ScanRunRecord): Promise<void>;
   lastScanRun(): Promise<ScanRunRecord | null>;
@@ -22,14 +42,17 @@ export interface Store {
   loadFamilies(): Promise<Family[] | null>;
 }
 
-function unitKey(u: ScanUnit): string {
+/** Stable scan-unit / opportunity / queue-row id (same format across all three). */
+export function workUnitId(u: ScanUnit): string {
   return `${u.debridgeId}:${u.buyChainId}:${u.sellChainId}:${u.tierUsd}:${u.kind}`;
 }
+
+const unitKey = workUnitId;
 
 /** In-memory store (Phase 1). Swapped for a Supabase-backed store in Phase 2 via getStore(). */
 export class MemoryStore implements Store {
   private opps = new Map<string, Opportunity>();
-  private queue: ScanUnit[] = [];
+  private queue: { unit: ScanUnit; priority: number; lastScannedAt: number | null }[] = [];
   private queued = new Set<string>();
   private lastRun: ScanRunRecord | null = null;
   private families: Family[] | null = null;
@@ -53,6 +76,10 @@ export class MemoryStore implements Store {
     if (filter.chainId != null)
       list = list.filter((o) => o.buyChainId === filter.chainId || o.sellChainId === filter.chainId);
     if (filter.verifiedOnly) list = list.filter((o) => o.verification?.verified);
+    if (filter.maxAgeMs != null) {
+      const cutoff = Date.now() - filter.maxAgeMs;
+      list = list.filter((o) => o.computedAt >= cutoff);
+    }
     list.sort((a, b) => b.edge.netEdgePct - a.edge.netEdgePct);
     const total = list.length;
     const page = filter.page ?? 1;
@@ -61,12 +88,18 @@ export class MemoryStore implements Store {
     return { opportunities: list.slice(start, start + take), total };
   }
 
-  async enqueue(units: ScanUnit[]): Promise<void> {
+  async enqueue(units: ScanUnit[], priorityOf?: (u: ScanUnit) => number): Promise<void> {
     for (const u of units) {
       const k = unitKey(u);
-      if (this.queued.has(k)) continue;
+      const priority = priorityOf ? priorityOf(u) : 0;
+      if (this.queued.has(k)) {
+        // parity with arb_enqueue_work's ON CONFLICT DO UPDATE priority
+        const item = this.queue.find((i) => unitKey(i.unit) === k);
+        if (item) item.priority = priority;
+        continue;
+      }
       this.queued.add(k);
-      this.queue.push(u);
+      this.queue.push({ unit: u, priority, lastScannedAt: null });
     }
   }
 
@@ -79,12 +112,41 @@ export class MemoryStore implements Store {
   }
 
   async dequeue(n: number): Promise<ScanUnit[]> {
-    const batch = this.queue.splice(0, n);
-    for (const u of batch) this.queued.delete(unitKey(u));
-    // re-enqueue at the tail so coverage keeps cycling
-    this.queue.push(...batch);
-    for (const u of batch) this.queued.add(unitKey(u));
-    return batch;
+    // Mirror arb_dequeue_work: least-recently-scanned first (fair cycling), priority breaks ties.
+    const sorted = [...this.queue].sort((a, b) => {
+      const at = a.lastScannedAt ?? -Infinity;
+      const bt = b.lastScannedAt ?? -Infinity;
+      return at !== bt ? at - bt : b.priority - a.priority;
+    });
+    const batch = sorted.slice(0, Math.max(0, n));
+    const now = Date.now();
+    for (const item of batch) item.lastScannedAt = now;
+    return batch.map((i) => i.unit);
+  }
+
+  async markScanned(outcomes: ScanOutcome[]): Promise<void> {
+    const now = Date.now();
+    for (const { unit, live } of outcomes) {
+      const k = unitKey(unit);
+      const item = this.queue.find((i) => unitKey(i.unit) === k);
+      if (!item) continue;
+      // A proven route (one that has ever produced a quote) is never demoted on a single failure —
+      // that's a transient API blip, not a dead pool. Only unproven-dead routes get time-demoted so
+      // dequeue (time-ordered) stops re-scanning the no-liquidity wrapped reps every cycle.
+      const keep = live || this.opps.has(k);
+      item.lastScannedAt = keep ? now : now + DEAD_ROUTE_PENALTY_MS;
+    }
+  }
+
+  async requeueFresh(ids: string[]): Promise<void> {
+    const set = new Set(ids);
+    for (const item of this.queue) {
+      if (set.has(unitKey(item.unit))) item.lastScannedAt = null;
+    }
+  }
+
+  async knownUnitIds(): Promise<Set<string>> {
+    return new Set(this.opps.keys());
   }
 
   async queueSize(): Promise<number> {

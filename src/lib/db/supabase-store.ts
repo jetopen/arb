@@ -1,5 +1,6 @@
 import type { Family, Opportunity, OpportunityFilter, ScanUnit } from "../types";
-import type { Store, ScanRunRecord } from "./store";
+import type { Store, ScanRunRecord, ScanOutcome } from "./store";
+import { DEAD_ROUTE_PENALTY_MS, workUnitId } from "./store";
 import { getServiceClient } from "./supabase";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -80,6 +81,9 @@ export class SupabaseStore implements Store {
       q = q.or(`buy_chain_id.eq.${cid},sell_chain_id.eq.${cid}`);
     }
     if (filter.verifiedOnly) q = q.eq("verified", true);
+    if (filter.maxAgeMs != null && Number.isFinite(filter.maxAgeMs)) {
+      q = q.gte("computed_at", new Date(Date.now() - filter.maxAgeMs).toISOString());
+    }
     q = q.order("net_edge_pct", { ascending: false }).range(start, start + take - 1);
     const { data, count, error } = await q;
     if (error) throw new Error(`topOpportunities: ${error.message}`);
@@ -105,6 +109,62 @@ export class SupabaseStore implements Store {
     const { data, error } = await this.db.rpc("arb_dequeue_work", { n });
     if (error) throw new Error(`dequeue: ${error.message}`);
     return (data ?? []).map(rowToUnit);
+  }
+
+  async markScanned(outcomes: ScanOutcome[]): Promise<void> {
+    if (outcomes.length === 0) return;
+    const now = Date.now();
+    const liveIds = outcomes.filter((o) => o.live).map((o) => workUnitId(o.unit));
+    const deadIds = outcomes.filter((o) => !o.live).map((o) => workUnitId(o.unit));
+
+    // A dead route that has ever produced an opportunity is "proven" — a single failure is a transient
+    // blip, not a dead pool, so it keeps cycling. Only UNproven-dead routes get time-demoted.
+    let provenDead: string[] = [];
+    if (deadIds.length > 0) {
+      const { data, error } = await this.db.from("arb_opportunities").select("id").in("id", deadIds);
+      if (error) throw new Error(`markScanned(proven): ${error.message}`);
+      provenDead = (data ?? []).map((r: any) => r.id as string);
+    }
+    const provenSet = new Set(provenDead);
+    const keepIds = [...liveIds, ...provenDead]; // cycle normally (now)
+    const demoteIds = deadIds.filter((id) => !provenSet.has(id)); // push into the future
+
+    // Two bulk updates (no RPC/DDL needed). Clearing the lease lets a kept route re-enter immediately.
+    if (keepIds.length > 0) {
+      const { error } = await this.db
+        .from("arb_work_queue")
+        .update({ last_scanned_at: new Date(now).toISOString(), leased_until: null })
+        .in("id", keepIds);
+      if (error) throw new Error(`markScanned(keep): ${error.message}`);
+    }
+    if (demoteIds.length > 0) {
+      const { error } = await this.db
+        .from("arb_work_queue")
+        .update({ last_scanned_at: new Date(now + DEAD_ROUTE_PENALTY_MS).toISOString(), leased_until: null })
+        .in("id", demoteIds);
+      if (error) throw new Error(`markScanned(demote): ${error.message}`);
+    }
+  }
+
+  async requeueFresh(ids: string[]): Promise<void> {
+    // Null out lastScannedAt so the time-ordered dequeue (nulls first) scans these next — used to
+    // surface the proven-productive routes immediately on re-seed instead of after a full backlog pass.
+    for (let i = 0; i < ids.length; i += 500) {
+      const slice = ids.slice(i, i + 500);
+      const { error } = await this.db
+        .from("arb_work_queue")
+        .update({ last_scanned_at: null, leased_until: null })
+        .in("id", slice);
+      if (error) throw new Error(`requeueFresh: ${error.message}`);
+    }
+  }
+
+  async knownUnitIds(): Promise<Set<string>> {
+    // Routes that have ever produced a quote (have an opportunity row) — the realized-quotability set
+    // used to warm-start priority. Bounded select; the productive set is small relative to the queue.
+    const { data, error } = await this.db.from("arb_opportunities").select("id").limit(5000);
+    if (error) throw new Error(`knownUnitIds: ${error.message}`);
+    return new Set((data ?? []).map((r: any) => r.id as string));
   }
 
   async queueSize(): Promise<number> {

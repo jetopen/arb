@@ -2,9 +2,11 @@
 
 import type { NormalizedMessage } from "@/lib/types";
 import { MessageRow } from "./message-row";
-import { LoadingSpinner } from "./ui/loading-spinner";
+import { TableSkeleton } from "./ui/skeleton";
 import { EmptyState } from "./ui/empty-state";
 import { ErrorState } from "./ui/error-state";
+
+const COLUMNS = ["#", "Time", "Tx Hash", "From → To", "From Token", "To Token", "Amount", "Fee", "Status"];
 
 interface MessagesTableProps {
   messages: NormalizedMessage[];
@@ -30,7 +32,7 @@ export function MessagesTable({
   const totalPages = Math.ceil(total / pageSize);
 
   if (loading && messages.length === 0) {
-    return <LoadingSpinner />;
+    return <TableSkeleton columns={COLUMNS} rows={pageSize > 0 ? Math.min(pageSize, 12) : 10} />;
   }
 
   if (error) {
@@ -47,15 +49,11 @@ export function MessagesTable({
         <table className="w-full">
           <thead>
             <tr className="border-b border-border text-left">
-              <th className="px-4 py-3 text-xs font-medium text-muted uppercase tracking-wider">#</th>
-              <th className="px-4 py-3 text-xs font-medium text-muted uppercase tracking-wider">Time</th>
-              <th className="px-4 py-3 text-xs font-medium text-muted uppercase tracking-wider">Tx Hash</th>
-              <th className="px-4 py-3 text-xs font-medium text-muted uppercase tracking-wider">From → To</th>
-              <th className="px-4 py-3 text-xs font-medium text-muted uppercase tracking-wider">From Token</th>
-              <th className="px-4 py-3 text-xs font-medium text-muted uppercase tracking-wider">To Token</th>
-              <th className="px-4 py-3 text-xs font-medium text-muted uppercase tracking-wider">Amount</th>
-              <th className="px-4 py-3 text-xs font-medium text-muted uppercase tracking-wider">Fee</th>
-              <th className="px-4 py-3 text-xs font-medium text-muted uppercase tracking-wider">Status</th>
+              {COLUMNS.map((h) => (
+                <th key={h} className="px-4 py-3 text-xs font-medium text-muted uppercase tracking-wider">
+                  {h}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
