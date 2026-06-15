@@ -44,7 +44,7 @@ export async function buildScanDeps(): Promise<ScanDeps> {
     getFeeUsd: async (chainId, dbId) => getFixedFeeUsd(chainId, dbId as Hex, await getNativeUsd(chainId)),
     verify: (args) =>
       args.buyChainId === SOLANA_INTERNAL_ID
-        ? verifySolanaCandidate(args, { getTokenStats })
+        ? verifySolanaCandidate(args, { getTokenStats, getLiquidityUsd: getPoolLiquidityUsd })
         : verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd }),
     store,
     budget: getBudget(),

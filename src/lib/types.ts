@@ -208,7 +208,7 @@ export interface Verification {
   sourcesAgreed: string[];
   /** Disagreement between primary and cross-check, in bps. */
   quoteDisagreementBps: number | null;
-  /** Pool liquidity (USD) observed for the traded leg, if checked. */
+  /** Pool liquidity (USD) of the binding (thinnest) gated leg across the round-trip, if checked. */
   liquidityUsd: number | null;
   /** Reason the candidate was rejected, when verified === false. */
   rejectReason?: string;

@@ -158,6 +158,8 @@ export async function scanUnit(unit: ScanUnit, deps: ScanDeps): Promise<ScanUnit
         tierUsd: unit.tierUsd,
         buyAmountOut: buyLeg.amountOut,
         buyTokenDecimals: family.decimals,
+        sellChainId: unit.sellChainId,
+        sellTokenAddress: sellToken,
       });
     } catch {
       /* verification is an optional corroboration; absence just leaves the row unverified */
