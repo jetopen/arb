@@ -82,8 +82,7 @@ export function useTokens() {
 import type { Opportunity } from "./types";
 
 export interface ArbFilters {
-  minNetPct?: number;
-  tier?: number;
+  minSpreadPct?: number;
   chainId?: number;
   verifiedOnly?: boolean;
   take?: number;
@@ -116,8 +115,7 @@ export interface GraphSummary {
 
 function buildArbUrl(f: ArbFilters): string {
   const p = new URLSearchParams();
-  if (f.minNetPct != null) p.set("minNetPct", String(f.minNetPct));
-  if (f.tier) p.set("tier", String(f.tier));
+  if (f.minSpreadPct != null) p.set("minSpreadPct", String(f.minSpreadPct));
   if (f.chainId) p.set("chainId", String(f.chainId));
   if (f.verifiedOnly) p.set("verifiedOnly", "true");
   if (f.take) p.set("take", String(f.take));

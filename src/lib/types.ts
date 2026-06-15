@@ -236,12 +236,14 @@ export interface Opportunity {
 }
 
 export interface OpportunityFilter {
-  minNetPct?: number;
-  tierUsd?: number;
+  /** Minimum gross round-trip spread % (the price gap). Primary filter for the spread screener. */
+  minSpreadPct?: number;
   chainId?: number;
   verifiedOnly?: boolean;
   /** Exclude opportunities whose computedAt is older than this many ms (freshness gate). */
   maxAgeMs?: number;
+  /** Collapse to one row per token (family): keep the highest-spread row per debridgeId. */
+  groupByToken?: boolean;
   page?: number;
   take?: number;
 }

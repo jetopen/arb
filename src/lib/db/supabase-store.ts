@@ -5,6 +5,13 @@ import { getServiceClient } from "./supabase";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+/** True when an RPC error means the function isn't in the DB yet (migration 0003 not applied). Used to
+ *  fall back to JS-side grouping so the page keeps working until the migration runs. */
+function isMissingFunction(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false;
+  return error.code === "PGRST202" || /could not find the function|function .* does not exist/i.test(error.message ?? "");
+}
+
 export function rowToOpp(r: any): Opportunity {
   return {
     id: r.id,
@@ -73,18 +80,63 @@ export class SupabaseStore implements Store {
     const page = filter.page ?? 1;
     const take = filter.take ?? 50;
     const start = (page - 1) * take;
-    let q = this.db.from("arb_opportunities").select("*", { count: "exact" });
-    if (filter.minNetPct != null && Number.isFinite(filter.minNetPct)) q = q.gte("net_edge_pct", filter.minNetPct);
-    if (filter.tierUsd != null && Number.isFinite(filter.tierUsd)) q = q.eq("tier_usd", filter.tierUsd);
-    if (filter.chainId != null && Number.isFinite(filter.chainId)) {
-      const cid = Math.trunc(filter.chainId);
-      q = q.or(`buy_chain_id.eq.${cid},sell_chain_id.eq.${cid}`);
+
+    const computedAfter =
+      filter.maxAgeMs != null && Number.isFinite(filter.maxAgeMs)
+        ? new Date(Date.now() - filter.maxAgeMs).toISOString()
+        : null;
+    const minSpread = filter.minSpreadPct != null && Number.isFinite(filter.minSpreadPct) ? filter.minSpreadPct : null;
+    const chainId = filter.chainId != null && Number.isFinite(filter.chainId) ? Math.trunc(filter.chainId) : null;
+
+    // Shared predicate builder for the ungrouped path and the grouped fallback (identical filters).
+    const applyFilters = (q: any) => {
+      if (minSpread != null) q = q.gte("gross_spread_pct", minSpread);
+      if (chainId != null) q = q.or(`buy_chain_id.eq.${chainId},sell_chain_id.eq.${chainId}`);
+      if (filter.verifiedOnly) q = q.eq("verified", true);
+      if (computedAfter != null) q = q.gte("computed_at", computedAfter);
+      return q;
+    };
+
+    // Spread screener, one row per token: collapse server-side via the distinct-on RPC (migration 0003)
+    // so we fetch only the page we return and get an exact distinct-token total.
+    if (filter.groupByToken) {
+      const { data, error } = await this.db.rpc("arb_top_opportunities_by_token", {
+        p_min_spread_pct: minSpread,
+        p_chain_id: chainId,
+        p_verified_only: !!filter.verifiedOnly,
+        p_computed_after: computedAfter,
+        p_limit: take,
+        p_offset: start,
+      });
+      if (!error) {
+        // The RPC returns a single jsonb object { total, rows } so the exact distinct-token total
+        // survives even an out-of-range (empty) page.
+        const payload = (data ?? {}) as { total?: number | string; rows?: unknown[] };
+        const rows = Array.isArray(payload.rows) ? payload.rows : [];
+        return { opportunities: rows.map((r) => rowToOpp(r)), total: Number(payload.total ?? 0) };
+      }
+      // Fallback when 0003 (the RPC) isn't applied yet: collapse in JS so the page keeps working. Bounded
+      // by max-rows and less efficient — the RPC is the real fix once the migration runs.
+      if (!isMissingFunction(error)) throw new Error(`topOpportunities: ${error.message}`);
+      const { data: fbData, error: fbErr } = await applyFilters(this.db.from("arb_opportunities").select("*"))
+        .order("gross_spread_pct", { ascending: false })
+        .order("id", { ascending: true })
+        .limit(1000);
+      if (fbErr) throw new Error(`topOpportunities: ${fbErr.message}`);
+      const seen = new Set<string>();
+      const grouped = (fbData ?? []).filter((r: any) => {
+        if (seen.has(r.debridge_id)) return false;
+        seen.add(r.debridge_id);
+        return true;
+      });
+      return { opportunities: grouped.slice(start, start + take).map(rowToOpp), total: grouped.length };
     }
-    if (filter.verifiedOnly) q = q.eq("verified", true);
-    if (filter.maxAgeMs != null && Number.isFinite(filter.maxAgeMs)) {
-      q = q.gte("computed_at", new Date(Date.now() - filter.maxAgeMs).toISOString());
-    }
-    q = q.order("net_edge_pct", { ascending: false }).range(start, start + take - 1);
+
+    // Ungrouped (tests / future callers): exact count + DB pagination, id tiebreaker for determinism.
+    const q = applyFilters(this.db.from("arb_opportunities").select("*", { count: "exact" }))
+      .order("gross_spread_pct", { ascending: false })
+      .order("id", { ascending: true })
+      .range(start, start + take - 1);
     const { data, count, error } = await q;
     if (error) throw new Error(`topOpportunities: ${error.message}`);
     return { opportunities: (data ?? []).map(rowToOpp), total: count ?? 0 };

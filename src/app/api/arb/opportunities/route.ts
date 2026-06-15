@@ -22,11 +22,12 @@ export async function GET(request: NextRequest) {
     const maxAgeParam = finite("maxAgeMs");
     const maxAgeMs = maxAgeParam ?? parsePenaltyMs(process.env.ARB_OPP_MAX_AGE_MS, DEAD_ROUTE_PENALTY_MS);
     const filter: OpportunityFilter = {
-      minNetPct: finite("minNetPct"),
-      tierUsd: finite("tier"),
+      minSpreadPct: finite("minSpreadPct"),
       chainId: finite("chainId"),
       verifiedOnly: searchParams.get("verifiedOnly") === "true",
       maxAgeMs: maxAgeMs > 0 ? maxAgeMs : undefined,
+      // Spread screener collapses to one row per token (highest spread per debridgeId).
+      groupByToken: true,
       page: Math.max(1, finite("page") ?? 1),
       take: Math.min(Math.max(1, finite("take") ?? 50), 200),
     };
