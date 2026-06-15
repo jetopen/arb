@@ -1,8 +1,15 @@
 import { describe, it, expect } from "vitest";
 import { MemoryStore, parsePenaltyMs, DEAD_ROUTE_PENALTY_MS } from "../db/store";
-import type { Opportunity, ScanUnit } from "../types";
+import type { EdgeResult, Opportunity, ScanUnit } from "../types";
 
-function opp(id: string, netEdgePct: number, over: Partial<Opportunity> = {}): Opportunity {
+function opp(
+  id: string,
+  spreadPct: number,
+  over: Partial<Omit<Opportunity, "edge">> & { edge?: Partial<EdgeResult> } = {}
+): Opportunity {
+  // `over` may carry a partial `edge` (e.g. a net value distinct from the gross spread); merge it onto
+  // the default edge instead of letting `...over` replace the whole edge object.
+  const { edge: edgeOver, ...rest } = over;
   return {
     id,
     debridgeId: "0x" + id,
@@ -12,26 +19,27 @@ function opp(id: string, netEdgePct: number, over: Partial<Opportunity> = {}): O
     nativeChainId: 56,
     tierUsd: 10000,
     edge: {
-      grossSpreadPct: 0,
+      grossSpreadPct: spreadPct,
       dexImpactBuyBps: 0,
       dexImpactSellBps: 0,
       deportFeeUsd: 0,
       gasBuyUsd: 0,
       gasSellUsd: 0,
-      netUsd: netEdgePct * 100,
-      netEdgePct,
+      netUsd: spreadPct * 100,
+      netEdgePct: spreadPct,
       netUsdConservative: 0,
-      profitable: netEdgePct > 0,
+      profitable: spreadPct > 0,
+      ...edgeOver,
     },
     verification: null,
     lockPath: [],
     computedAt: 0,
-    ...over,
+    ...rest,
   };
 }
 
 describe("MemoryStore opportunities", () => {
-  it("upserts by id and ranks by net edge desc", async () => {
+  it("upserts by id and ranks by spread desc", async () => {
     const s = new MemoryStore();
     await s.upsertOpportunities([opp("a", 0.2), opp("b", 1.5), opp("c", 0.8)]);
     const { opportunities, total } = await s.topOpportunities({});
@@ -44,14 +52,14 @@ describe("MemoryStore opportunities", () => {
     expect(after.opportunities[0].id).toBe("a");
   });
 
-  it("filters by minNetPct, tier, chain, verifiedOnly", async () => {
+  it("filters by minSpreadPct, chain, verifiedOnly", async () => {
     const s = new MemoryStore();
     await s.upsertOpportunities([
       opp("a", 0.1),
       opp("b", 1.0, { verification: { verified: true, sourcesAgreed: ["debridge", "kyberswap"], quoteDisagreementBps: 5, liquidityUsd: 1e6 } }),
       opp("c", 2.0, { buyChainId: 8453 }),
     ]);
-    expect((await s.topOpportunities({ minNetPct: 0.5 })).total).toBe(2);
+    expect((await s.topOpportunities({ minSpreadPct: 0.5 })).total).toBe(2);
     expect((await s.topOpportunities({ verifiedOnly: true })).total).toBe(1);
     expect((await s.topOpportunities({ chainId: 8453 })).total).toBe(1);
   });
@@ -64,7 +72,48 @@ describe("MemoryStore opportunities", () => {
     expect(p1.opportunities).toHaveLength(10);
     expect(p2.opportunities).toHaveLength(10);
     expect(p1.total).toBe(25);
-    expect(p1.opportunities[0].edge.netEdgePct).toBe(24); // highest first
+    expect(p1.opportunities[0].edge.grossSpreadPct).toBe(24); // highest spread first
+  });
+
+  it("groupByToken keeps the highest-spread row per debridgeId (one row per token)", async () => {
+    const s = new MemoryStore();
+    // two routes for the SAME token (same debridgeId) + a second token
+    await s.upsertOpportunities([
+      opp("t1-a", 0.5, { debridgeId: "0xtoken1" }),
+      opp("t1-b", 1.2, { debridgeId: "0xtoken1" }),
+      opp("t2", 0.8, { debridgeId: "0xtoken2" }),
+    ]);
+    const grouped = await s.topOpportunities({ groupByToken: true });
+    expect(grouped.total).toBe(2); // two distinct tokens
+    expect(grouped.opportunities.map((o) => o.id)).toEqual(["t1-b", "t2"]); // best of token1, then token2
+    expect((await s.topOpportunities({})).total).toBe(3); // ungrouped returns every row
+  });
+
+  it("ranks and filters by gross spread, not net edge", async () => {
+    const s = new MemoryStore();
+    // x: high gross spread but deeply net-negative; y: lower spread but net-positive.
+    await s.upsertOpportunities([
+      opp("x", 2.0, { edge: { netEdgePct: -5, netUsd: -500, profitable: false } }),
+      opp("y", 1.0, { edge: { netEdgePct: 1.0, netUsd: 100, profitable: true } }),
+    ]);
+    // Sorted by gross spread → x (2.0) before y (1.0) despite x's worse net.
+    expect((await s.topOpportunities({})).opportunities.map((o) => o.id)).toEqual(["x", "y"]);
+    // minSpreadPct filters on gross spread: x passes ≥1.5 even though its net is -5.
+    const filtered = await s.topOpportunities({ minSpreadPct: 1.5 });
+    expect(filtered.total).toBe(1);
+    expect(filtered.opportunities[0].id).toBe("x");
+  });
+
+  it("breaks equal-spread ties by id (deterministic per-token winner)", async () => {
+    const s = new MemoryStore();
+    // Same token + same gross spread, different ids → lowest id wins the group.
+    await s.upsertOpportunities([
+      opp("z-b", 1.0, { debridgeId: "0xtok" }),
+      opp("z-a", 1.0, { debridgeId: "0xtok" }),
+    ]);
+    const grouped = await s.topOpportunities({ groupByToken: true });
+    expect(grouped.total).toBe(1);
+    expect(grouped.opportunities[0].id).toBe("z-a");
   });
 });
 

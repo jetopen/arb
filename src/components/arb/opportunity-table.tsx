@@ -6,7 +6,7 @@ import { TableSkeleton } from "../ui/skeleton";
 import { EmptyState } from "../ui/empty-state";
 import { ErrorState } from "../ui/error-state";
 
-const COLUMNS = ["#", "Token", "Route (buy → sell)", "Tier", "Gross %", "Net %", "Net $", "Verified"];
+const COLUMNS = ["", "#", "Token", "Route (buy → sell)", "Spread %", "dePort fee", "Verified"];
 
 interface Props {
   opportunities: Opportunity[];
@@ -36,7 +36,7 @@ export function OpportunityTable({ opportunities, loading, error, onSelect, onRe
         </thead>
         <tbody>
           {opportunities.map((o, i) => (
-            <OpportunityRow key={o.id} opp={o} index={i} onSelect={onSelect} />
+            <OpportunityRow key={o.debridgeId} opp={o} index={i} colSpan={COLUMNS.length} onSelect={onSelect} />
           ))}
         </tbody>
       </table>

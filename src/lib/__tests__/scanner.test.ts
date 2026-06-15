@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { enumerateUnits, scanUnit, runBatch, type ScanDeps } from "../arb/scanner";
+import { enumerateUnits, scanUnit, runBatch, parseNotional, type ScanDeps } from "../arb/scanner";
 import { MemoryStore } from "../db/store";
 import { RpmBudget } from "../arb/budget";
 import type { DexQuote, Family, LockGraph } from "../types";
@@ -49,6 +49,11 @@ describe("enumerateUnits", () => {
     expect(units).toHaveLength(4);
     expect(units.some((u) => u.buyChainId === 42161 && u.sellChainId === 56)).toBe(true); // rep -> home
     expect(units.some((u) => u.buyChainId === 56 && u.sellChainId === 42161)).toBe(true); // home -> rep
+  });
+
+  it("emits a single probe size per route by default (2 units/route: both directions)", () => {
+    const units = enumerateUnits(graphOf([fam({})]));
+    expect(units).toHaveLength(2); // 1 rep × 1 probe size × 2 directions
   });
 
   it("skips families whose home chain is not quotable", () => {
@@ -202,5 +207,16 @@ describe("runBatch", () => {
       budget,
     });
     expect(run.unitsProcessed).toBe(0);
+  });
+});
+
+describe("parseNotional", () => {
+  it("returns a positive integer, falling back to $1k for 0 / negative / fractional / non-numeric", () => {
+    expect(parseNotional("2500")).toBe(2500);
+    expect(parseNotional(undefined)).toBe(1000);
+    expect(parseNotional("0")).toBe(1000);
+    expect(parseNotional("-100")).toBe(1000);
+    expect(parseNotional("1000.5")).toBe(1000);
+    expect(parseNotional("abc")).toBe(1000);
   });
 });

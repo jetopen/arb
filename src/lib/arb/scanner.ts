@@ -6,7 +6,29 @@ import { redemptionEdge } from "./edge";
 import { baseToken, tierToBaseUnits } from "./base-tokens";
 import { isEvmDeportChain } from "../deport/registry";
 
-export const DEFAULT_TIERS = [1000, 10000, 50000];
+/**
+ * The scanner probes ONE small notional per route, not a tier ladder — this is a SPREAD screener.
+ * It surfaces the round-trip gross price gap (`grossSpreadPct`); size and profit are the user's to
+ * compute (the per-route optimizer drawer sweeps $25–$5k on demand). A single small probe (a) keeps
+ * DEX price impact low so the spread ≈ the true mid-price gap, and (b) cuts quote spend ~3× vs the
+ * old 3-tier ladder, so the cycling scanner reaches ~3× more distinct families within the same RPM
+ * budget. Override the probe size via ARB_SCAN_NOTIONAL_USD (falls back to $1k on a non-numeric value).
+ */
+/**
+ * Parse the probe-size env into a POSITIVE INTEGER. `tier_usd` is an `int` column, so a fractional
+ * value would make every Supabase upsert/enqueue throw; a negative would feed a negative amountIn to
+ * the quote API. Unset / non-numeric / non-integer / non-positive all fall back to $1k.
+ */
+export function parseNotional(raw: string | undefined): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : 1000;
+}
+export const SCAN_NOTIONAL_USD = parseNotional(process.env.ARB_SCAN_NOTIONAL_USD);
+/**
+ * Notionals scanned per route. Retained as an array (and named DEFAULT_TIERS for call-site
+ * compatibility with enumerateUnits/seedQueue) but now a single probe size — see SCAN_NOTIONAL_USD.
+ */
+export const DEFAULT_TIERS = [SCAN_NOTIONAL_USD];
 
 /**
  * PURE: expand the lock-graph into redemption scan-units. For every (rep, home) pair we emit BOTH

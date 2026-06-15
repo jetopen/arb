@@ -88,8 +88,7 @@ export class MemoryStore implements Store {
 
   async topOpportunities(filter: OpportunityFilter): Promise<{ opportunities: Opportunity[]; total: number }> {
     let list = [...this.opps.values()];
-    if (filter.minNetPct != null) list = list.filter((o) => o.edge.netEdgePct >= filter.minNetPct!);
-    if (filter.tierUsd != null) list = list.filter((o) => o.tierUsd === filter.tierUsd);
+    if (filter.minSpreadPct != null) list = list.filter((o) => o.edge.grossSpreadPct >= filter.minSpreadPct!);
     if (filter.chainId != null)
       list = list.filter((o) => o.buyChainId === filter.chainId || o.sellChainId === filter.chainId);
     if (filter.verifiedOnly) list = list.filter((o) => o.verification?.verified);
@@ -97,7 +96,20 @@ export class MemoryStore implements Store {
       const cutoff = Date.now() - filter.maxAgeMs;
       list = list.filter((o) => o.computedAt >= cutoff);
     }
-    list.sort((a, b) => b.edge.netEdgePct - a.edge.netEdgePct);
+    // Spread screener: rank by the raw round-trip gross spread (the price gap), highest first; break
+    // ties by id (code-unit order, mirroring the RPC's `order by …, id`) so the order — and the
+    // per-token winner kept below — is deterministic.
+    list.sort((a, b) => b.edge.grossSpreadPct - a.edge.grossSpreadPct || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    // One row per token (family): keep the highest-spread row per debridgeId. The list is already
+    // sorted by spread desc, so the first occurrence of each debridgeId is its best.
+    if (filter.groupByToken) {
+      const seen = new Set<string>();
+      list = list.filter((o) => {
+        if (seen.has(o.debridgeId)) return false;
+        seen.add(o.debridgeId);
+        return true;
+      });
+    }
     const total = list.length;
     const page = filter.page ?? 1;
     const take = filter.take ?? 50;

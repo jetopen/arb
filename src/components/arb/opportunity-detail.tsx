@@ -2,8 +2,8 @@
 
 import { useEffect, useState } from "react";
 import type { Opportunity } from "@/lib/types";
-import { chainName, getChainByInternalId } from "@/lib/deport/registry";
-import { getExplorerAddressUrl } from "@/lib/chains";
+import { chainName } from "@/lib/deport/registry";
+import { LegAddress } from "./leg-address";
 
 function money(n: number): string {
   return `${n < 0 ? "-" : ""}$${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
@@ -47,15 +47,19 @@ export function OpportunityDetail({ opp, onClose }: { opp: Opportunity; onClose:
 
         <div className="overflow-y-auto h-[calc(100%-64px)] px-6 py-4 space-y-6">
           <Section title="Edge">
-            <Row label="Net edge %">
-              <span className={e.netEdgePct > 0 ? "text-accent font-semibold" : "text-red-600"}>
+            <Row label="Gross spread">
+              <span className={e.grossSpreadPct > 0 ? "text-accent font-semibold" : "text-red-600"}>
+                {e.grossSpreadPct >= 0 ? "+" : ""}{e.grossSpreadPct.toFixed(3)}%
+              </span>
+            </Row>
+            <Row label="Probe size">${opp.tierUsd.toLocaleString()}</Row>
+            <Row label="Net edge % (after fees)">
+              <span className={e.netEdgePct > 0 ? "text-accent" : "text-red-600"}>
                 {e.netEdgePct >= 0 ? "+" : ""}{e.netEdgePct.toFixed(3)}%
               </span>
             </Row>
             <Row label="Net (optimistic)">{money(e.netUsd)}</Row>
             <Row label="Net (after slippage)">{money(e.netUsdConservative)}</Row>
-            <Row label="Gross spread">{e.grossSpreadPct.toFixed(3)}%</Row>
-            <Row label="Tier (notional)">${opp.tierUsd.toLocaleString()}</Row>
           </Section>
 
           <OptimizeSection opp={opp} />
@@ -99,22 +103,12 @@ export function OpportunityDetail({ opp, onClose }: { opp: Opportunity; onClose:
           )}
 
           <Section title="Lock path">
-            {opp.lockPath.map((leg, i) => {
-              const evmId = getChainByInternalId(leg.chainId)?.evmChainId ?? leg.chainId;
-              const url = getExplorerAddressUrl(evmId, leg.address);
-              return (
-                <div key={i} className="text-sm">
-                  <div className="text-muted">{i + 1}. {chainName(leg.chainId)} — {leg.role}</div>
-                  {url ? (
-                    <a href={url} target="_blank" rel="noopener noreferrer" className="font-mono text-xs text-accent hover:underline break-all">
-                      {leg.address}
-                    </a>
-                  ) : (
-                    <span className="font-mono text-xs break-all">{leg.address}</span>
-                  )}
-                </div>
-              );
-            })}
+            {opp.lockPath.map((leg, i) => (
+              <div key={i} className="text-sm">
+                <div className="text-muted">{i + 1}. {chainName(leg.chainId)} — {leg.role}</div>
+                <LegAddress chainId={leg.chainId} address={leg.address} />
+              </div>
+            ))}
           </Section>
 
           <p className="text-xs text-muted border-t border-border pt-4">
