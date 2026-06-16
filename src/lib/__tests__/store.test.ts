@@ -267,6 +267,16 @@ describe("MemoryStore freshness gate (maxAgeMs)", () => {
   });
 });
 
+describe("MemoryStore alert dedup (filterNewAlerts)", () => {
+  it("returns only ids not previously recorded", async () => {
+    const s = new MemoryStore();
+    expect(await s.filterNewAlerts(["a", "b"])).toEqual(["a", "b"]); // both new
+    expect(await s.filterNewAlerts(["a", "b"])).toEqual([]); // already alerted
+    expect(await s.filterNewAlerts(["b", "c"])).toEqual(["c"]); // only the new one
+    expect(await s.filterNewAlerts([])).toEqual([]);
+  });
+});
+
 describe("read-freshness default decoupled from dead-route penalty (Fix 1)", () => {
   it("DEFAULT_OPP_MAX_AGE_MS is 24h and wider than the 6h dead-route penalty", () => {
     expect(DEFAULT_OPP_MAX_AGE_MS).toBe(24 * 60 * 60 * 1000);

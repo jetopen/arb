@@ -311,6 +311,13 @@ export class SupabaseStore implements Store {
     if (error) throw new Error(`saveGraph: ${error.message}`);
   }
 
+  async filterNewAlerts(ids: string[]): Promise<string[]> {
+    if (ids.length === 0) return [];
+    const { data, error } = await this.db.rpc("arb_filter_new_alerts", { p_ids: ids });
+    if (error) throw new Error(`filterNewAlerts: ${error.message}`);
+    return (data ?? []).map((r: any) => (typeof r === "string" ? r : r.id));
+  }
+
   async loadGraph(): Promise<LockGraph | null> {
     // Single jsonb value (not a row select) so the family list can't hit PostgREST's 1000-row cap.
     const { data, error } = await this.db.rpc("arb_load_graph");

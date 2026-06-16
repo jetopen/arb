@@ -14,6 +14,8 @@ import { chainName } from "../deport/registry";
 import { RpmBudget } from "./budget";
 import { runBatch, seedQueue, type ScanDeps } from "./scanner";
 import { optimizeRoute } from "./optimize";
+import { sendDiscordAlert } from "../alerts/providers/discord";
+import { shouldAlert, formatOpportunityEmbed, parseAlertMinSpread, ALERT_BATCH_CAP } from "../alerts/opportunity-alert";
 
 let budget: RpmBudget | null = null;
 function getBudget(): RpmBudget {
@@ -37,6 +39,23 @@ export async function buildScanDeps(): Promise<ScanDeps> {
   }
 
   const apiKey = process.env.DEBRIDGE_API_KEY || undefined;
+  // Discord alerts (server-side, fired from whoever drives scans — incl. the headless worker). Active
+  // only when DISCORD_WEBHOOK_URL is set; alerts on net-profitable routes OR gross spread >= the optional
+  // ARB_ALERT_MIN_SPREAD_PCT. filterNewAlerts dedups so each opportunity pings once, not every tick.
+  const discordUrl = process.env.DISCORD_WEBHOOK_URL || undefined;
+  const alertMinSpread = parseAlertMinSpread(process.env.ARB_ALERT_MIN_SPREAD_PCT);
+  const notify: ScanDeps["notify"] = discordUrl
+    ? async (opps) => {
+        // Cap BEFORE marking, so extras beyond the cap stay un-marked and get another chance next batch.
+        const candidates = opps.filter((o) => shouldAlert(o, alertMinSpread)).slice(0, ALERT_BATCH_CAP);
+        if (candidates.length === 0) return;
+        const fresh = new Set(await store.filterNewAlerts(candidates.map((o) => o.id)));
+        for (const o of candidates) {
+          if (fresh.has(o.id)) await sendDiscordAlert(discordUrl, { embeds: [formatOpportunityEmbed(o)] });
+        }
+      }
+    : undefined;
+
   return {
     getFamily: (id) => famMap.get(id),
     fetchQuote: (c, i, o, a) =>
@@ -49,6 +68,7 @@ export async function buildScanDeps(): Promise<ScanDeps> {
     store,
     budget: getBudget(),
     concurrency: Number(process.env.ARB_SCAN_CONCURRENCY ?? 8),
+    notify,
   };
 }
 

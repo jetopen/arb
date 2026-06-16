@@ -73,6 +73,9 @@ export interface Store {
   saveGraph(graph: LockGraph): Promise<void>;
   /** Load the last persisted snapshot, or null when none has been written. */
   loadGraph(): Promise<LockGraph | null>;
+  /** Record alert ids and return ONLY the ones not previously recorded — dedup so each opportunity
+   *  pings once, not every scan tick it stays profitable. */
+  filterNewAlerts(ids: string[]): Promise<string[]>;
 }
 
 /** Stable scan-unit / opportunity / queue-row id (same format across all three). */
@@ -89,6 +92,7 @@ export class MemoryStore implements Store {
   private queued = new Set<string>();
   private lastRun: ScanRunRecord | null = null;
   private graph: LockGraph | null = null;
+  private alerted = new Set<string>();
 
   async upsertOpportunities(opps: Opportunity[]): Promise<void> {
     for (const o of opps) {
@@ -154,6 +158,17 @@ export class MemoryStore implements Store {
 
   async loadGraph(): Promise<LockGraph | null> {
     return this.graph;
+  }
+
+  async filterNewAlerts(ids: string[]): Promise<string[]> {
+    const fresh: string[] = [];
+    for (const id of ids) {
+      if (!this.alerted.has(id)) {
+        this.alerted.add(id);
+        fresh.push(id);
+      }
+    }
+    return fresh;
   }
 
   async dequeue(n: number): Promise<ScanUnit[]> {

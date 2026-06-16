@@ -81,6 +81,9 @@ export interface ScanDeps {
   store: Store;
   budget: RpmBudget;
   concurrency?: number;
+  /** Optional post-upsert hook for side-channel notifications (e.g. Discord). Receives the batch's
+   *  opportunities; best-effort — runBatch swallows its errors so a notifier can't break scanning. */
+  notify?: (opps: Opportunity[]) => Promise<void>;
 }
 
 function opportunityId(u: ScanUnit): string {
@@ -224,6 +227,8 @@ export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord
 
   const opps = results.map((r) => r.opportunity).filter((o): o is Opportunity => o !== null);
   if (opps.length > 0) await deps.store.upsertOpportunities(opps);
+  // Best-effort side-channel notify (Discord) — never let it block or break a scan batch.
+  if (deps.notify && opps.length > 0) await deps.notify(opps).catch(() => {});
 
   // Feed scan outcomes back so the queue demotes dead (no-liquidity) routes and keeps cycling live ones.
   if (units.length > 0) await deps.store.markScanned(units.map((u, i) => ({ unit: u, live: results[i].live })));
