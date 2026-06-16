@@ -12,8 +12,15 @@
 //   SCAN_DRIVER_INTERVAL_MS  loop interval                 (default 12000)
 //   CRON_SECRET              if set, sent as Bearer auth   (must match the app's CRON_SECRET)
 
-import { loadEnvConfig } from "@next/env";
-loadEnvConfig(process.cwd(), true);
+// @next/env is CommonJS — import the default object and call loadEnvConfig off it. Best-effort: on a
+// host like Heroku the config vars are already in process.env and there's no .env.local on disk, so a
+// failure (or absence) here is harmless. It only matters for local `node scripts/scan-driver.mjs` runs.
+import nextEnv from "@next/env";
+try {
+  nextEnv?.loadEnvConfig?.(process.cwd(), true);
+} catch {
+  /* production: real env vars already present */
+}
 
 const BASE = (process.env.SCAN_DRIVER_URL || "http://localhost:3000").replace(/\/+$/, "");
 const N = Math.min(Math.max(Number(process.env.SCAN_DRIVER_N) || 24, 1), 32);
