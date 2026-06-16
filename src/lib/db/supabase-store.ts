@@ -1,6 +1,6 @@
 import type { Family, LockGraph, Opportunity, OpportunityFilter, ScanUnit } from "../types";
 import type { Store, ScanRunRecord, ScanOutcome } from "./store";
-import { DEAD_ROUTE_PENALTY_MS, workUnitId } from "./store";
+import { DEAD_ROUTE_PENALTY_MS, HOT_RATIO, workUnitId } from "./store";
 import { getServiceClient } from "./supabase";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -186,7 +186,11 @@ export class SupabaseStore implements Store {
   }
 
   async dequeue(n: number): Promise<ScanUnit[]> {
-    const { data, error } = await this.db.rpc("arb_dequeue_work", { n });
+    // Hot-lane split: reserve ceil(n*HOT_RATIO) slots for the proven set (priority>=1) so live routes
+    // refresh fast. The RPC leases the hot rows in its first statement, so the cold fill (second statement)
+    // can't re-grab them — one round-trip, no double-lease.
+    const n_hot = Math.ceil(Math.max(0, n) * HOT_RATIO);
+    const { data, error } = await this.db.rpc("arb_dequeue_batch", { n, n_hot });
     if (error) throw new Error(`dequeue: ${error.message}`);
     return (data ?? []).map(rowToUnit);
   }

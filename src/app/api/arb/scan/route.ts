@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { runScan } from "@/lib/arb/scan-service";
+import { requireCron } from "@/lib/api-auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -7,6 +8,8 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 120;
 
 export async function GET(request: NextRequest) {
+  const denied = requireCron(request);
+  if (denied) return denied;
   try {
     const { searchParams } = new URL(request.url);
     const n = Math.min(Math.max(Number(searchParams.get("n") ?? "12"), 1), 32);

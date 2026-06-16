@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { MemoryStore, parsePenaltyMs, DEAD_ROUTE_PENALTY_MS } from "../db/store";
+import { MemoryStore, parsePenaltyMs, parseHotRatio, DEAD_ROUTE_PENALTY_MS, DEFAULT_OPP_MAX_AGE_MS, HOT_RATIO } from "../db/store";
 import type { EdgeResult, Opportunity, ScanUnit } from "../types";
 
 function opp(
@@ -196,15 +196,17 @@ describe("MemoryStore adaptive demotion + realized quotability", () => {
     expect((await s.dequeue(1))[0].debridgeId).toBe("b"); // equal staleness, higher priority wins
   });
 
-  it("requeueFresh does NOT reset lastScannedAt — proven routes can't starve a never-scanned route (fix #2)", async () => {
+  it("requeueFresh only bumps priority (never resets lastScannedAt); the cold lane still serves never-scanned routes (fix #2)", async () => {
     const s = new MemoryStore();
     await s.enqueue([u("proven")]);
     await s.dequeue(1); // proven scanned: lastScannedAt = now
     await s.enqueue([u("fresh")]); // a newly-discovered, never-scanned route (lastScannedAt = null)
-    await s.requeueFresh(["proven:1:56:1000:redemption"]); // warm-start the proven route
-    // The never-scanned route still sorts first (null < now); the warm-start must NOT have jumped
-    // the proven route ahead of it by nulling its timestamp.
-    expect((await s.dequeue(1))[0].debridgeId).toBe("fresh");
+    await s.requeueFresh(["proven:1:56:1000:redemption"]); // warm-start the proven route → priority 1
+    // A realistic batch reserves the hot lane for the proven route AND the cold lane for the never-scanned
+    // one — so warming a proven route does NOT starve discovery. The fix-#2 guarantee now holds via the
+    // cold-lane reservation rather than pure time-ordering (and requeueFresh still never nulls the stamp).
+    const batch = await s.dequeue(2);
+    expect(batch.map((b) => b.debridgeId).sort()).toEqual(["fresh", "proven"]);
   });
 
   it("dequeue freshness gate holds the penalty even when the live set is smaller than the batch (fix #3)", async () => {
@@ -262,5 +264,55 @@ describe("MemoryStore freshness gate (maxAgeMs)", () => {
     const recent = await s.topOpportunities({ maxAgeMs: 3_600_000 }); // 1h
     expect(recent.total).toBe(1);
     expect(recent.opportunities[0].id).toBe("fresh"); // stale dropped despite higher edge
+  });
+});
+
+describe("read-freshness default decoupled from dead-route penalty (Fix 1)", () => {
+  it("DEFAULT_OPP_MAX_AGE_MS is 24h and wider than the 6h dead-route penalty", () => {
+    expect(DEFAULT_OPP_MAX_AGE_MS).toBe(24 * 60 * 60 * 1000);
+    expect(DEFAULT_OPP_MAX_AGE_MS).toBeGreaterThan(DEAD_ROUTE_PENALTY_MS);
+    expect(parsePenaltyMs(undefined, DEFAULT_OPP_MAX_AGE_MS)).toBe(24 * 60 * 60 * 1000); // unset env → 24h
+  });
+});
+
+describe("hot-lane dequeue (Fix 3)", () => {
+  const u = (id: string): ScanUnit => ({ debridgeId: id, buyChainId: 1, sellChainId: 56, tierUsd: 1000, kind: "redemption" });
+
+  it("parseHotRatio clamps to 0..1 and defaults to 0.5; HOT_RATIO is the parsed env", () => {
+    expect(parseHotRatio(undefined)).toBe(0.5);
+    expect(parseHotRatio("abc")).toBe(0.5);
+    expect(parseHotRatio("2")).toBe(0.5); // out of range → default
+    expect(parseHotRatio("-0.1")).toBe(0.5);
+    expect(parseHotRatio("0.25")).toBe(0.25);
+    expect(parseHotRatio("0")).toBe(0);
+    expect(HOT_RATIO).toBeGreaterThanOrEqual(0);
+    expect(HOT_RATIO).toBeLessThanOrEqual(1);
+  });
+
+  it("reserves the hot lane for proven (priority>=1) routes, refreshing them alongside cold discovery", async () => {
+    const s = new MemoryStore();
+    await s.enqueue([u("p")], () => 1); // proven (priority 1)
+    await s.enqueue([u("c1"), u("c2"), u("c3")]); // never-scanned cold (priority 0)
+    // n=2 → hotN=ceil(2*0.5)=1: the proven route takes the hot slot; one cold route fills the rest.
+    const batch = await s.dequeue(2);
+    expect(batch).toHaveLength(2);
+    expect(batch.map((b) => b.debridgeId)).toContain("p");
+    expect(batch.filter((b) => b.debridgeId === "p")).toHaveLength(1); // taken once, not by both lanes
+  });
+
+  it("the hot lane still respects the freshness gate — a demoted proven route is skipped", async () => {
+    const s = new MemoryStore();
+    await s.enqueue([u("p")], () => 1); // priority 1 but no opportunity row → unproven on failure
+    await s.dequeue(2);
+    await s.markScanned([{ unit: u("p"), live: false }]); // demoted to now + 6h
+    expect(await s.dequeue(2)).toHaveLength(0); // past the freshness gate, even though priority>=1
+  });
+
+  it("never returns the same proven row in both lanes within one dequeue", async () => {
+    const s = new MemoryStore();
+    await s.enqueue([u("p1"), u("p2")], () => 1); // both proven
+    const ids = (await s.dequeue(2)).map((b) => b.debridgeId);
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(2); // no duplicate across hot + cold
   });
 });

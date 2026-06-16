@@ -36,6 +36,20 @@ export function parsePenaltyMs(raw: string | undefined, fallback = DEFAULT_DEAD_
 
 export const DEAD_ROUTE_PENALTY_MS = parsePenaltyMs(process.env.ARB_DEAD_ROUTE_PENALTY_MS);
 
+/** Default read-freshness window for the Opportunities list — DECOUPLED from the dead-route penalty. The
+ * work queue can take well over 6h to cycle when scanning is sparse, so a 6h read gate hid most still-valid
+ * tokens (only those scanned in the last 6h showed). 24h surfaces the full live set; override via
+ * ARB_OPP_MAX_AGE_MS, and maxAgeMs<=0 (at the route) disables the gate entirely. */
+export const DEFAULT_OPP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** Fraction of each dequeue batch reserved for the proven/realized-quotability set (priority>=1) so the
+ * handful of live routes refresh fast instead of competing time-fairly with the ~1000 dead ones. 0..1. */
+export function parseHotRatio(raw: string | undefined): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 0.5;
+}
+export const HOT_RATIO = parseHotRatio(process.env.ARB_SCAN_HOT_RATIO);
+
 export interface Store {
   upsertOpportunities(opps: Opportunity[]): Promise<void>;
   topOpportunities(filter: OpportunityFilter): Promise<{ opportunities: Opportunity[]; total: number }>;
@@ -143,18 +157,30 @@ export class MemoryStore implements Store {
   }
 
   async dequeue(n: number): Promise<ScanUnit[]> {
-    // Mirror arb_dequeue_work: least-recently-scanned first (fair cycling), priority breaks ties.
+    // Mirror arb_dequeue_batch: least-recently-scanned first (fair cycling), priority breaks ties, with a
+    // reserved HOT lane for the proven set so live routes refresh fast instead of competing time-fairly
+    // with the ~1000 dead routes.
     const now = Date.now();
+    const cmp = (
+      a: { priority: number; lastScannedAt: number | null },
+      b: { priority: number; lastScannedAt: number | null }
+    ) => {
+      const at = a.lastScannedAt ?? -Infinity;
+      const bt = b.lastScannedAt ?? -Infinity;
+      return at !== bt ? at - bt : b.priority - a.priority;
+    };
     // Freshness gate (fix #3): a route demoted into the future (lastScannedAt = now + penalty) is NOT
     // eligible until that time passes — otherwise a small queue re-dequeues it immediately and the
     // dead-route penalty never holds. Only null (never scanned) or past timestamps are eligible.
     const eligible = this.queue.filter((i) => i.lastScannedAt === null || i.lastScannedAt <= now);
-    const sorted = eligible.sort((a, b) => {
-      const at = a.lastScannedAt ?? -Infinity;
-      const bt = b.lastScannedAt ?? -Infinity;
-      return at !== bt ? at - bt : b.priority - a.priority;
-    });
-    const batch = sorted.slice(0, Math.max(0, n));
+    const want = Math.max(0, n);
+    // Hot lane first (proven, priority>=1), then cold fills the rest from the REMAINING eligible. One
+    // snapshot + a `taken` set ⇒ a row can never be taken by both lanes in a single dequeue.
+    const hotN = Math.ceil(want * HOT_RATIO);
+    const hot = eligible.filter((i) => i.priority >= 1).sort(cmp).slice(0, hotN);
+    const taken = new Set(hot);
+    const cold = eligible.filter((i) => !taken.has(i)).sort(cmp).slice(0, want - hot.length);
+    const batch = [...hot, ...cold];
     for (const item of batch) item.lastScannedAt = now;
     return batch.map((i) => i.unit);
   }

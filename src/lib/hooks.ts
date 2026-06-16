@@ -131,10 +131,16 @@ export function useArbOpportunities(filters: ArbFilters) {
   });
 }
 
-/** Polls the scan endpoint to keep the cycling scanner advancing while the page is open. */
+/**
+ * Polls the scan endpoint to keep the cycling scanner advancing while the page is open. When a dedicated
+ * scan driver owns scanning (NEXT_PUBLIC_ARB_DRIVER=1), the browser must NOT also poll — the key goes null
+ * (SWR disabled), and it would 401 anyway if CRON_SECRET is set. ScanStatus then falls back to the queue
+ * depth from the graph summary.
+ */
 export function useArbScanner(n = 12) {
+  const driverOwnsScanning = process.env.NEXT_PUBLIC_ARB_DRIVER === "1";
   return useSWR<{ unitsProcessed: number; remaining: number; rpmAvailable: number }>(
-    `/api/arb/scan?n=${n}`,
+    driverOwnsScanning ? null : `/api/arb/scan?n=${n}`,
     fetcher,
     { refreshInterval: 7_000, revalidateOnFocus: false, dedupingInterval: 5_000 }
   );
