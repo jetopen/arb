@@ -1,7 +1,7 @@
-import { describe, it, expect } from "vitest";
-import { assembleFamilies, multiChainFamilies, mergeForwardReps, fillMeta, forwardUniverse, type TokenMeta } from "../deport/graph";
+import { describe, it, expect, vi } from "vitest";
+import { assembleFamilies, multiChainFamilies, mergeForwardReps, fillMeta, forwardUniverse, resolveLockGraph, type TokenMeta } from "../deport/graph";
 import { computeDebridgeId, type RawDeAsset } from "../onchain/debridge-gate";
-import type { Family } from "../types";
+import type { Family, LockGraph } from "../types";
 
 // A token natively on chain 56, its address.
 const USDT_BSC = "0x55d398326f99059ff775485246999027b3197955";
@@ -209,5 +209,139 @@ describe("debridgeId encoding", () => {
     // verified live against deBridgeGate.getDebridgeId(1, WETH)
     const wethId = computeDebridgeId(1, "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
     expect(wethId).toBe("0x7a4f5988eb2e00ce51697c543e0163ef96f4ec0dfd6729d29b0a1dd88626f055");
+  });
+});
+
+describe("resolveLockGraph (snapshot read-through tiering)", () => {
+  const lg = (builtAt: number, tag: string): LockGraph => ({
+    families: [{ debridgeId: tag, nativeChainId: 1, nativeAddress: "0x", nativeOnHomeChain: true, reps: [] }],
+    builtAt,
+    chainsScanned: [1],
+    partial: false,
+  });
+
+  it("tier 1: serves a fresh in-memory entry without loading or building", async () => {
+    const loadSnapshot = vi.fn(async () => lg(0, "snap"));
+    const build = vi.fn(async () => lg(0, "built"));
+    const saveSnapshot = vi.fn(async () => {});
+    const out = await resolveLockGraph(false, { now: 1100, cached: lg(1000, "mem"), ttlMs: 1000, loadSnapshot, build, saveSnapshot });
+    expect(out.families[0].debridgeId).toBe("mem");
+    expect(loadSnapshot).not.toHaveBeenCalled();
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  it("tier 2: in-memory stale → serves a fresh snapshot, no build, no write-back", async () => {
+    const build = vi.fn(async () => lg(0, "built"));
+    const saveSnapshot = vi.fn(async () => {});
+    const out = await resolveLockGraph(false, { now: 1500, cached: lg(0, "mem"), ttlMs: 1000, loadSnapshot: async () => lg(1000, "snap"), build, saveSnapshot });
+    expect(out.families[0].debridgeId).toBe("snap");
+    expect(build).not.toHaveBeenCalled();
+    expect(saveSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("tier 3: both stale → builds and writes the built graph back", async () => {
+    const built = lg(2000, "built");
+    const build = vi.fn(async () => built);
+    const saveSnapshot = vi.fn(async () => {});
+    const out = await resolveLockGraph(false, { now: 5000, cached: lg(0, "mem"), ttlMs: 1000, loadSnapshot: async () => lg(1000, "snap"), build, saveSnapshot });
+    expect(out).toBe(built);
+    expect(build).toHaveBeenCalledOnce();
+    expect(saveSnapshot).toHaveBeenCalledWith(built);
+  });
+
+  it("snapshot never written (null) → builds and saves", async () => {
+    const build = vi.fn(async () => lg(2000, "built"));
+    const saveSnapshot = vi.fn(async () => {});
+    const out = await resolveLockGraph(false, { now: 5000, cached: null, ttlMs: 1000, loadSnapshot: async () => null, build, saveSnapshot });
+    expect(out.families[0].debridgeId).toBe("built");
+    expect(build).toHaveBeenCalledOnce();
+    expect(saveSnapshot).toHaveBeenCalledOnce();
+  });
+
+  it("force bypasses BOTH fresh tiers, rebuilds and saves", async () => {
+    const loadSnapshot = vi.fn(async () => lg(9000, "snap"));
+    const build = vi.fn(async () => lg(9999, "built"));
+    const saveSnapshot = vi.fn(async () => {});
+    const out = await resolveLockGraph(true, { now: 9000, cached: lg(9000, "mem"), ttlMs: 1e9, loadSnapshot, build, saveSnapshot });
+    expect(out.families[0].debridgeId).toBe("built");
+    expect(loadSnapshot).not.toHaveBeenCalled(); // force never reads the snapshot
+    expect(build).toHaveBeenCalledOnce();
+    expect(saveSnapshot).toHaveBeenCalledOnce();
+  });
+
+  it("loadSnapshot failure falls through to a live build (best-effort)", async () => {
+    const build = vi.fn(async () => lg(2000, "built"));
+    const out = await resolveLockGraph(false, {
+      now: 5000, cached: null, ttlMs: 1000,
+      loadSnapshot: async () => { throw new Error("db down"); }, build, saveSnapshot: async () => {},
+    });
+    expect(out.families[0].debridgeId).toBe("built");
+    expect(build).toHaveBeenCalledOnce();
+  });
+
+  it("saveSnapshot failure still returns the built graph", async () => {
+    const built = lg(2000, "built");
+    const out = await resolveLockGraph(false, {
+      now: 5000, cached: null, ttlMs: 1000, loadSnapshot: async () => null,
+      build: async () => built, saveSnapshot: async () => { throw new Error("write fail"); },
+    });
+    expect(out).toBe(built);
+  });
+
+  const empty = (builtAt: number): LockGraph => ({ families: [], builtAt, chainsScanned: [], partial: true });
+
+  it("does NOT serve a zero-family in-memory entry as fresh — consults the snapshot", async () => {
+    const build = vi.fn(async () => lg(0, "built"));
+    const out = await resolveLockGraph(false, {
+      now: 1100, cached: empty(1000), ttlMs: 1000, loadSnapshot: async () => lg(1000, "snap"), build, saveSnapshot: async () => {},
+    });
+    expect(out.families[0].debridgeId).toBe("snap"); // empty in-mem must not poison the cache
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  it("ignores a fresh-but-empty snapshot and rebuilds", async () => {
+    const build = vi.fn(async () => lg(2000, "built"));
+    const out = await resolveLockGraph(false, {
+      now: 1100, cached: null, ttlMs: 1e9, loadSnapshot: async () => empty(1000), build, saveSnapshot: async () => {},
+    });
+    expect(out.families[0].debridgeId).toBe("built");
+    expect(build).toHaveBeenCalledOnce();
+  });
+
+  it("treats a non-finite builtAt as not-fresh (never serves a NaN-stamped graph)", async () => {
+    const build = vi.fn(async () => lg(2000, "built"));
+    const out = await resolveLockGraph(false, {
+      now: 5000, cached: lg(NaN, "mem"), ttlMs: 1e9, loadSnapshot: async () => null, build, saveSnapshot: async () => {},
+    });
+    expect(out.families[0].debridgeId).toBe("built");
+    expect(build).toHaveBeenCalledOnce();
+  });
+
+  it("empty build falls back to a stale-but-usable snapshot rather than serving zero families; never persists empty", async () => {
+    const saveSnapshot = vi.fn(async () => {});
+    const out = await resolveLockGraph(false, {
+      now: 5000, cached: null, ttlMs: 1000, loadSnapshot: async () => lg(0, "snap"), build: async () => empty(5000), saveSnapshot,
+    });
+    expect(out.families[0].debridgeId).toBe("snap"); // stale real data beats empty
+    expect(saveSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("empty build falls back to the last good in-memory entry when no snapshot exists", async () => {
+    const saveSnapshot = vi.fn(async () => {});
+    const out = await resolveLockGraph(false, {
+      now: 5000, cached: lg(0, "mem"), ttlMs: 1000, loadSnapshot: async () => null, build: async () => empty(5000), saveSnapshot,
+    });
+    expect(out.families[0].debridgeId).toBe("mem");
+    expect(saveSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("empty build with no usable fallback returns the empty graph and does not persist it", async () => {
+    const saveSnapshot = vi.fn(async () => {});
+    const built = empty(5000);
+    const out = await resolveLockGraph(false, {
+      now: 5000, cached: null, ttlMs: 1000, loadSnapshot: async () => null, build: async () => built, saveSnapshot,
+    });
+    expect(out).toBe(built);
+    expect(saveSnapshot).not.toHaveBeenCalled();
   });
 });

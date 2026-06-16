@@ -1,4 +1,4 @@
-import type { Family, Opportunity, OpportunityFilter, ScanUnit } from "../types";
+import type { Family, LockGraph, Opportunity, OpportunityFilter, ScanUnit } from "../types";
 import type { Store, ScanRunRecord, ScanOutcome } from "./store";
 import { DEAD_ROUTE_PENALTY_MS, workUnitId } from "./store";
 import { getServiceClient } from "./supabase";
@@ -60,6 +60,34 @@ export function rowToUnit(r: any): ScanUnit {
     sellChainId: r.sell_chain_id,
     tierUsd: r.tier_usd,
     kind: r.kind,
+  };
+}
+
+/** Family -> arb_families row (snake_case; reps stays jsonb). Undefined optionals become null. */
+export function famToRow(f: Family) {
+  return {
+    debridge_id: f.debridgeId,
+    native_chain_id: f.nativeChainId,
+    native_address: f.nativeAddress,
+    symbol: f.symbol ?? null,
+    name: f.name ?? null,
+    decimals: f.decimals ?? null,
+    native_on_home_chain: f.nativeOnHomeChain,
+    reps: f.reps,
+  };
+}
+
+/** arb_families row (as emitted by arb_load_graph) -> Family. Null optionals become undefined. */
+export function rowToFamily(r: any): Family {
+  return {
+    debridgeId: r.debridge_id,
+    nativeChainId: r.native_chain_id,
+    nativeAddress: r.native_address,
+    symbol: r.symbol ?? undefined,
+    name: r.name ?? undefined,
+    decimals: r.decimals ?? undefined,
+    nativeOnHomeChain: r.native_on_home_chain,
+    reps: r.reps ?? [],
   };
 }
 
@@ -268,35 +296,30 @@ export class SupabaseStore implements Store {
     };
   }
 
-  async saveFamilies(families: Family[]): Promise<void> {
-    if (families.length === 0) return;
-    const rows = families.map((f) => ({
-      debridge_id: f.debridgeId,
-      native_chain_id: f.nativeChainId,
-      native_address: f.nativeAddress,
-      symbol: f.symbol ?? null,
-      name: f.name ?? null,
-      decimals: f.decimals ?? null,
-      native_on_home_chain: f.nativeOnHomeChain,
-      reps: f.reps,
-    }));
-    const { error } = await this.db.from("arb_families").upsert(rows, { onConflict: "debridge_id" });
-    if (error) throw new Error(`saveFamilies: ${error.message}`);
+  async saveGraph(graph: LockGraph): Promise<void> {
+    // An empty graph means discovery wholly failed — don't clobber the high-water-mark snapshot (the
+    // RPC never deletes anyway) or stamp the meta row with a broken build. Mirrors the old length guard.
+    if (graph.families.length === 0) return;
+    const { error } = await this.db.rpc("arb_save_graph", {
+      p_meta: { built_at: graph.builtAt, chains_scanned: graph.chainsScanned, partial: graph.partial },
+      p_families: graph.families.map(famToRow),
+    });
+    if (error) throw new Error(`saveGraph: ${error.message}`);
   }
 
-  async loadFamilies(): Promise<Family[] | null> {
-    const { data, error } = await this.db.from("arb_families").select("*");
-    if (error) throw new Error(`loadFamilies: ${error.message}`);
-    if (!data || data.length === 0) return null;
-    return data.map((r: any) => ({
-      debridgeId: r.debridge_id,
-      nativeChainId: r.native_chain_id,
-      nativeAddress: r.native_address,
-      symbol: r.symbol ?? undefined,
-      name: r.name ?? undefined,
-      decimals: r.decimals ?? undefined,
-      nativeOnHomeChain: r.native_on_home_chain,
-      reps: r.reps ?? [],
-    }));
+  async loadGraph(): Promise<LockGraph | null> {
+    // Single jsonb value (not a row select) so the family list can't hit PostgREST's 1000-row cap.
+    const { data, error } = await this.db.rpc("arb_load_graph");
+    if (error) throw new Error(`loadGraph: ${error.message}`);
+    const payload = (data ?? {}) as { meta?: any; families?: any[] };
+    if (!payload.meta) return null; // snapshot never written → caller rebuilds
+    const builtAt = Number(payload.meta.built_at);
+    if (!Number.isFinite(builtAt)) return null; // corrupt/missing builtAt → treat as no snapshot, never NaN
+    return {
+      families: (payload.families ?? []).map(rowToFamily),
+      builtAt,
+      chainsScanned: Array.isArray(payload.meta.chains_scanned) ? payload.meta.chains_scanned.map(Number) : [],
+      partial: !!payload.meta.partial,
+    };
   }
 }

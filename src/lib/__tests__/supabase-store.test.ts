@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { rowToOpp, oppToItem, rowToUnit } from "../db/supabase-store";
+import { rowToOpp, oppToItem, rowToUnit, famToRow, rowToFamily } from "../db/supabase-store";
 import { MemoryStore } from "../db/store";
-import type { Opportunity, Family } from "../types";
+import type { Opportunity, Family, LockGraph } from "../types";
 
 function opp(id: string, profitable: boolean, netEdgePct = 1): Opportunity {
   return {
@@ -89,6 +89,31 @@ describe("supabase row mappers", () => {
       kind: "redemption",
     });
   });
+
+  it("famToRow maps camelCase -> snake_case and nulls undefined optionals", () => {
+    const row = famToRow({
+      debridgeId: "0xfam", nativeChainId: 1, nativeAddress: "0xnat", nativeOnHomeChain: true,
+      reps: [{ internalChainId: 1, address: "0xrep", isNativeRoot: true }],
+    });
+    expect(row).toMatchObject({ debridge_id: "0xfam", native_chain_id: 1, native_address: "0xnat", native_on_home_chain: true });
+    expect(row.symbol).toBeNull(); // undefined optional -> null for the DB
+    expect(row.decimals).toBeNull();
+    expect(row.reps).toHaveLength(1);
+  });
+
+  it("rowToFamily inverts famToRow and restores undefined for null optionals (incl. null reps -> [])", () => {
+    expect(
+      rowToFamily({ debridge_id: "0xfam", native_chain_id: 56, native_address: "0xnat", symbol: null, name: null, decimals: null, native_on_home_chain: false, reps: null })
+    ).toEqual({ debridgeId: "0xfam", nativeChainId: 56, nativeAddress: "0xnat", symbol: undefined, name: undefined, decimals: undefined, nativeOnHomeChain: false, reps: [] });
+  });
+
+  it("famToRow -> rowToFamily round-trips a fully-populated family", () => {
+    const fam: Family = {
+      debridgeId: "0xz", nativeChainId: 1, nativeAddress: "0xn", symbol: "USDT", name: "Tether", decimals: 6, nativeOnHomeChain: true,
+      reps: [{ internalChainId: 56, address: "0xr", symbol: "deUSDT", decimals: 6, isNativeRoot: false }],
+    };
+    expect(rowToFamily(famToRow(fam))).toEqual(fam);
+  });
 });
 
 describe("MemoryStore times tracking + families (Supabase parity)", () => {
@@ -104,13 +129,16 @@ describe("MemoryStore times tracking + families (Supabase parity)", () => {
     expect(a.firstSeenAt).toBe(1000); // preserved from first upsert
   });
 
-  it("round-trips families through save/load", async () => {
+  it("round-trips the lock-graph (families + meta) through save/load; null before any save", async () => {
     const s = new MemoryStore();
-    expect(await s.loadFamilies()).toBeNull();
-    const fams: Family[] = [
-      { debridgeId: "0x1", nativeChainId: 56, nativeAddress: "0xn", nativeOnHomeChain: true, reps: [] },
-    ];
-    await s.saveFamilies(fams);
-    expect(await s.loadFamilies()).toEqual(fams);
+    expect(await s.loadGraph()).toBeNull();
+    const graph: LockGraph = {
+      families: [{ debridgeId: "0x1", nativeChainId: 56, nativeAddress: "0xn", nativeOnHomeChain: true, reps: [] }],
+      builtAt: 1234,
+      chainsScanned: [1, 56],
+      partial: true,
+    };
+    await s.saveGraph(graph);
+    expect(await s.loadGraph()).toEqual(graph);
   });
 });

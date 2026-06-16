@@ -11,6 +11,7 @@ import {
 import { isEvmDeportChain, EVM_DEPORT_CHAINS } from "./registry";
 import { getTokenListForChain } from "../api-client";
 import { deriveFamiliesFromEvents, mergeEventReps, type DerivedEvents } from "./events-graph";
+import { getStore, parsePenaltyMs } from "../db/store";
 
 export interface TokenMeta {
   symbol?: string;
@@ -272,11 +273,69 @@ export async function buildLockGraph(
 }
 
 const GRAPH_TTL = 6 * 60 * 60 * 1000; // 6h — deAsset sets change slowly
+/**
+ * Freshness window for BOTH cache tiers (the in-memory entry and the Supabase snapshot). deAsset sets
+ * change slowly and rep addresses are immutable, so a slightly stale snapshot is safe (only ever missing
+ * a brand-new rep) — overridable to serve staler snapshots and rebuild less often. A non-positive value
+ * (incl. a blank env, which parses to 0) would make every entry "stale" and force a ~15-25s live rebuild
+ * on EVERY call, so clamp back to the default rather than let a misconfig self-DoS.
+ */
+const rawSnapshotTtl = parsePenaltyMs(process.env.ARB_GRAPH_SNAPSHOT_TTL_MS, GRAPH_TTL);
+const SNAPSHOT_TTL = rawSnapshotTtl > 0 ? rawSnapshotTtl : GRAPH_TTL;
 let cached: LockGraph | null = null;
 
+export interface GraphCacheDeps {
+  now: number;
+  cached: LockGraph | null;
+  ttlMs: number;
+  loadSnapshot: () => Promise<LockGraph | null>;
+  build: () => Promise<LockGraph>;
+  saveSnapshot: (g: LockGraph) => Promise<void>;
+}
+
+/**
+ * PURE tiering for the lock-graph cache: in-memory (tier 1) → Supabase snapshot (tier 2) → live build
+ * (tier 3, written back). Store/network access is injected so the policy is unit-testable without a DB.
+ * A graph is served only while within `ttlMs` of its `builtAt` AND non-empty: a zero-family graph is a
+ * failed/degenerate build (e.g. every chain RPC and the event derive failed at once) and must never be
+ * cached or persisted — otherwise a transient total-discovery outage would mask itself as "no
+ * opportunities" for the whole TTL, and would even suppress an otherwise-good snapshot (tier 1 wins
+ * before tier 2). `force` bypasses both fresh tiers. loadSnapshot/saveSnapshot are best-effort — a
+ * failure falls through / is swallowed, never blocks.
+ */
+export async function resolveLockGraph(force: boolean, d: GraphCacheDeps): Promise<LockGraph> {
+  const usable = (g: LockGraph | null): g is LockGraph =>
+    !!g && g.families.length > 0 && Number.isFinite(g.builtAt);
+  const fresh = (g: LockGraph | null): g is LockGraph => usable(g) && d.now - g.builtAt < d.ttlMs;
+  const inMem = d.cached;
+  if (!force && fresh(inMem)) return inMem; // tier 1
+  let snap: LockGraph | null = null;
+  if (!force) {
+    snap = await d.loadSnapshot().catch(() => null);
+    if (fresh(snap)) return snap; // tier 2 — shared across instances / survives restarts
+  }
+  const built = await d.build(); // tier 3
+  if (usable(built)) {
+    await d.saveSnapshot(built).catch(() => {}); // write-back so the next cold cache reads it
+    return built;
+  }
+  // Empty build: prefer ANY non-empty graph we already have — a stale snapshot or the last good
+  // in-memory entry — over serving zero families. Never persist the empty build.
+  if (usable(snap)) return snap;
+  if (usable(inMem)) return inMem;
+  return built; // nothing better exists; caller surfaces the empty/partial graph
+}
+
 export async function getLockGraph(force = false): Promise<LockGraph> {
-  if (!force && cached && Date.now() - cached.builtAt < GRAPH_TTL) return cached;
-  cached = await buildLockGraph();
+  const store = getStore();
+  cached = await resolveLockGraph(force, {
+    now: Date.now(),
+    cached,
+    ttlMs: SNAPSHOT_TTL,
+    loadSnapshot: () => store.loadGraph(),
+    build: buildLockGraph,
+    saveSnapshot: (g) => store.saveGraph(g),
+  });
   return cached;
 }
 

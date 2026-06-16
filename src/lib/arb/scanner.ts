@@ -241,9 +241,10 @@ export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord
 }
 
 /**
- * Seed/refresh the work queue from the lock-graph and persist it. enqueue is idempotent (existing
- * units are deduped / have only their priority updated), so calling this on every graph (re)build
- * adds newly-discovered families' units without disturbing the cycling state of existing ones.
+ * Seed/refresh the work queue from the lock-graph. enqueue is idempotent (existing units are deduped /
+ * have only their priority updated), so calling this on every graph (re)build adds newly-discovered
+ * families' units without disturbing the cycling state of existing ones. (Snapshot persistence now lives
+ * in getLockGraph's write-back, so this no longer saves the graph itself.)
  *
  * Priority = realized quotability: a route that has ever produced a quote (has an opportunity row) is
  * warm-started by PRIORITY (preferred among equally-stale peers in the dequeue tie-break), not by
@@ -254,11 +255,6 @@ export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord
  * demotion of dead routes is handled separately by markScanned (see DEAD_ROUTE_PENALTY_MS).
  */
 export async function seedQueue(store: Store, graph: LockGraph, tiers: number[] = DEFAULT_TIERS): Promise<number> {
-  try {
-    await store.saveFamilies(graph.families);
-  } catch {
-    /* persistence is best-effort; never block scanning */
-  }
   const units = enumerateUnits(graph, tiers);
   const known = await store.knownUnitIds().catch(() => new Set<string>());
   await store.enqueue(units, (u) => (known.has(opportunityId(u)) ? 1 : 0));

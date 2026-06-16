@@ -1,4 +1,4 @@
-import type { Family, Opportunity, OpportunityFilter, ScanUnit } from "../types";
+import type { LockGraph, Opportunity, OpportunityFilter, ScanUnit } from "../types";
 import { SupabaseStore } from "./supabase-store";
 
 export interface ScanRunRecord {
@@ -55,8 +55,10 @@ export interface Store {
   queueSize(): Promise<number>;
   recordScanRun(run: ScanRunRecord): Promise<void>;
   lastScanRun(): Promise<ScanRunRecord | null>;
-  saveFamilies(families: Family[]): Promise<void>;
-  loadFamilies(): Promise<Family[] | null>;
+  /** Persist the assembled lock-graph as a snapshot (families + builtAt/chainsScanned/partial). */
+  saveGraph(graph: LockGraph): Promise<void>;
+  /** Load the last persisted snapshot, or null when none has been written. */
+  loadGraph(): Promise<LockGraph | null>;
 }
 
 /** Stable scan-unit / opportunity / queue-row id (same format across all three). */
@@ -72,7 +74,7 @@ export class MemoryStore implements Store {
   private queue: { unit: ScanUnit; priority: number; lastScannedAt: number | null }[] = [];
   private queued = new Set<string>();
   private lastRun: ScanRunRecord | null = null;
-  private families: Family[] | null = null;
+  private graph: LockGraph | null = null;
 
   async upsertOpportunities(opps: Opportunity[]): Promise<void> {
     for (const o of opps) {
@@ -132,12 +134,12 @@ export class MemoryStore implements Store {
     }
   }
 
-  async saveFamilies(families: Family[]): Promise<void> {
-    this.families = families;
+  async saveGraph(graph: LockGraph): Promise<void> {
+    this.graph = graph;
   }
 
-  async loadFamilies(): Promise<Family[] | null> {
-    return this.families;
+  async loadGraph(): Promise<LockGraph | null> {
+    return this.graph;
   }
 
   async dequeue(n: number): Promise<ScanUnit[]> {
