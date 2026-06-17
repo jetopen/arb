@@ -1,6 +1,6 @@
 import type { Family, LockGraph, Opportunity, OpportunityFilter, ScanUnit } from "../types";
 import type { Store, ScanRunRecord, ScanOutcome } from "./store";
-import { DEAD_ROUTE_PENALTY_MS, HOT_RATIO, workUnitId } from "./store";
+import { DEAD_ROUTE_PENALTY_MS, TRANSIENT_RETRY_MS, HOT_RATIO, workUnitId } from "./store";
 import { getServiceClient } from "./supabase";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -24,6 +24,7 @@ export function rowToOpp(r: any): Opportunity {
     tierUsd: r.tier_usd,
     edge: r.edge,
     verification: r.verification ?? null,
+    ...(r.simulation ? { simulation: r.simulation } : {}),
     lockPath: r.lock_path ?? [],
     computedAt: r.computed_at ? new Date(r.computed_at).getTime() : 0,
     timesSeen: r.times_seen ?? undefined,
@@ -47,6 +48,7 @@ export function oppToItem(o: Opportunity) {
     gross_spread_pct: o.edge.grossSpreadPct,
     edge: o.edge,
     verification: o.verification,
+    simulation: o.simulation ?? null,
     lock_path: o.lockPath,
     // The authoritative cross-check result — distinct from edge.profitable.
     verified: o.verification?.verified ?? false,
@@ -115,12 +117,15 @@ export class SupabaseStore implements Store {
         : null;
     const minSpread = filter.minSpreadPct != null && Number.isFinite(filter.minSpreadPct) ? filter.minSpreadPct : null;
     const chainId = filter.chainId != null && Number.isFinite(filter.chainId) ? Math.trunc(filter.chainId) : null;
+    const tierUsd = filter.tierUsd != null && Number.isFinite(filter.tierUsd) ? Math.trunc(filter.tierUsd) : null;
 
     // Shared predicate builder for the ungrouped path and the grouped fallback (identical filters).
     const applyFilters = (q: any) => {
       if (minSpread != null) q = q.gte("gross_spread_pct", minSpread);
       if (chainId != null) q = q.or(`buy_chain_id.eq.${chainId},sell_chain_id.eq.${chainId}`);
+      if (tierUsd != null) q = q.eq("tier_usd", tierUsd);
       if (filter.verifiedOnly) q = q.eq("verified", true);
+      if (filter.executableOnly) q = q.eq("simulation->>executable", "true");
       if (computedAfter != null) q = q.gte("computed_at", computedAfter);
       return q;
     };
@@ -128,14 +133,20 @@ export class SupabaseStore implements Store {
     // Spread screener, one row per token: collapse server-side via the distinct-on RPC (migration 0003)
     // so we fetch only the page we return and get an exact distinct-token total.
     if (filter.groupByToken) {
-      const { data, error } = await this.db.rpc("arb_top_opportunities_by_token", {
+      // Only send p_executable_only when the filter is ON, so a default query still matches the pre-0011
+      // RPC signature (graceful degradation until migration 0011 is applied; if it's on without the
+      // migration, the param-mismatch trips the isMissingFunction JS fallback below, which also filters).
+      const rpcArgs: Record<string, unknown> = {
         p_min_spread_pct: minSpread,
         p_chain_id: chainId,
+        p_tier_usd: tierUsd,
         p_verified_only: !!filter.verifiedOnly,
         p_computed_after: computedAfter,
         p_limit: take,
         p_offset: start,
-      });
+      };
+      if (filter.executableOnly) rpcArgs.p_executable_only = true;
+      const { data, error } = await this.db.rpc("arb_top_opportunities_by_token", rpcArgs);
       if (!error) {
         // The RPC returns a single jsonb object { total, rows } so the exact distinct-token total
         // survives even an out-of-range (empty) page.
@@ -199,35 +210,43 @@ export class SupabaseStore implements Store {
     if (outcomes.length === 0) return;
     const now = Date.now();
     const liveIds = outcomes.filter((o) => o.live).map((o) => workUnitId(o.unit));
-    const deadIds = outcomes.filter((o) => !o.live).map((o) => workUnitId(o.unit));
+    const failed = outcomes.filter((o) => !o.live);
+    const failedIds = failed.map((o) => workUnitId(o.unit));
 
-    // A dead route that has ever produced an opportunity is "proven" — a single failure is a transient
-    // blip, not a dead pool, so it keeps cycling. Only UNproven-dead routes get time-demoted.
-    let provenDead: string[] = [];
-    if (deadIds.length > 0) {
-      const { data, error } = await this.db.from("arb_opportunities").select("id").in("id", deadIds);
+    // A failed route that has ever produced an opportunity is "proven" — a single failure is a blip,
+    // not a dead pool, so it keeps cycling. Among UNproven failures, a TRANSIENT upstream error
+    // (5xx/429/network) gets a short backoff so a flaky chain's live routes recover fast; a permanent
+    // no-route (amountOut 0 / 4xx) gets the full dead-route penalty.
+    let provenSet = new Set<string>();
+    if (failedIds.length > 0) {
+      const { data, error } = await this.db.from("arb_opportunities").select("id").in("id", failedIds);
       if (error) throw new Error(`markScanned(proven): ${error.message}`);
-      provenDead = (data ?? []).map((r: any) => r.id as string);
+      provenSet = new Set((data ?? []).map((r: any) => r.id as string));
     }
-    const provenSet = new Set(provenDead);
-    const keepIds = [...liveIds, ...provenDead]; // cycle normally (now)
-    const demoteIds = deadIds.filter((id) => !provenSet.has(id)); // push into the future
+    const keepIds = [...liveIds];
+    const transientIds: string[] = [];
+    const demoteIds: string[] = [];
+    for (const o of failed) {
+      const id = workUnitId(o.unit);
+      if (provenSet.has(id)) keepIds.push(id); // proven → cycle normally
+      else if (o.transient) transientIds.push(id); // transient blip → short backoff
+      else demoteIds.push(id); // permanent no-route → full dead penalty
+    }
 
-    // Two bulk updates (no RPC/DDL needed). Clearing the lease lets a kept route re-enter immediately.
-    if (keepIds.length > 0) {
+    // Bulk time-stamp updates (no RPC/DDL needed). Clearing the lease lets a kept route re-enter immediately.
+    const bump = async (ids: string[], whenMs: number, label: string) => {
+      if (ids.length === 0) return;
       const { error } = await this.db
         .from("arb_work_queue")
-        .update({ last_scanned_at: new Date(now).toISOString(), leased_until: null })
-        .in("id", keepIds);
-      if (error) throw new Error(`markScanned(keep): ${error.message}`);
-    }
-    if (demoteIds.length > 0) {
-      const { error } = await this.db
-        .from("arb_work_queue")
-        .update({ last_scanned_at: new Date(now + DEAD_ROUTE_PENALTY_MS).toISOString(), leased_until: null })
-        .in("id", demoteIds);
-      if (error) throw new Error(`markScanned(demote): ${error.message}`);
-    }
+        .update({ last_scanned_at: new Date(whenMs).toISOString(), leased_until: null })
+        .in("id", ids);
+      if (error) throw new Error(`markScanned(${label}): ${error.message}`);
+    };
+    await Promise.all([
+      bump(keepIds, now, "keep"),
+      bump(transientIds, now + TRANSIENT_RETRY_MS, "transient"),
+      bump(demoteIds, now + DEAD_ROUTE_PENALTY_MS, "demote"),
+    ]);
   }
 
   async requeueFresh(ids: string[]): Promise<void> {

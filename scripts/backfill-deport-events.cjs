@@ -42,6 +42,13 @@ const db = createClient(url, key, { auth: { persistSession: false, autoRefreshTo
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Only 0x-hex addresses are safe to lowercase. Tron (and other base58) addresses are case-sensitive —
+// lowercasing destroys the base58check, so they must be stored verbatim.
+function normAddr(a) {
+  const s = a || "";
+  return s.startsWith("0x") ? s.toLowerCase() : s;
+}
+
 function mapEvent(e) {
   // origin_chain_id is BIGINT NOT NULL and the family key; a single NULL aborts the whole-page batch upsert
   // (and the backfill process.exit(1)s mid-history). Drop rows missing it — same guard as the TS tail.
@@ -52,7 +59,7 @@ function mapEvent(e) {
     type: typeof e.type === "number" ? e.type : 0,
     origin_chain_id: e.eventOriginChainId,
     to_chain_id: e.chainToId ?? null,
-    token_address: (e.tokenAddress || "").toLowerCase(),
+    token_address: normAddr(e.tokenAddress),
     token_symbol: e.tokenSymbol ?? null,
     token_name: e.tokenName ?? null,
     token_decimals: typeof e.tokenDecimals === "number" ? e.tokenDecimals : null,

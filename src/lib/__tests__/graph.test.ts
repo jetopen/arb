@@ -182,22 +182,25 @@ describe("forwardUniverse (feed event-only families into the on-chain forward pa
     expect(u.some((k) => k.nativeChainId === 56)).toBe(true);
   });
 
-  it("SKIPS a non-EVM (Solana, base58) native family — its hex-less address can't anchor getDebridge", () => {
-    // A Solana-native event family: forward-expanding it via EVM getDebridge would corrupt the native
-    // leg's (base58) address, so it must NOT enter the universe. It stays on the event-merge path.
+  it("ADMITS a non-EVM (Solana, base58) native family via its authoritative debridgeId", () => {
+    // A Solana-native event family enters the universe keyed on the debridgeId deBridge already gave us
+    // (no recompute from the base58 native address), so getDebridge resolves its EVM reps. The canonical
+    // base58 native leg rides in separately via the PASS-5 event merge.
     const discovered: RawDeAsset[] = [
       { internalChainId: 56, address: USDT_BSC, nativeChainId: 56, nativeAddress: USDT_BSC },
     ];
     const sol: Family = {
       debridgeId: "0xdeadbeef",
       nativeChainId: 7565164,
-      nativeAddress: SOLANA_USDC, // base58, not hex
+      nativeAddress: SOLANA_USDC, // base58, not hex — carried through untouched
       nativeOnHomeChain: false,
       reps: [],
     };
     const u = forwardUniverse(discovered, [sol]);
-    expect(u).toHaveLength(1); // Solana family skipped, only the discovered one remains
-    expect(u.every((k) => k.nativeChainId !== 7565164)).toBe(true);
+    expect(u).toHaveLength(2);
+    const solKey = u.find((k) => k.nativeChainId === 7565164);
+    expect(solKey?.debridgeId).toBe("0xdeadbeef");
+    expect(solKey?.nativeAddress).toBe(SOLANA_USDC); // base58 preserved, not hashed/lowercased
   });
 });
 

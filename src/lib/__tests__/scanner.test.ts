@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { enumerateUnits, scanUnit, runBatch, parseNotional, type ScanDeps } from "../arb/scanner";
+import { enumerateUnits, scanUnit, runBatch, parseNotionalLadder, routeKeyOfId, DEFAULT_LADDER, DEFAULT_TIERS, type ScanDeps } from "../arb/scanner";
 import { MemoryStore } from "../db/store";
 import { RpmBudget } from "../arb/budget";
-import type { DexQuote, Family, LockGraph } from "../types";
+import type { DexQuote, Family, LockGraph, SimulationResult } from "../types";
 import type { VerifyArgs } from "../quotes/verify";
+import { QuoteHttpError } from "../quotes/quote-error";
 
 function fam(over: Partial<Family>): Family {
   return {
@@ -51,15 +52,17 @@ describe("enumerateUnits", () => {
     expect(units.some((u) => u.buyChainId === 56 && u.sellChainId === 42161)).toBe(true); // home -> rep
   });
 
-  it("emits a single probe size per route by default (2 units/route: both directions)", () => {
+  it("emits both directions per rung of the default ladder", () => {
     const units = enumerateUnits(graphOf([fam({})]));
-    expect(units).toHaveLength(2); // 1 rep × 1 probe size × 2 directions
+    // 1 rep × DEFAULT_TIERS rungs × 2 directions
+    expect(DEFAULT_TIERS.length).toBeGreaterThanOrEqual(1);
+    expect(units).toHaveLength(2 * DEFAULT_TIERS.length);
   });
 
   it("skips families whose home chain has no USDC base (non-quotable)", () => {
-    // Tron (internal id 100000026) has no USDC base in BASE_USDC → not quotable → skipped.
-    const tronHome = fam({ nativeChainId: 100000026, nativeOnHomeChain: false });
-    expect(enumerateUnits(graphOf([tronHome]), [1000])).toHaveLength(0);
+    // Injective (internal id 100000029) has no USDC base in BASE_USDC (deferred) → not quotable → skipped.
+    const injHome = fam({ nativeChainId: 100000029, nativeOnHomeChain: false });
+    expect(enumerateUnits(graphOf([injHome]), [1000])).toHaveLength(0);
   });
 
   it("scans a Solana-native family when ARB_SCAN_SOLANA is on, skips it when off", () => {
@@ -84,17 +87,18 @@ describe("enumerateUnits", () => {
     }
   });
 
-  it("skips reps with unknown or mismatched decimals (the 1:1 raw move would be unsafe)", () => {
-    // rep decimals differ from the native root → mis-scaled sell leg → skip
-    const mismatched = fam({
+  it("emits cross-decimal reps (rescaled, e.g. an 18-dec native ↔ its 8-dec deAsset), but skips UNKNOWN decimals", () => {
+    // rep decimals differ from the native root (18 vs 8 — a deBridge deToken). The dePort move is 1:1 by
+    // value and scanUnit rescales, so this is NO LONGER skipped — both directions are emitted.
+    const crossDecimal = fam({
       reps: [
         { internalChainId: 56, address: "0xnative", isNativeRoot: true, decimals: 18 },
-        { internalChainId: 42161, address: "0xdeasset", isNativeRoot: false, decimals: 6 },
+        { internalChainId: 42161, address: "0xdeasset", isNativeRoot: false, decimals: 8 },
       ],
     });
-    expect(enumerateUnits(graphOf([mismatched]), [1000])).toHaveLength(0);
+    expect(enumerateUnits(graphOf([crossDecimal]), [1000])).toHaveLength(2); // rep→home + home→rep
 
-    // rep decimals unknown (forward-found, ERC20 read failed) → skip
+    // rep decimals unknown (forward-found, ERC20 read failed) → still skip: can't rescale safely
     const unknownRep = fam({
       reps: [
         { internalChainId: 56, address: "0xnative", isNativeRoot: true, decimals: 18 },
@@ -190,6 +194,114 @@ describe("scanUnit", () => {
     expect(r.live).toBe(false);
     expect(r.opportunity).toBeNull();
   });
+
+  it("classifies a 5xx/429 quote failure as TRANSIENT (so it gets a short backoff, not a 6h demote)", async () => {
+    const r500 = await scanUnit(route, deps({ fetchQuote: async () => { throw new QuoteHttpError(500); } }));
+    expect(r500.live).toBe(false);
+    expect(r500.transient).toBe(true);
+    const r429 = await scanUnit(route, deps({ fetchQuote: async () => { throw new QuoteHttpError(429); } }));
+    expect(r429.transient).toBe(true);
+  });
+
+  it("classifies a permanent no-route as NOT transient (amountOut 0, or a 4xx like TOKEN_PAIR_NOT_TRADABLE)", async () => {
+    const rZero = await scanUnit(route, deps({ fetchQuote: async () => quote({ amountOut: "0" }) }));
+    expect(rZero.live).toBe(false);
+    expect(rZero.transient).toBe(false);
+    const r400 = await scanUnit(route, deps({ fetchQuote: async () => { throw new QuoteHttpError(400); } }));
+    expect(r400.live).toBe(false);
+    expect(r400.transient).toBe(false);
+  });
+
+  it("rescales the bridged amount across a decimal delta before the sell leg (buy 8-dec → sell 18-dec)", async () => {
+    // An 18-dec native with an 8-dec deAsset (the deBridge deToken case). The dePort move is 1:1 by VALUE,
+    // so the 8-dec buy output must be scaled up by 10^10 before the 18-dec sell leg.
+    const crossFam = fam({
+      nativeChainId: 56,
+      nativeAddress: "0xnative",
+      decimals: 18,
+      reps: [
+        { internalChainId: 56, address: "0xnative", isNativeRoot: true, decimals: 18 },
+        { internalChainId: 42161, address: "0xdeasset", isNativeRoot: false, decimals: 8 },
+      ],
+    });
+    const sellAmountsIn: string[] = [];
+    const d = deps({
+      getFamily: () => crossFam,
+      fetchQuote: async (_chainId, _tokenIn, tokenOut, amountIn) => {
+        const isBuy = tokenOut === "0xdeasset"; // buy leg acquires the 8-dec deAsset
+        if (!isBuy) sellAmountsIn.push(amountIn);
+        return isBuy
+          ? quote({ amountOut: "100000000", amountInUsd: 1000, amountOutUsd: 1000 }) // 1.0 token @ 8 decimals
+          : quote({ amountOut: "1005000000", amountInUsd: 1005, amountOutUsd: 1005 });
+      },
+    });
+    const { opportunity } = await scanUnit(
+      { debridgeId: "0xfam", buyChainId: 42161, sellChainId: 56, tierUsd: 1000, kind: "redemption" },
+      d
+    );
+    expect(sellAmountsIn).toEqual(["1000000000000000000"]); // 1e8 (8dp) → 1e18 (18dp)
+    expect(opportunity).not.toBeNull();
+  });
+
+  const simResult: SimulationResult = {
+    executable: true,
+    buy: { status: "pass" },
+    sell: { status: "pass" },
+    send: { status: "skipped" },
+    claim: { status: "pass" },
+    simulatedAt: 0,
+  };
+
+  it("attaches simulation to a profitable opportunity when ARB_SIMULATE=true and deps.simulate is set", async () => {
+    const prev = process.env.ARB_SIMULATE;
+    process.env.ARB_SIMULATE = "true";
+    try {
+      let simCalls = 0;
+      const d = deps({
+        simulate: async () => {
+          simCalls++;
+          return simResult;
+        },
+      });
+      const { opportunity } = await scanUnit(route, d);
+      expect(simCalls).toBe(1);
+      expect(opportunity!.simulation).toEqual(simResult);
+    } finally {
+      if (prev === undefined) delete process.env.ARB_SIMULATE;
+      else process.env.ARB_SIMULATE = prev;
+    }
+  });
+
+  it("does NOT call deps.simulate or attach simulation when ARB_SIMULATE is off", async () => {
+    const prev = process.env.ARB_SIMULATE;
+    delete process.env.ARB_SIMULATE;
+    try {
+      let simCalls = 0;
+      const d = deps({
+        simulate: async () => {
+          simCalls++;
+          return simResult;
+        },
+      });
+      const { opportunity } = await scanUnit(route, d);
+      expect(simCalls).toBe(0);
+      expect(opportunity!.simulation).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env.ARB_SIMULATE;
+      else process.env.ARB_SIMULATE = prev;
+    }
+  });
+});
+
+describe("routeKeyOfId (warm-start spans ladder rungs)", () => {
+  it("drops the tier so every rung of a route shares one key", () => {
+    expect(routeKeyOfId("0xfam:42161:56:25:redemption")).toBe("0xfam:42161:56:redemption");
+    expect(routeKeyOfId("0xfam:42161:56:1000:redemption")).toBe("0xfam:42161:56:redemption");
+    // a route proven at the OLD $1000 rung now matches its NEW micro-ladder rungs (the orphan-warm-start fix)
+    expect(routeKeyOfId("0xfam:42161:56:1000:redemption")).toBe(routeKeyOfId("0xfam:42161:56:10:redemption"));
+    // distinct routes (direction / chains) stay distinct
+    expect(routeKeyOfId("0xfam:56:42161:25:redemption")).not.toBe(routeKeyOfId("0xfam:42161:56:25:redemption"));
+  });
 });
 
 describe("runBatch", () => {
@@ -233,13 +345,18 @@ describe("runBatch", () => {
   });
 });
 
-describe("parseNotional", () => {
-  it("returns a positive integer, falling back to $1k for 0 / negative / fractional / non-numeric", () => {
-    expect(parseNotional("2500")).toBe(2500);
-    expect(parseNotional(undefined)).toBe(1000);
-    expect(parseNotional("0")).toBe(1000);
-    expect(parseNotional("-100")).toBe(1000);
-    expect(parseNotional("1000.5")).toBe(1000);
-    expect(parseNotional("abc")).toBe(1000);
+describe("parseNotionalLadder", () => {
+  it("parses a comma list into a sorted, de-duped ladder of positive integers", () => {
+    expect(parseNotionalLadder("10,25,50,100")).toEqual([10, 25, 50, 100]);
+    expect(parseNotionalLadder("100, 25 , 25, 10")).toEqual([10, 25, 100]); // trims, de-dupes, sorts
+    expect(parseNotionalLadder("2500")).toEqual([2500]); // single value (back-compat)
+  });
+  it("drops invalid rungs (0 / negative / fractional / non-numeric) and keeps the valid ones", () => {
+    expect(parseNotionalLadder("100,abc,-5,0,2.5")).toEqual([100]);
+  });
+  it("falls back to the default micro ladder when nothing valid survives", () => {
+    expect(parseNotionalLadder(undefined)).toEqual(DEFAULT_LADDER);
+    expect(parseNotionalLadder("")).toEqual(DEFAULT_LADDER);
+    expect(parseNotionalLadder("abc,-1,0,1.5")).toEqual(DEFAULT_LADDER);
   });
 });

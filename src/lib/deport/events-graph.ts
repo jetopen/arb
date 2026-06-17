@@ -1,8 +1,7 @@
-import type { Hex } from "viem";
 import type { DeAsset, Family } from "../types";
 import { computeDebridgeId } from "../onchain/debridge-gate";
 import { isEvmDeportChain } from "./registry";
-import { toCanonicalAddress } from "./address-codec";
+import { toCanonicalAddress, canonicalToHashBytes } from "./address-codec";
 import { getServiceClient, supabaseConfigured } from "../db/supabase";
 
 /** One (chain, address) representation as aggregated by the arb_derive_families RPC. */
@@ -41,32 +40,32 @@ function toDeAsset(r: RawRep, isNativeRoot: boolean): DeAsset {
 export function assembleEventFamily(debridgeId: string, raws: RawRep[]): Family | null {
   const id = debridgeId.toLowerCase();
   let nativeChainId: number | undefined;
-  let nativeAddressHex: string | undefined;
+  let nativeAddressRaw: string | undefined;
   for (const r of raws) {
-    try {
-      if (computeDebridgeId(r.chainId, r.address as Hex).toLowerCase() === id) {
-        nativeChainId = r.chainId;
-        nativeAddressHex = r.address.toLowerCase();
-        break;
-      }
-    } catch {
-      /* malformed address bytes — skip this rep as a root candidate */
+    // Hash the chain's CANONICAL native-address bytes: EVM/Solana are already raw hex; Tron decodes from
+    // base58check to its bare 20-byte body (a lowercased/corrupted Tron base58 yields null → skipped).
+    const hashBytes = canonicalToHashBytes(r.chainId, r.address);
+    if (hashBytes && computeDebridgeId(r.chainId, hashBytes).toLowerCase() === id) {
+      nativeChainId = r.chainId;
+      nativeAddressRaw = r.address;
+      break;
     }
   }
-  if (nativeChainId === undefined || nativeAddressHex === undefined) return null;
+  if (nativeChainId === undefined || nativeAddressRaw === undefined) return null;
 
-  const rootRaw = raws.find((r) => r.chainId === nativeChainId && r.address.toLowerCase() === nativeAddressHex);
+  const isRoot = (r: RawRep) => r.chainId === nativeChainId && r.address === nativeAddressRaw;
+  const rootRaw = raws.find(isRoot);
   return {
     debridgeId,
     nativeChainId,
-    // Canonical address (base58 for Solana, hex for EVM) — memberAddress() returns this for the native
-    // leg, and the quote dispatch needs the chain-native form (Jupiter wants a base58 mint, not hex).
-    nativeAddress: toCanonicalAddress(nativeChainId, nativeAddressHex),
+    // Canonical address (base58 for Solana/Tron, hex for EVM) — memberAddress() returns this for the
+    // native leg, and the quote dispatch needs the chain-native form (Jupiter wants a base58 mint, not hex).
+    nativeAddress: toCanonicalAddress(nativeChainId, nativeAddressRaw),
     symbol: rootRaw?.symbol ?? raws[0]?.symbol ?? undefined,
     name: rootRaw?.name ?? raws[0]?.name ?? undefined,
     decimals: rootRaw?.decimals ?? raws[0]?.decimals ?? undefined,
     nativeOnHomeChain: isEvmDeportChain(nativeChainId),
-    reps: raws.map((r) => toDeAsset(r, r.chainId === nativeChainId && r.address.toLowerCase() === nativeAddressHex)),
+    reps: raws.map((r) => toDeAsset(r, isRoot(r))),
   };
 }
 
@@ -88,7 +87,11 @@ export async function deriveFamiliesFromEvents(): Promise<DerivedEvents> {
   const repsByDebridgeId = new Map<string, DeAsset[]>();
   const families: Family[] = [];
   for (const f of raw) {
-    const reps = (f.reps || []).map((r) => ({ ...r, address: String(r.address).toLowerCase() }));
+    // Lowercase only 0x-hex; Tron (base58) addresses are case-sensitive and must be preserved verbatim.
+    const reps = (f.reps || []).map((r) => {
+      const a = String(r.address);
+      return { ...r, address: a.startsWith("0x") ? a.toLowerCase() : a };
+    });
     const fam = assembleEventFamily(f.debridge_id, reps);
     if (fam) {
       families.push(fam);

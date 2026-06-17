@@ -40,6 +40,7 @@ describe("supabase row mappers", () => {
     expect(item.net_edge_pct).toBe(1.5);
     expect(item.gross_spread_pct).toBeCloseTo(1.6, 6);
     expect(item.buy_chain_id).toBe(42161);
+    expect(item.tier_usd).toBe(10000); // probe size persisted per row (the capital-selector filter column)
     expect(item.edge.profitable).toBe(true);
     expect(item.verification).not.toBeNull();
   });
@@ -78,6 +79,30 @@ describe("supabase row mappers", () => {
     expect(o.timesSeen).toBe(3);
     expect(o.timesProfitable).toBe(2);
     expect(o.computedAt).toBe(Date.parse("2026-06-14T00:00:00.000Z"));
+  });
+
+  it("round-trips the simulation jsonb (null/undefined when absent, carried verbatim when present)", () => {
+    // absent → null in the DB row, undefined on the reconstructed opp
+    expect(oppToItem(opp("a", true)).simulation).toBeNull();
+    const bareRow = {
+      id: "a", debridge_id: "0xa", kind: "redemption", buy_chain_id: 1, sell_chain_id: 2, native_chain_id: 2,
+      tier_usd: 10, edge: { profitable: true }, verification: null, lock_path: [], computed_at: "2026-06-14T00:00:00.000Z",
+    };
+    expect(rowToOpp(bareRow).simulation).toBeUndefined();
+
+    // present → carried both ways unchanged
+    const sim = {
+      executable: false,
+      buy: { status: "pass" as const },
+      sell: { status: "revert" as const, reason: "transfer tax" },
+      send: { status: "skipped" as const },
+      claim: { status: "pass" as const },
+      simulatedAt: 5,
+    };
+    const o = opp("d", true);
+    o.simulation = sim;
+    expect(oppToItem(o).simulation).toEqual(sim);
+    expect(rowToOpp({ ...bareRow, simulation: sim }).simulation).toEqual(sim);
   });
 
   it("rowToUnit maps a work_queue row to a ScanUnit", () => {

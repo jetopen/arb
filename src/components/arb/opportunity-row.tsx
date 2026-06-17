@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import type { Opportunity } from "@/lib/types";
+import type { Opportunity, SimulationResult } from "@/lib/types";
 import { chainName } from "@/lib/deport/registry";
 import { LegAddress } from "./leg-address";
 
@@ -11,6 +11,50 @@ function pct(n: number): string {
 
 function usd(n: number): string {
   return `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+}
+
+/** First blocking leg's reason, for the "reverts" badge tooltip. */
+function failReason(sim: SimulationResult): string {
+  if (sim.buy.status === "revert") return `buy swap: ${sim.buy.reason ?? "revert"}`;
+  if (sim.sell.status === "revert") return `sell swap: ${sim.sell.reason ?? "revert"}`;
+  if (sim.send.status === "revert") return `origin send: ${sim.send.reason ?? "revert"}`;
+  if (sim.claim.status === "fail") return `claim: ${sim.claim.reason ?? "fail"}`;
+  return "reverts on execution";
+}
+
+/** Compact sim badge: executable ✓ / reverts ✗ (with reason tooltip) / n/a (nothing simulatable). */
+function SimBadge({ sim }: { sim?: SimulationResult }) {
+  if (!sim) return <span className="text-xs text-muted">—</span>;
+  if (sim.executable === true)
+    return (
+      <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-800">
+        ✓ executable
+      </span>
+    );
+  if (sim.executable === false)
+    return (
+      <span className="text-xs font-medium text-red-600" title={failReason(sim)}>
+        ✗ reverts
+      </span>
+    );
+  return (
+    <span className="text-xs text-muted" title="nothing on this route could be simulated">
+      sim n/a
+    </span>
+  );
+}
+
+function SimLeg({ label, status, reason }: { label: string; status: string; reason?: string }) {
+  const tone =
+    status === "pass" ? "text-green-700" : status === "revert" || status === "fail" ? "text-red-600" : "text-muted";
+  const word = status === "pass" ? "pass" : status === "revert" ? "revert" : status === "fail" ? "fail" : "n/a";
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-2 text-sm">
+      <span className="w-48 shrink-0 text-muted">{label}</span>
+      <span className={`font-medium ${tone}`}>{word}</span>
+      {reason && <span className="text-xs text-muted">— {reason}</span>}
+    </div>
+  );
 }
 
 export function OpportunityRow({
@@ -56,6 +100,9 @@ export function OpportunityRow({
         <td className={`px-4 py-3 text-sm font-semibold tabular-nums ${positive ? "text-accent" : "text-red-600"}`}>
           {pct(spread)}
         </td>
+        <td className="px-4 py-3 text-sm text-muted tabular-nums" title="Probe size this spread is measured at">
+          ${opp.tierUsd.toLocaleString()}
+        </td>
         <td className="px-4 py-3 text-sm text-muted tabular-nums">
           {opp.edge.deportFeeUsd > 0 ? usd(opp.edge.deportFeeUsd) : "—"}
         </td>
@@ -71,6 +118,9 @@ export function OpportunityRow({
           ) : (
             <span className="text-xs text-muted">—</span>
           )}
+        </td>
+        <td className="px-4 py-3 text-sm">
+          <SimBadge sim={opp.simulation} />
         </td>
       </tr>
       {expanded && (
@@ -89,6 +139,19 @@ export function OpportunityRow({
                 </div>
               ))}
             </div>
+            {opp.simulation && (
+              <div className="mt-4">
+                <p className="mb-2 text-xs font-medium uppercase tracking-wider text-muted">
+                  Simulation (executable path)
+                </p>
+                <div className="space-y-1">
+                  <SimLeg label="Buy swap (USDC → asset)" status={opp.simulation.buy.status} reason={opp.simulation.buy.reason} />
+                  <SimLeg label="Origin send (lock/burn)" status={opp.simulation.send.status} reason={opp.simulation.send.reason} />
+                  <SimLeg label="Claim (gate reserves)" status={opp.simulation.claim.status} reason={opp.simulation.claim.reason} />
+                  <SimLeg label="Sell swap (asset → USDC)" status={opp.simulation.sell.status} reason={opp.simulation.sell.reason} />
+                </div>
+              </div>
+            )}
           </td>
         </tr>
       )}

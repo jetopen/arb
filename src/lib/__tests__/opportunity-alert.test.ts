@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { shouldAlert, formatOpportunityEmbed, parseAlertMinSpread, ALERT_BATCH_CAP } from "../alerts/opportunity-alert";
+import { shouldAlert, bestPerToken, formatOpportunityEmbed, parseAlertMinSpread, ALERT_BATCH_CAP } from "../alerts/opportunity-alert";
 import { sendDiscordAlert } from "../alerts/providers/discord";
 import type { Opportunity } from "../types";
 
@@ -36,6 +36,22 @@ function opp(over: Partial<Omit<Opportunity, "edge">> & { edge?: Partial<Opportu
     ...rest,
   };
 }
+
+describe("bestPerToken", () => {
+  it("collapses a ladder × direction batch to ONE strongest row per token, strongest token first", () => {
+    const opps = [
+      opp({ id: "a:25", debridgeId: "A", tierUsd: 25, edge: { netUsd: -2, profitable: false, grossSpreadPct: 1.0 } }),
+      opp({ id: "a:50", debridgeId: "A", tierUsd: 50, edge: { netUsd: 3, profitable: true, grossSpreadPct: 0.8 } }), // strongest A
+      opp({ id: "a:10", debridgeId: "A", tierUsd: 10, edge: { netUsd: 1, profitable: true, grossSpreadPct: 2.0 } }),
+      opp({ id: "b:25", debridgeId: "B", tierUsd: 25, edge: { netUsd: -1, profitable: false, grossSpreadPct: 0.5 } }),
+    ];
+    const out = bestPerToken(opps);
+    expect(out).toHaveLength(2); // one alert per token, not per rung × direction
+    expect(out[0].debridgeId).toBe("A"); // the profitable token sorts ahead of the unprofitable one
+    expect(out[0].id).toBe("a:50"); // highest net USD among A's profitable rungs
+    expect(out.map((o) => o.debridgeId)).toEqual(["A", "B"]);
+  });
+});
 
 describe("parseAlertMinSpread", () => {
   it("parses numbers; unset/blank/non-numeric → null (threshold off)", () => {

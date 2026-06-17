@@ -1,23 +1,11 @@
 import type { DexQuote } from "../types";
 import { fetchWithRetry } from "../api-client";
+import { getChainByInternalId } from "../deport/registry";
 
-/** deBridge internal chain id -> KyberSwap aggregator chain slug. Missing => unsupported (skip cross-check). */
-const KYBER_SLUG: Record<number, string> = {
-  1: "ethereum",
-  10: "optimism",
-  56: "bsc",
-  137: "polygon",
-  8453: "base",
-  42161: "arbitrum",
-  43114: "avalanche",
-  59144: "linea",
-  100000019: "cronos",
-  100000023: "mantle",
-  // HyperEVM (100000022) not supported by KyberSwap as of writing -> no cross-check there.
-};
-
+/** deBridge internal chain id -> KyberSwap aggregator chain slug (from the chain registry). Missing => no
+ *  cross-check there (e.g. HyperEVM, Sei, Tron, Flow, Monad, MegaETH, Solana — verified via GeckoTerminal). */
 export function kyberSlug(internalChainId: number): string | undefined {
-  return KYBER_SLUG[internalChainId];
+  return getChainByInternalId(internalChainId)?.kyberSlug;
 }
 
 interface KyberRouteResponse {

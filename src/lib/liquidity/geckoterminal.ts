@@ -1,23 +1,9 @@
 import { fetchWithRetry } from "../api-client";
+import { getChainByInternalId } from "../deport/registry";
 
-/** deBridge internal chain id -> GeckoTerminal network slug. Missing => liquidity gate skipped. */
-const GT_NETWORK: Record<number, string> = {
-  1: "eth",
-  10: "optimism",
-  56: "bsc",
-  137: "polygon_pos",
-  8453: "base",
-  42161: "arbitrum",
-  43114: "avax",
-  59144: "linea",
-  100000019: "cro",
-  100000023: "mantle",
-  100000022: "hyperevm",
-  7565164: "solana",
-};
-
+/** deBridge internal chain id -> GeckoTerminal network slug (from the chain registry). Missing => gate skipped. */
 export function gtNetwork(internalChainId: number): string | undefined {
-  return GT_NETWORK[internalChainId];
+  return getChainByInternalId(internalChainId)?.gtSlug;
 }
 
 interface GtTokenResponse {

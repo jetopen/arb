@@ -5,8 +5,9 @@ import { fetchJupiterQuote } from "../quotes/jupiter";
 import { SOLANA_INTERNAL_ID } from "../deport/address-codec";
 import { getFixedFeeUsd } from "../deport/fees";
 import { getNativeUsd } from "../quotes/native-price";
-import { verifyCandidate, verifySolanaCandidate } from "../quotes/verify";
-import { fetchKyberQuote } from "../quotes/kyberswap";
+import { verifyCandidate, verifyViaGeckoTerminal } from "../quotes/verify";
+import { simulateOpportunity } from "../sim/simulate";
+import { fetchKyberQuote, kyberSlug } from "../quotes/kyberswap";
 import { getPoolLiquidityUsd, getTokenStats } from "../liquidity/geckoterminal";
 import { getStore } from "../db/store";
 import { supabaseConfigured } from "../db/supabase";
@@ -15,7 +16,7 @@ import { RpmBudget } from "./budget";
 import { runBatch, seedQueue, type ScanDeps } from "./scanner";
 import { optimizeRoute } from "./optimize";
 import { sendDiscordAlert } from "../alerts/providers/discord";
-import { shouldAlert, formatOpportunityEmbed, parseAlertMinSpread, ALERT_BATCH_CAP } from "../alerts/opportunity-alert";
+import { shouldAlert, bestPerToken, formatOpportunityEmbed, parseAlertMinSpread, ALERT_BATCH_CAP } from "../alerts/opportunity-alert";
 
 let budget: RpmBudget | null = null;
 function getBudget(): RpmBudget {
@@ -46,12 +47,16 @@ export async function buildScanDeps(): Promise<ScanDeps> {
   const alertMinSpread = parseAlertMinSpread(process.env.ARB_ALERT_MIN_SPREAD_PCT);
   const notify: ScanDeps["notify"] = discordUrl
     ? async (opps) => {
-        // Cap BEFORE marking, so extras beyond the cap stay un-marked and get another chance next batch.
-        const candidates = opps.filter((o) => shouldAlert(o, alertMinSpread)).slice(0, ALERT_BATCH_CAP);
+        // Collapse to ONE row per token (strongest first) so a single profitable token can't emit an alert
+        // per ladder rung × direction (up to 8) and exhaust the cap. Cap BEFORE marking, so extras beyond
+        // the cap stay un-marked and get another chance next batch.
+        const candidates = bestPerToken(opps.filter((o) => shouldAlert(o, alertMinSpread))).slice(0, ALERT_BATCH_CAP);
         if (candidates.length === 0) return;
-        const fresh = new Set(await store.filterNewAlerts(candidates.map((o) => o.id)));
+        // Dedup the cross-batch ping on the TOKEN (debridgeId), not the rung-specific opportunity id — so a
+        // token pings once even if a different rung/direction wins the next batch.
+        const fresh = new Set(await store.filterNewAlerts(candidates.map((o) => o.debridgeId)));
         for (const o of candidates) {
-          if (fresh.has(o.id)) await sendDiscordAlert(discordUrl, { embeds: [formatOpportunityEmbed(o)] });
+          if (fresh.has(o.debridgeId)) await sendDiscordAlert(discordUrl, { embeds: [formatOpportunityEmbed(o)] });
         }
       }
     : undefined;
@@ -61,10 +66,17 @@ export async function buildScanDeps(): Promise<ScanDeps> {
     fetchQuote: (c, i, o, a) =>
       c === SOLANA_INTERNAL_ID ? fetchJupiterQuote(i, o, a) : fetchDexQuote(c, i, o, a, apiKey),
     getFeeUsd: async (chainId, dbId) => getFixedFeeUsd(chainId, dbId as Hex, await getNativeUsd(chainId)),
+    // Cross-check via KyberSwap only when it covers BOTH legs; if EITHER leg is on a chain Kyber can't
+    // quote (Solana, Sei, Tron, HyperEVM, Flow, Monad, MegaETH, …), use the GeckoTerminal path — it gates
+    // both legs' liquidity AND price-checks the buy and (when a sell quote is passed) the sell leg, so a
+    // depegged non-Kyber sell side can't slip through verifyCandidate's buy-leg-only cross-check.
     verify: (args) =>
-      args.buyChainId === SOLANA_INTERNAL_ID
-        ? verifySolanaCandidate(args, { getTokenStats, getLiquidityUsd: getPoolLiquidityUsd })
-        : verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd }),
+      kyberSlug(args.buyChainId) && kyberSlug(args.sellChainId)
+        ? verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd })
+        : verifyViaGeckoTerminal(args, { getTokenStats }),
+    // Tx simulation of the executable path (build → eth_call with state overrides). Gated upstream by
+    // ARB_SIMULATE in scanUnit; here we just supply the impl + the deBridge API key for the build calls.
+    simulate: (args) => simulateOpportunity({ ...args, apiKey }),
     store,
     budget: getBudget(),
     concurrency: Number(process.env.ARB_SCAN_CONCURRENCY ?? 8),
@@ -95,19 +107,20 @@ export async function runOptimize(debridgeId: string, buyChainId: number, sellCh
   const sellToken = member(sellChainId);
   if (!buyToken || !sellToken) return { error: "tokens not found on those chains" as const };
 
-  // optimizeRoute, like scanUnit, passes raw token units 1:1 across the redemption — both legs must
-  // share a known decimals or the size sweep is mis-scaled. Forward-found reps can lack/mismatch it.
+  // optimizeRoute mirrors scanUnit: the dePort move is 1:1 by VALUE, so the size sweep rescales the
+  // bridged amount by the buy→sell decimal delta. Decimals only need to be KNOWN (rep ≠ native is fine —
+  // e.g. an 18-dec EVM token ↔ its 8-dec Solana deAsset); forward-found reps can still lack them.
   const decimalsOf = (chainId: number) =>
     chainId === family.nativeChainId ? family.decimals : family.reps.find((r) => r.internalChainId === chainId)?.decimals;
   const buyDecimals = decimalsOf(buyChainId);
   const sellDecimals = decimalsOf(sellChainId);
-  if (buyDecimals === undefined || sellDecimals === undefined || buyDecimals !== sellDecimals) {
-    return { error: "token decimals unknown or mismatched — 1:1 redemption not size-safe" as const };
+  if (buyDecimals === undefined || sellDecimals === undefined) {
+    return { error: "token decimals unknown — 1:1 redemption not size-safe" as const };
   }
 
   const apiKey = process.env.DEBRIDGE_API_KEY || undefined;
   return optimizeRoute(
-    { debridgeId, buyChainId, sellChainId, buyToken, sellToken, symbol: family.symbol },
+    { debridgeId, buyChainId, sellChainId, buyToken, sellToken, symbol: family.symbol, buyDecimals, sellDecimals },
     {
       fetchQuote: (c, i, o, a) =>
         c === SOLANA_INTERNAL_ID ? fetchJupiterQuote(i, o, a) : fetchDexQuote(c, i, o, a, apiKey),

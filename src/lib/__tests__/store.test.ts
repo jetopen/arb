@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { MemoryStore, parsePenaltyMs, parseHotRatio, DEAD_ROUTE_PENALTY_MS, DEFAULT_OPP_MAX_AGE_MS, HOT_RATIO } from "../db/store";
+import { describe, it, expect, vi } from "vitest";
+import { MemoryStore, parsePenaltyMs, parseHotRatio, DEAD_ROUTE_PENALTY_MS, TRANSIENT_RETRY_MS, DEFAULT_OPP_MAX_AGE_MS, HOT_RATIO } from "../db/store";
 import type { EdgeResult, Opportunity, ScanUnit } from "../types";
 
 function opp(
@@ -62,6 +62,26 @@ describe("MemoryStore opportunities", () => {
     expect((await s.topOpportunities({ minSpreadPct: 0.5 })).total).toBe(2);
     expect((await s.topOpportunities({ verifiedOnly: true })).total).toBe(1);
     expect((await s.topOpportunities({ chainId: 8453 })).total).toBe(1);
+  });
+
+  it("filters by tierUsd (the capital selector pins one ladder rung); unset = best size per token", async () => {
+    const s = new MemoryStore();
+    // same token at two probe sizes: $25 has the bigger spread, $100 smaller (thin-pool U-curve)
+    await s.upsertOpportunities([
+      opp("t-25", 1.2, { debridgeId: "0xtok", tierUsd: 25 }),
+      opp("t-100", 0.4, { debridgeId: "0xtok", tierUsd: 100 }),
+      opp("u-25", 0.9, { debridgeId: "0xtok2", tierUsd: 25 }),
+    ]);
+    // unset → best size per token (token1's $25 rung wins)
+    const best = await s.topOpportunities({ groupByToken: true });
+    expect(best.opportunities.map((o) => o.id)).toEqual(["t-25", "u-25"]);
+    // pinned to $100 → only token1 has a $100 rung
+    const pinned = await s.topOpportunities({ tierUsd: 100, groupByToken: true });
+    expect(pinned.total).toBe(1);
+    expect(pinned.opportunities[0].id).toBe("t-100");
+    // pinned to $25 → both tokens, their $25 rows
+    const pinned25 = await s.topOpportunities({ tierUsd: 25, groupByToken: true });
+    expect(pinned25.opportunities.map((o) => o.id)).toEqual(["t-25", "u-25"]);
   });
 
   it("paginates", async () => {
@@ -186,6 +206,27 @@ describe("MemoryStore adaptive demotion + realized quotability", () => {
       { unit: u("deadx"), live: false }, // never proven → demoted
     ]);
     expect((await s.dequeue(1))[0].debridgeId).toBe("proven"); // proven cycles, deadx is in the future
+  });
+
+  it("gives a TRANSIENT failure a short backoff, not the 6h dead penalty (flaky-chain live routes recover fast)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2020-01-01T00:00:00Z"));
+      const s = new MemoryStore();
+      await s.enqueue([u("transient"), u("dead")]);
+      await s.dequeue(2);
+      await s.markScanned([
+        { unit: u("transient"), live: false, transient: true }, // 5xx/429 blip → short backoff
+        { unit: u("dead"), live: false, transient: false }, // permanent no-route → 6h penalty
+      ]);
+      // Past the short transient backoff but well within the 6h dead penalty: only the transient route is eligible.
+      vi.advanceTimersByTime(TRANSIENT_RETRY_MS + 1000);
+      expect(TRANSIENT_RETRY_MS).toBeLessThan(DEAD_ROUTE_PENALTY_MS);
+      const got = await s.dequeue(2);
+      expect(got.map((x) => x.debridgeId)).toEqual(["transient"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("requeueFresh bumps priority so a proven route wins the tie-break among equally-stale peers", async () => {

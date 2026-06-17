@@ -37,6 +37,13 @@ export const SUPPORTED_CHAINS: ChainInfo[] = [
   { id: 998, name: "HyperEVM", symbol: "HYPE", logoUrl: "https://tokens.debridge.finance/Logo/998/native/big/token-logo.png", color: "#00D1FF", explorerTxUrl: "https://explorer.hyperevm.xyz/tx" },
   { id: 25, name: "Cronos", symbol: "CRO", logoUrl: "https://tokens.debridge.finance/Logo/25/native/big/token-logo.png", color: "#002D74", explorerTxUrl: "https://cronoscan.com/tx" },
   { id: 383, name: "Cronos zkEVM", symbol: "CRO", logoUrl: "https://tokens.debridge.finance/Logo/383/native/big/token-logo.png", color: "#002D74", explorerTxUrl: "https://explorer.cronos.org/tx" },
+  // Non-EVM chains keyed by deBridge INTERNAL id (what opportunities/reps store) so chainName + explorer
+  // links resolve for them — the entries above key Sei/Injective by display ids, which never match a row.
+  { id: 100000026, name: "Tron", symbol: "TRX", logoUrl: "https://tokens.debridge.finance/Logo/100000026/native/big/token-logo.png", color: "#EF0027", explorerTxUrl: "https://tronscan.org/#/transaction" },
+  { id: 100000027, name: "Sei", symbol: "SEI", logoUrl: "https://tokens.debridge.finance/Logo/100000027/native/big/token-logo.png", color: "#9B1C2E", explorerTxUrl: "https://seitrace.com/tx" },
+  { id: 100000009, name: "Flow", symbol: "FLOW", logoUrl: "https://tokens.debridge.finance/Logo/100000009/native/big/token-logo.png", color: "#00EF8B", explorerTxUrl: "https://evm.flowscan.io/tx" },
+  { id: 100000030, name: "Monad", symbol: "MON", logoUrl: "https://tokens.debridge.finance/Logo/100000030/native/big/token-logo.png", color: "#836EF9", explorerTxUrl: "https://monadexplorer.com/tx" },
+  { id: 100000031, name: "MegaETH", symbol: "ETH", logoUrl: "https://tokens.debridge.finance/Logo/100000031/native/big/token-logo.png", color: "#2B2B2B", explorerTxUrl: "https://megaexplorer.xyz/tx" },
 ];
 
 const chainMap = new Map<number, ChainInfo>();
@@ -59,6 +66,7 @@ export function getExplorerTxUrl(chainId: number, txHash: string): string {
 export function getExplorerAddressUrl(chainId: number, address: string): string {
   const chain = chainMap.get(chainId);
   if (!chain) return "";
+  if (chainId === 100000026) return `https://tronscan.org/#/address/${address}`; // Tron uses a hash route
   const base = chain.explorerTxUrl.replace(/\/tx$/, "");
   const path = chainId === 7565164 ? "account" : "address"; // Solscan uses /account/<pubkey>
   return `${base}/${path}/${address}`;

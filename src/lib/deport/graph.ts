@@ -9,6 +9,8 @@ import {
   type FamilyKey,
 } from "../onchain/debridge-gate";
 import { isEvmDeportChain, EVM_DEPORT_CHAINS } from "./registry";
+import { toCanonicalAddress } from "./address-codec";
+import { enumerateTronReps } from "../onchain/tron-reps";
 import { getTokenListForChain } from "../api-client";
 import { deriveFamiliesFromEvents, mergeEventReps, type DerivedEvents } from "./events-graph";
 import { getStore, parsePenaltyMs } from "../db/store";
@@ -36,7 +38,9 @@ export function assembleFamilies(
 ): Family[] {
   const groups = new Map<string, RawDeAsset[]>();
   for (const r of raw) {
-    const id = computeDebridgeId(r.nativeChainId, r.nativeAddress as Hex);
+    // Forward-found reps carry the authoritative debridgeId (their native address may be a base58
+    // Solana/Tron string that can't be re-hashed); discovered reps carry raw-hex natives we re-derive.
+    const id = r.debridgeId ?? computeDebridgeId(r.nativeChainId, r.nativeAddress as Hex);
     const list = groups.get(id);
     if (list) list.push(r);
     else groups.set(id, [r]);
@@ -44,7 +48,10 @@ export function assembleFamilies(
 
   const families: Family[] = [];
   for (const [debridgeId, members] of groups) {
-    const { nativeChainId, nativeAddress } = members[0];
+    const { nativeChainId } = members[0];
+    // memberAddress() quotes the native leg straight off Family.nativeAddress, so it MUST be canonical
+    // (base58 for a Solana/Tron native, hex for EVM) — members may carry either raw-hex or base58.
+    const nativeAddress = toCanonicalAddress(nativeChainId, members[0].nativeAddress);
     // Dedupe reps by (chain,address) — a token can legitimately appear once per chain.
     const seen = new Set<string>();
     const reps: DeAsset[] = [];
@@ -160,13 +167,15 @@ export function forwardUniverse(discovered: RawDeAsset[], eventFamilies: Family[
   };
   // Discovered reps always carry a raw-hex native address (from getNativeInfo) — add them all.
   for (const r of discovered) add(r.nativeChainId, r.nativeAddress);
-  // Event families: ONLY EVM-native ones. Their canonical native address IS raw hex (computeDebridgeId can
-  // anchor it and the assemble regroup stays correct). A non-EVM native (Solana base58, etc.) would corrupt
-  // both anchoring and the native leg, so it is left to the event-merge path (PASS 5), which preserves the
-  // canonical native address. NB computeDebridgeId does NOT throw on a base58 string — it silently hashes it
-  // wrong — so this MUST be an explicit chain-kind check; the try/catch above is resilience, not a filter.
+  // Event families of EVERY native-chain kind (Solana, Tron, Sei, … included). We seed from the family's
+  // AUTHORITATIVE debridgeId (it came straight from deBridge's submission log — no recompute, so a base58
+  // native address is a non-issue), then getDebridge resolves that family's reps on every scanned EVM
+  // chain — including the receive-only ones the submission log can't carry a deAsset address for. This is
+  // what unblocks forward expansion for non-EVM-native families (e.g. the 244 Solana-native families);
+  // their canonical native leg still rides in via the PASS-5 event merge.
   for (const f of eventFamilies) {
-    if (isEvmDeportChain(f.nativeChainId)) add(f.nativeChainId, f.nativeAddress);
+    const k = f.debridgeId.toLowerCase();
+    if (!keys.has(k)) keys.set(k, { debridgeId: f.debridgeId as Hex, nativeChainId: f.nativeChainId, nativeAddress: f.nativeAddress });
   }
   return [...keys.values()];
 }
@@ -229,11 +238,23 @@ export async function buildLockGraph(
     if (!f.ok) partial = true;
     forward.push(...f.reps);
   }
+
+  // ---- PASS 2b: forward expansion on Tron (non-EVM gate, same getDebridge via TronGrid eth_call). Finds
+  // Tron reps the EVM multicall can't reach and the case-lossy event index can't anchor. Best-effort:
+  // a transport failure flags partial, never aborts. (Solana's gate has no equivalent cold read — its
+  // reachable families are already covered by the event seed + forward pass above.) ----
+  const tron = await enumerateTronReps(families).catch(() => ({ reps: [] as RawDeAsset[], ok: false }));
+  if (!tron.ok) partial = true;
+  forward.push(...tron.reps);
+
   const raw = mergeForwardReps(discovered, forward);
 
   // ---- PASS 3: metadata fill for reps with no (or decimals-less) token-list entry ----
   const missingByChain = new Map<number, Set<string>>();
   for (const r of raw) {
+    // On-chain ERC20 reads only work on EVM chains (getPublicClient throws for quote-only). Non-EVM reps
+    // (Tron, Solana) take their decimals from the token-list / event index, never an on-chain probe.
+    if (!isEvmDeportChain(r.internalChainId)) continue;
     const m = metaByKey.get(metaKey(r.internalChainId, r.address));
     if (!m || m.decimals === undefined) {
       let set = missingByChain.get(r.internalChainId);

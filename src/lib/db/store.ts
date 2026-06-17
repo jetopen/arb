@@ -15,6 +15,9 @@ export interface ScanOutcome {
   unit: ScanUnit;
   /** true when BOTH legs returned a real (non-zero, non-throwing) quote — i.e. the route has liquidity. */
   live: boolean;
+  /** true when a non-live result came from a TRANSIENT upstream error (5xx/429/network) rather than a
+   *  permanent no-route. Transient failures on an unproven route get a short backoff, not the 6h penalty. */
+  transient?: boolean;
 }
 
 /**
@@ -35,6 +38,11 @@ export function parsePenaltyMs(raw: string | undefined, fallback = DEFAULT_DEAD_
 }
 
 export const DEAD_ROUTE_PENALTY_MS = parsePenaltyMs(process.env.ARB_DEAD_ROUTE_PENALTY_MS);
+
+/** Backoff for a TRANSIENT quote failure (5xx/429/network/timeout) on a not-yet-proven route. Short on
+ * purpose: a flaky chain's genuinely-live routes (Flow/Sei estimation is intermittently 5xx) recover
+ * within minutes instead of being hidden for the full 6h dead penalty. Default 10m; ARB_TRANSIENT_RETRY_MS. */
+export const TRANSIENT_RETRY_MS = parsePenaltyMs(process.env.ARB_TRANSIENT_RETRY_MS, 10 * 60 * 1000);
 
 /** Default read-freshness window for the Opportunities list — DECOUPLED from the dead-route penalty. The
  * work queue can take well over 6h to cycle when scanning is sparse, so a 6h read gate hid most still-valid
@@ -109,9 +117,11 @@ export class MemoryStore implements Store {
   async topOpportunities(filter: OpportunityFilter): Promise<{ opportunities: Opportunity[]; total: number }> {
     let list = [...this.opps.values()];
     if (filter.minSpreadPct != null) list = list.filter((o) => o.edge.grossSpreadPct >= filter.minSpreadPct!);
+    if (filter.tierUsd != null) list = list.filter((o) => o.tierUsd === filter.tierUsd);
     if (filter.chainId != null)
       list = list.filter((o) => o.buyChainId === filter.chainId || o.sellChainId === filter.chainId);
     if (filter.verifiedOnly) list = list.filter((o) => o.verification?.verified);
+    if (filter.executableOnly) list = list.filter((o) => o.simulation?.executable === true);
     if (filter.maxAgeMs != null) {
       const cutoff = Date.now() - filter.maxAgeMs;
       list = list.filter((o) => o.computedAt >= cutoff);
@@ -202,15 +212,16 @@ export class MemoryStore implements Store {
 
   async markScanned(outcomes: ScanOutcome[]): Promise<void> {
     const now = Date.now();
-    for (const { unit, live } of outcomes) {
+    for (const { unit, live, transient } of outcomes) {
       const k = unitKey(unit);
       const item = this.queue.find((i) => unitKey(i.unit) === k);
       if (!item) continue;
-      // A proven route (one that has ever produced a quote) is never demoted on a single failure —
-      // that's a transient API blip, not a dead pool. Only unproven-dead routes get time-demoted so
-      // dequeue (time-ordered) stops re-scanning the no-liquidity wrapped reps every cycle.
+      // A proven route (one that has ever produced a quote) is never demoted on a single failure — that's
+      // a blip, not a dead pool. Among UNproven failures, a TRANSIENT upstream error (5xx/429/network) gets
+      // only a short backoff so a flaky chain's live routes recover fast, while a permanent no-route
+      // (amountOut 0 / 4xx) gets the full dead-route penalty so dequeue stops re-scanning dead reps.
       const keep = live || this.opps.has(k);
-      item.lastScannedAt = keep ? now : now + DEAD_ROUTE_PENALTY_MS;
+      item.lastScannedAt = keep ? now : now + (transient ? TRANSIENT_RETRY_MS : DEAD_ROUTE_PENALTY_MS);
     }
   }
 

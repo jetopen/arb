@@ -11,21 +11,37 @@ import type { Opportunity } from "@/lib/types";
 
 type View = "opportunities" | "tracked";
 
+const PAGE_SIZE = 200;
+// Fallback capital ladder for first paint / older API responses. The live list comes from the API
+// (`data.tiers`, which mirrors the actually-scanned ARB_SCAN_NOTIONAL_USD ladder) so the selector never
+// offers a rung that wasn't scanned. "Best size" (undefined) keeps each token's highest-spread rung.
+const CAPITAL_TIERS_FALLBACK = [10, 25, 50, 100];
+
 export default function ArbitragePage() {
   const [view, setView] = useState<View>("opportunities");
   const [minSpreadPct, setMinSpreadPct] = useState<number | undefined>(undefined);
+  const [tierUsd, setTierUsd] = useState<number | undefined>(undefined);
   const [verifiedOnly, setVerifiedOnly] = useState(false);
+  const [executableOnly, setExecutableOnly] = useState(false);
+  const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Opportunity | null>(null);
 
   const { data: graph } = useLockGraphSummary();
-  const scan = useArbScanner(12);
+  const scan = useArbScanner(24);
   const { data, error, isLoading, mutate } = useArbOpportunities({
     minSpreadPct,
+    tierUsd,
     verifiedOnly,
-    take: 100,
+    executableOnly,
+    take: PAGE_SIZE,
+    page,
   });
 
   const opportunities = data?.opportunities ?? [];
+  const total = data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  // Offer exactly the rungs the scanner actually probed (from the API), falling back before first load.
+  const capitalTiers = data?.tiers ?? CAPITAL_TIERS_FALLBACK;
 
   return (
     <div className="space-y-6">
@@ -45,11 +61,15 @@ export default function ArbitragePage() {
       {/* Honesty banner */}
       <div className="rounded-lg border border-border bg-muted/20 p-4 text-sm text-muted">
         <span className="font-medium text-foreground">dePort cross-chain redemption spreads.</span>{" "}
-        Real executable round-trip quotes (deBridge aggregator) at a ~$1k probe size, grouped by lock
-        origin (debridgeId) — never by symbol — one row per token (its best spread). Spread is the gross
-        price gap before fees &amp; gas: size your own trade and compute net profit from it (open a row
-        for the $25–$5k optimizer). Net-profitable candidates are cross-checked against KyberSwap + a
-        GeckoTerminal liquidity gate. Solana/Tron not yet scanned. Screener only — not an auto-executor.
+        Real executable round-trip quotes (deBridge aggregator + Jupiter on Solana) probed across a small
+        capital ladder ($10–$100) over EVM <span className="font-medium text-foreground">and non-EVM</span>{" "}
+        chains (Solana, Sei, Tron, HyperEVM, …), grouped by lock origin (debridgeId) — never by symbol —
+        one row per token showing its <span className="font-medium text-foreground">best size</span> (or
+        pin one with the Capital filter). Spread is the gross price gap before fees &amp; gas: open a row
+        for the $10–$5k optimizer (net profit, break-even, gross-positive window). Net-profitable
+        candidates are cross-checked against KyberSwap (or a GeckoTerminal spot price where Kyber has no
+        coverage) + a liquidity gate. Note: some chains carry heavy gas (e.g. Tron ≈ $27/trade), so their
+        rows list but rarely net out. Screener only — not an auto-executor.
       </div>
 
       <ScanStatus graph={graph} scan={scan.data} lastScan={data?.lastScan} />
@@ -79,10 +99,31 @@ export default function ArbitragePage() {
           {/* Filters */}
           <div className="flex flex-wrap items-end gap-4">
             <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-muted uppercase tracking-wider">Capital</label>
+              <select
+                value={tierUsd ?? ""}
+                onChange={(e) => {
+                  setTierUsd(e.target.value === "" ? undefined : Number(e.target.value));
+                  setPage(1);
+                }}
+                className="px-3 py-2 text-sm rounded-md border border-border bg-white focus:outline-none focus:ring-2 focus:ring-accent/30"
+              >
+                <option value="">Best size</option>
+                {capitalTiers.map((t) => (
+                  <option key={t} value={t}>
+                    ${t}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="flex flex-col gap-1">
               <label className="text-xs font-medium text-muted uppercase tracking-wider">Min spread %</label>
               <select
                 value={minSpreadPct ?? ""}
-                onChange={(e) => setMinSpreadPct(e.target.value === "" ? undefined : Number(e.target.value))}
+                onChange={(e) => {
+                  setMinSpreadPct(e.target.value === "" ? undefined : Number(e.target.value));
+                  setPage(1);
+                }}
                 className="px-3 py-2 text-sm rounded-md border border-border bg-white focus:outline-none focus:ring-2 focus:ring-accent/30"
               >
                 <option value="">Any</option>
@@ -93,12 +134,25 @@ export default function ArbitragePage() {
               </select>
             </div>
             <button
-              onClick={() => setVerifiedOnly((v) => !v)}
+              onClick={() => {
+                setVerifiedOnly((v) => !v);
+                setPage(1);
+              }}
               className={`px-3 py-2 text-sm rounded-md border transition-colors self-end ${verifiedOnly ? "bg-accent text-white border-accent" : "border-border hover:bg-muted/50"}`}
             >
               {verifiedOnly ? "✓ Verified only" : "Verified only"}
             </button>
-            <div className="self-end text-sm text-muted">{data?.total ?? 0} tokens</div>
+            <button
+              onClick={() => {
+                setExecutableOnly((v) => !v);
+                setPage(1);
+              }}
+              title="Only routes whose tx simulation proved the executable path (requires ARB_SIMULATE on the scanner)"
+              className={`px-3 py-2 text-sm rounded-md border transition-colors self-end ${executableOnly ? "bg-accent text-white border-accent" : "border-border hover:bg-muted/50"}`}
+            >
+              {executableOnly ? "✓ Executable only" : "Executable only"}
+            </button>
+            <div className="self-end text-sm text-muted">{total} tokens</div>
           </div>
 
           <OpportunityTable
@@ -108,6 +162,28 @@ export default function ArbitragePage() {
             onSelect={setSelected}
             onRetry={() => mutate()}
           />
+
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between gap-4 text-sm">
+              <button
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page <= 1}
+                className="px-3 py-1.5 rounded-md border border-border hover:bg-muted/50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                ← Prev
+              </button>
+              <span className="text-muted">
+                Page {page} of {totalPages}
+              </span>
+              <button
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={page >= totalPages}
+                className="px-3 py-1.5 rounded-md border border-border hover:bg-muted/50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Next →
+              </button>
+            </div>
+          )}
         </>
       ) : (
         <TrackedFamilies />

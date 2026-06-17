@@ -1,5 +1,6 @@
 import type { DexQuote } from "../types";
 import { SOLANA_INTERNAL_ID, SOLANA_USDC_MINT } from "../deport/address-codec";
+import { QuoteHttpError } from "./quote-error";
 
 // Re-exported so existing importers (and tests) can keep `import { SOLANA_USDC_MINT } from ".../jupiter"`,
 // while the single source of truth lives in address-codec alongside SOLANA_INTERNAL_ID.
@@ -18,13 +19,14 @@ const RPS_RAW = Number(process.env.ARB_JUPITER_RPS);
 const RPS = Number.isFinite(RPS_RAW) && RPS_RAW > 0 ? RPS_RAW : 2;
 const MIN_INTERVAL_MS = Math.max(1, Math.round(1000 / RPS));
 
-// Serial throttle: each call resolves at least MIN_INTERVAL_MS after the previous one, capping request
-// rate even though the scanner issues quotes concurrently. Cheap (a promise chain), process-wide.
-let chain: Promise<void> = Promise.resolve();
+// Timestamp-based throttle: each call waits until MIN_INTERVAL_MS after the last one resolved.
+// Unlike a chained-promise throttle this doesn't accumulate list nodes for the process lifetime.
+let lastResolve = 0;
 function throttle(): Promise<void> {
-  const next = chain.then(() => new Promise<void>((res) => setTimeout(res, MIN_INTERVAL_MS)));
-  chain = next.catch(() => undefined);
-  return next;
+  const now = Date.now();
+  const delay = Math.max(0, lastResolve + MIN_INTERVAL_MS - now);
+  lastResolve = now + delay;
+  return new Promise<void>((res) => setTimeout(res, delay));
 }
 
 interface JupiterQuoteRaw {
@@ -74,7 +76,7 @@ export async function fetchJupiterQuote(tokenIn: string, tokenOut: string, amoun
   const headers: Record<string, string> = { Accept: "application/json", "User-Agent": UA };
   if (API_KEY) headers["x-api-key"] = API_KEY;
   const res = await fetch(url, { method: "GET", headers });
-  if (!res.ok) throw new Error(`jupiter ${res.status} for ${tokenIn}->${tokenOut}`);
+  if (!res.ok) throw new QuoteHttpError(res.status, `jupiter ${res.status} for ${tokenIn}->${tokenOut}`);
   const json = (await res.json()) as JupiterQuoteRaw;
   return parseJupiter(json, { tokenIn, tokenOut });
 }

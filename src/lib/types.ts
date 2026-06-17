@@ -1,3 +1,6 @@
+import type { SimulationResult } from "./sim/types";
+export type { SimulationResult } from "./sim/types";
+
 export type MessageStatus =
   | "Awaiting Confirmation"
   | "Awaiting Execution"
@@ -225,6 +228,8 @@ export interface Opportunity {
   tierUsd: number;
   edge: EdgeResult;
   verification: Verification | null;
+  /** Tx-simulation result (executable path tested before surfacing); absent when ARB_SIMULATE is off. */
+  simulation?: SimulationResult;
   /** Ordered legs describing the executable lock path. */
   lockPath: Array<{ chainId: number; address: string; role: string }>;
   computedAt: number;
@@ -239,7 +244,11 @@ export interface OpportunityFilter {
   /** Minimum gross round-trip spread % (the price gap). Primary filter for the spread screener. */
   minSpreadPct?: number;
   chainId?: number;
+  /** Pin to one probe size (a rung of the scan ladder). Unset = best size per token across the ladder. */
+  tierUsd?: number;
   verifiedOnly?: boolean;
+  /** Keep only opportunities whose tx simulation verdict is executable (simulation.executable === true). */
+  executableOnly?: boolean;
   /** Exclude opportunities whose computedAt is older than this many ms (freshness gate). */
   maxAgeMs?: number;
   /** Collapse to one row per token (family): keep the highest-spread row per debridgeId. */

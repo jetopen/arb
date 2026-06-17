@@ -84,8 +84,13 @@ import type { Opportunity } from "./types";
 export interface ArbFilters {
   minSpreadPct?: number;
   chainId?: number;
+  /** Pin to one probe size (a rung of the scan ladder); unset = best size per token. */
+  tierUsd?: number;
   verifiedOnly?: boolean;
+  /** Keep only rows whose tx simulation proved the executable path (needs ARB_SIMULATE on the scanner). */
+  executableOnly?: boolean;
   take?: number;
+  page?: number;
 }
 
 export interface ScanRunInfo {
@@ -101,6 +106,8 @@ export interface ArbResponse {
   opportunities: Opportunity[];
   total: number;
   lastScan: ScanRunInfo | null;
+  /** The probe-size ladder actually scanned (mirrors ARB_SCAN_NOTIONAL_USD) — drives the capital selector. */
+  tiers?: number[];
 }
 
 export interface GraphSummary {
@@ -117,8 +124,11 @@ function buildArbUrl(f: ArbFilters): string {
   const p = new URLSearchParams();
   if (f.minSpreadPct != null) p.set("minSpreadPct", String(f.minSpreadPct));
   if (f.chainId) p.set("chainId", String(f.chainId));
+  if (f.tierUsd != null) p.set("tierUsd", String(f.tierUsd));
   if (f.verifiedOnly) p.set("verifiedOnly", "true");
+  if (f.executableOnly) p.set("executableOnly", "true");
   if (f.take) p.set("take", String(f.take));
+  if (f.page && f.page > 1) p.set("page", String(f.page));
   const qs = p.toString();
   return `/api/arb/opportunities${qs ? `?${qs}` : ""}`;
 }

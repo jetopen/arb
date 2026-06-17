@@ -91,7 +91,7 @@ describe("enumerateDebridgeReps (forward getDebridge)", () => {
     } as unknown as PublicClient;
   }
 
-  it("emits a rep only on exist + matching native chainId; lowercases; carries nativeAddress", async () => {
+  it("emits a rep only on exist + matching native chainId; lowercases; carries nativeAddress + debridgeId", async () => {
     __setPublicClient(56, gdMock());
     const { reps, ok } = await enumerateDebridgeReps(56, families);
     expect(ok).toBe(true);
@@ -101,6 +101,7 @@ describe("enumerateDebridgeReps (forward getDebridge)", () => {
       address: "0xaabb0000000000000000000000000000000000cc",
       nativeChainId: 42161,
       nativeAddress: "0xarbnative",
+      debridgeId: "0xd1",
     });
   });
 

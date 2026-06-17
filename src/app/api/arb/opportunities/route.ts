@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getStore, DEFAULT_OPP_MAX_AGE_MS, parsePenaltyMs } from "@/lib/db/store";
+import { DEFAULT_TIERS } from "@/lib/arb/scanner";
 import type { OpportunityFilter } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -24,16 +25,22 @@ export async function GET(request: NextRequest) {
     const filter: OpportunityFilter = {
       minSpreadPct: finite("minSpreadPct"),
       chainId: finite("chainId"),
+      // Pin the table to one ladder rung (the capital selector); unset = best size per token.
+      tierUsd: finite("tierUsd"),
       verifiedOnly: searchParams.get("verifiedOnly") === "true",
+      // Keep only rows whose tx simulation proved the executable path (sim is opt-in via ARB_SIMULATE).
+      executableOnly: searchParams.get("executableOnly") === "true",
       maxAgeMs: maxAgeMs > 0 ? maxAgeMs : undefined,
       // Spread screener collapses to one row per token (highest spread per debridgeId).
       groupByToken: true,
       page: Math.max(1, finite("page") ?? 1),
-      take: Math.min(Math.max(1, finite("take") ?? 50), 200),
+      take: Math.min(Math.max(1, finite("take") ?? 50), 500),
     };
     const result = await getStore().topOpportunities(filter);
     const lastScan = await getStore().lastScanRun();
-    return NextResponse.json({ ...result, lastScan });
+    // The actual scanned ladder (reflects ARB_SCAN_NOTIONAL_USD) so the UI capital selector offers the
+    // rungs that were really scanned — never a hardcoded list that goes stale under an env override.
+    return NextResponse.json({ ...result, lastScan, tiers: DEFAULT_TIERS });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Internal server error";
     return NextResponse.json({ error: message }, { status: 500 });

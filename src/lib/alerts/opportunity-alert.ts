@@ -21,6 +21,28 @@ export function shouldAlert(opp: Opportunity, minSpreadPct: number | null): bool
   return false;
 }
 
+/** Sort comparator: STRONGEST first — net-profitable, then higher net USD, then higher gross spread. */
+export function compareOpportunityStrength(a: Opportunity, b: Opportunity): number {
+  if (a.edge.profitable !== b.edge.profitable) return a.edge.profitable ? -1 : 1;
+  if (b.edge.netUsd !== a.edge.netUsd) return b.edge.netUsd - a.edge.netUsd;
+  return b.edge.grossSpreadPct - a.edge.grossSpreadPct;
+}
+
+/**
+ * Collapse a scan batch to ONE alert per token (debridgeId), keeping its strongest row, sorted strongest
+ * first. The screener now probes each route at a LADDER of sizes × BOTH directions, so a single profitable
+ * token would otherwise emit up to 4×2 = 8 embeds and exhaust ALERT_BATCH_CAP. One token = one ping; the
+ * caller also keys the cross-batch dedup on debridgeId so it pings once, not once per rung.
+ */
+export function bestPerToken(opps: Opportunity[]): Opportunity[] {
+  const best = new Map<string, Opportunity>();
+  for (const o of opps) {
+    const cur = best.get(o.debridgeId);
+    if (!cur || compareOpportunityStrength(o, cur) < 0) best.set(o.debridgeId, o);
+  }
+  return [...best.values()].sort(compareOpportunityStrength);
+}
+
 const fmtUsd = (n: number) => `$${n.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
 const fmtPct = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(3)}%`;
 

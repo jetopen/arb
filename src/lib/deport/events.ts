@@ -6,6 +6,14 @@ const UA =
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+/** Only 0x-hex addresses are safe to lowercase. Tron (and other base58) addresses are case-sensitive —
+ *  lowercasing destroys the base58check, so they must be stored verbatim. Mirrors the backfill script's
+ *  normAddr; the live tail (this module) must match it or it silently re-corrupts every base58 row it ingests. */
+function normAddr(a: unknown): string {
+  const s = typeof a === "string" ? a : a == null ? "" : String(a);
+  return s.startsWith("0x") ? s.toLowerCase() : s;
+}
+
 /** Map a raw getEvents item to an arb_deport_events row (null if it lacks the required keys). */
 export function mapEvent(e: any): Record<string, unknown> | null {
   // origin_chain_id is BIGINT NOT NULL and is the family-identity key — a row missing it is useless AND,
@@ -18,7 +26,7 @@ export function mapEvent(e: any): Record<string, unknown> | null {
     type: typeof e.type === "number" ? e.type : 0,
     origin_chain_id: e.eventOriginChainId,
     to_chain_id: e.chainToId ?? null,
-    token_address: (e.tokenAddress || "").toLowerCase(),
+    token_address: normAddr(e.tokenAddress),
     token_symbol: e.tokenSymbol ?? null,
     token_name: e.tokenName ?? null,
     token_decimals: typeof e.tokenDecimals === "number" ? e.tokenDecimals : null,

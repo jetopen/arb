@@ -9,14 +9,24 @@ export interface VerifyArgs {
   /** deBridge's buy-leg output value in USD (what we cross-check against). */
   debridgeBuyAmountOutUsd: number;
   tierUsd: number;
-  /** Buy-leg token output in raw units + its decimals (Solana verify computes effective price from these). */
+  /** Buy-leg token output in raw units + its decimals (the GeckoTerminal verify computes effective price
+   *  from these). */
   buyAmountOut?: string;
   buyTokenDecimals?: number;
+  /** The buy leg's quote source label ("jupiter" for Solana, "debridge" otherwise) — used for the
+   *  GeckoTerminal cross-check's sourcesAgreed. Defaults to "quote" when absent. */
+  buyQuoteSource?: string;
   /** The SELL leg (the family member sold for USDC after the dePort move). Gated for fill-feasibility too:
    *  a round-trip is only real if BOTH pools can absorb the tier, and the thin leg can be either side
    *  (a deAsset rep, or a Solana-native pool). */
   sellChainId: number;
   sellTokenAddress: string;
+  /** Sell-leg quote (optional): raw tokens sold + their decimals + the USDC value received. When present,
+   *  the GeckoTerminal verify also cross-checks the SELL leg's effective price against market spot — the
+   *  deAsset being sold is often the thin/depegged leg, and the buy-leg-only cross-check would miss it. */
+  sellAmountIn?: string;
+  sellTokenDecimals?: number;
+  sellAmountOutUsd?: number;
 }
 
 /** One leg's observed liquidity (null = unknown — not a rejection). */
@@ -154,61 +164,82 @@ export async function verifyCandidate(args: VerifyArgs, deps: VerifyDeps): Promi
   };
 }
 
-export interface SolanaVerifyDeps {
+export interface GeckoTerminalVerifyDeps {
   /** One GeckoTerminal token fetch → both the pool reserve (liquidity gate) and the spot price
-   *  (cross-check) for the BUY leg. Combined so each candidate makes ONE GT request, not two identical ones. */
+   *  (cross-check). Called for BOTH legs so each candidate makes exactly TWO GT requests total — one per
+   *  leg — rather than the previous three (buy stats + sell liquidity + sell stats). */
   getTokenStats: (chainId: number, tokenAddr: string) => Promise<{ liquidityUsd: number | null; priceUsd: number | null } | null>;
-  /** Pool reserve for the SELL leg (its chain may be EVM or Solana — GeckoTerminal covers both). Gated so
-   *  an illiquid sell side can't be badged verified on the strength of a deep buy leg. */
-  getLiquidityUsd: (chainId: number, tokenAddr: string) => Promise<number | null>;
   /**
-   * Max |effective price − GeckoTerminal spot| / spot, in bps. Looser than the EVM path (200) on purpose:
-   * the Solana cross-check is a routed quote (Jupiter) vs a SPOT price (GeckoTerminal), so genuine size
-   * impact on thin pools can't be netted out — we tolerate it but still reject grossly mispriced/phantom
-   * routes. Default 1500 (15%).
+   * Max |effective price − GeckoTerminal spot| / spot, in bps. Looser than the Kyber path (200) on purpose:
+   * this cross-check is a routed quote (Jupiter / deBridge aggregator) vs a SPOT price (GeckoTerminal), so
+   * genuine size impact on thin pools can't be netted out — we tolerate it but still reject grossly
+   * mispriced/phantom routes. Default 1500 (15%).
    */
   toleranceBps?: number;
   minLiquidityMultiple?: number;
 }
 
 /**
- * Corroborate a profitable Solana-leg candidate, mirroring verifyCandidate with Solana sources:
+ * Corroborate a profitable candidate against GeckoTerminal — the cross-check for any chain KyberSwap can't
+ * quote (Solana, Sei, Tron, HyperEVM, …). Mirrors verifyCandidate with GT sources:
  *  1. Liquidity gate — BOTH legs' pools must be ≥ tier (buy leg from GeckoTerminal getTokenStats, sell leg
- *     from getLiquidityUsd; the sell side may be EVM or Solana). The thin leg can be either direction.
- *  2. Cross-check — Jupiter's effective buy price (USDC paid / tokens received) must agree with
+ *     from getLiquidityUsd; either side may be EVM or non-EVM). The thin leg can be either direction.
+ *  2. Cross-check — the buy quote's effective price (USD paid / tokens received) must agree with
  *     GeckoTerminal's market spot price within tolerance.
  * Missing liquidity/price or a mismatch leaves it UNVERIFIED (shown, not badged), never silently verified.
+ * `paidUsd` uses the nominal tier (the buy base is a stablecoin), so this is decimals-base-agnostic.
  */
-export async function verifySolanaCandidate(args: VerifyArgs, deps: SolanaVerifyDeps): Promise<Verification> {
+export async function verifyViaGeckoTerminal(args: VerifyArgs, deps: GeckoTerminalVerifyDeps): Promise<Verification> {
   const tolerance = deps.toleranceBps ?? 1500;
   const minMult = deps.minLiquidityMultiple ?? 1;
+  const source = args.buyQuoteSource ?? "quote";
 
-  // Single GeckoTerminal fetch supplies the buy leg's reserve AND spot price; the sell leg needs a reserve.
-  const [stats, sellLiq] = await Promise.all([
+  // Fetch both legs via getTokenStats: each call returns reserve AND spot price in a single GT request,
+  // so the pair needs exactly TWO requests instead of the previous three (buy stats + sell liquidity +
+  // conditional sell stats). The sell reserve (liquidityUsd) is now sourced from the same response used
+  // for the sell-leg price cross-check, eliminating the duplicate getLiquidityUsd call.
+  const wantSellPrice =
+    args.sellAmountIn != null && args.sellTokenDecimals != null && args.sellAmountOutUsd != null;
+  const [stats, sellStats] = await Promise.all([
     deps.getTokenStats(args.buyChainId, args.buyTokenAddress).catch(() => null),
-    legLiquidity(deps.getLiquidityUsd, args.sellChainId, args.sellTokenAddress),
+    deps.getTokenStats(args.sellChainId, args.sellTokenAddress).catch(() => null),
   ]);
   const gate = gateRoundTripLiquidity(
     [
       { chainId: args.buyChainId, liquidityUsd: stats?.liquidityUsd ?? null },
-      { chainId: args.sellChainId, liquidityUsd: sellLiq },
+      { chainId: args.sellChainId, liquidityUsd: sellStats?.liquidityUsd ?? null },
     ],
     args.tierUsd,
     minMult
   );
-  if (gate.thinLeg) return thinLegRejection(gate.thinLeg, args.tierUsd, "jupiter");
+  if (gate.thinLeg) return thinLegRejection(gate.thinLeg, args.tierUsd, source);
   const liquidityUsd = gate.liquidityUsd;
+
+  // A "verified" badge asserts fill-feasibility, so require at least one OBSERVED pool reserve that cleared
+  // the tier gate. With no reserve known on either leg (a chain GeckoTerminal can't price — e.g. a missing
+  // network slug — or a token whose response has price_usd but null total_reserve_in_usd) we have zero
+  // liquidity evidence; leave it UNVERIFIED rather than badge it on a spot price alone. This closes the
+  // gate-bypass where both legs' liquidity were null yet the price agreed.
+  if (liquidityUsd == null) {
+    return {
+      verified: false,
+      sourcesAgreed: [source],
+      quoteDisagreementBps: null,
+      liquidityUsd: null,
+      rejectReason: "no liquidity evidence on either leg",
+    };
+  }
 
   const gtPrice = stats?.priceUsd ?? null;
   const tokensOut =
     args.buyAmountOut != null && args.buyTokenDecimals != null
       ? Number(args.buyAmountOut) / 10 ** args.buyTokenDecimals
       : 0;
-  const paidUsd = args.amountInUsdcUnits ? Number(args.amountInUsdcUnits) / 1e6 : args.tierUsd;
+  const paidUsd = args.tierUsd;
   if (gtPrice == null || gtPrice <= 0 || tokensOut <= 0 || paidUsd <= 0) {
     return {
       verified: false,
-      sourcesAgreed: ["jupiter"],
+      sourcesAgreed: [source],
       quoteDisagreementBps: null,
       liquidityUsd,
       rejectReason: "no independent cross-check available",
@@ -219,15 +250,36 @@ export async function verifySolanaCandidate(args: VerifyArgs, deps: SolanaVerify
   if (disagreementBps > tolerance) {
     return {
       verified: false,
-      sourcesAgreed: ["jupiter"],
+      sourcesAgreed: [source],
       quoteDisagreementBps: disagreementBps,
       liquidityUsd,
       rejectReason: `price vs market off ${Math.round(disagreementBps)}bps`,
     };
   }
+
+  // Sell-leg cross-check: the deAsset being SOLD is often the thin/depegged leg (the home->rep direction),
+  // and the buy-leg cross-check above can't catch it. When a sell quote + a sell-leg GT spot are available,
+  // require the sell effective price (USDC received / tokens sold) to agree with market within tolerance.
+  if (wantSellPrice && sellStats?.priceUsd != null && sellStats.priceUsd > 0) {
+    const tokensSold = Number(args.sellAmountIn) / 10 ** (args.sellTokenDecimals as number);
+    if (tokensSold > 0) {
+      const sellEffective = (args.sellAmountOutUsd as number) / tokensSold;
+      const sellBps = (Math.abs(sellEffective - sellStats.priceUsd) / sellStats.priceUsd) * 10_000;
+      if (sellBps > tolerance) {
+        return {
+          verified: false,
+          sourcesAgreed: [source],
+          quoteDisagreementBps: sellBps,
+          liquidityUsd,
+          rejectReason: `sell price vs market off ${Math.round(sellBps)}bps`,
+        };
+      }
+    }
+  }
+
   return {
     verified: true,
-    sourcesAgreed: ["jupiter", "geckoterminal"],
+    sourcesAgreed: [source, "geckoterminal"],
     quoteDisagreementBps: disagreementBps,
     liquidityUsd,
   };

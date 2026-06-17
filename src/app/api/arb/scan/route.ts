@@ -12,7 +12,7 @@ export async function GET(request: NextRequest) {
   if (denied) return denied;
   try {
     const { searchParams } = new URL(request.url);
-    const n = Math.min(Math.max(Number(searchParams.get("n") ?? "12"), 1), 32);
+    const n = Math.min(Math.max(Number(searchParams.get("n") ?? "12"), 1), 64);
     const result = await runScan(n);
     return NextResponse.json(result);
   } catch (error) {

@@ -56,6 +56,18 @@ describe("mergeEventReps", () => {
     };
     expect(mergeEventReps(onChain, derived)[0].reps).toHaveLength(1);
   });
+
+  it("preserves a Tron base58 rep's case when augmenting (base58check is case-sensitive — never lowercased)", () => {
+    const TRON = 100000026;
+    const TRON_B58 = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
+    const onChain = [fam("0xT", [{ internalChainId: 56, address: "0xbnb", isNativeRoot: true }])];
+    const derived: DerivedEvents = {
+      repsByDebridgeId: new Map([["0xt", [{ internalChainId: TRON, address: TRON_B58, isNativeRoot: false }]]]),
+      families: [],
+    };
+    const tronRep = mergeEventReps(onChain, derived)[0].reps.find((r) => r.internalChainId === TRON)!;
+    expect(tronRep.address).toBe(TRON_B58); // exact mixed-case preserved
+  });
   it("adds event-only families absent from the on-chain graph", () => {
     const derived: DerivedEvents = {
       repsByDebridgeId: new Map(),

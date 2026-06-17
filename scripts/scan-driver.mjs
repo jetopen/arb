@@ -8,7 +8,7 @@
 //
 // Env (loaded from .env.local in dev via @next/env; real config vars in prod):
 //   SCAN_DRIVER_URL          base URL of the app          (default http://localhost:3000)
-//   SCAN_DRIVER_N            units per batch, 1..32        (default 24)
+//   SCAN_DRIVER_N            units per batch, 1..64        (default 24)
 //   SCAN_DRIVER_INTERVAL_MS  loop interval                 (default 12000)
 //   CRON_SECRET              if set, sent as Bearer auth   (must match the app's CRON_SECRET)
 
@@ -23,7 +23,7 @@ try {
 }
 
 const BASE = (process.env.SCAN_DRIVER_URL || "http://localhost:3000").replace(/\/+$/, "");
-const N = Math.min(Math.max(Number(process.env.SCAN_DRIVER_N) || 24, 1), 32);
+const N = Math.min(Math.max(Number(process.env.SCAN_DRIVER_N) || 24, 1), 64);
 const INTERVAL = Math.max(Number(process.env.SCAN_DRIVER_INTERVAL_MS) || 12_000, 1_000);
 const SECRET = process.env.CRON_SECRET;
 const ONCE = process.argv.includes("--once");
