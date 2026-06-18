@@ -39,3 +39,43 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local scratch / debug artifacts (data dumps, screenshots, probe output — not app code)
+/arb-*.png
+/dev-server.log
+*.patch
+.omo/
+.playwright-mcp/
+/forks.html
+/forks.json
+/verify-final.js
+/_paper_text.txt
+/_spotmeta_verify.json
+~/
+# accidental redirect/temp files (path-like names from shell redirects on Windows)
+*UsersnethaDocuments*
+*TEMP*.json
+# root-level probe/data dumps
+/bb_cg.json
+/chains.json
+/chains_v2.json
+/chains_verify.json
+/de_sol_events.json
+/dexs_response.json
+/dfk_api.json
+/dfk_tmp.json
+/harmony_dexs.json
+/hype_book.json
+/protocols.json
+/protos_check.json
+/somnia_hist.json
+/somnia_dexs.json
+/spotctx.json
+/spotctx_tmp.json
+/spotmeta.json
+/spotmeta_live.json
+/spotmeta_tmp.json
+/satsuma_vol.json
+/viper.json
+/viper2.json
+/viper_check.json
