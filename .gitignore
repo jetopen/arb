@@ -79,3 +79,6 @@ next-env.d.ts
 /viper.json
 /viper2.json
 /viper_check.json
+
+.vercel
+.env*
