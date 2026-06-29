@@ -14,7 +14,7 @@ name: arb-scan
 
 on:
   schedule:
-    - cron: "*/30 * * * *" # every 30 min (cron minimum is 5 min; runs on the default branch only)
+    - cron: "13,43 * * * *" # ~every 30 min at :13/:43 — off the congested top-of-hour; re-pushed to register the schedule after the default-branch switch to solana-support
   workflow_dispatch: {} # manual "Run workflow" button for testing
 
 # Never overlap runs; let an in-flight scan finish rather than starting a second.
