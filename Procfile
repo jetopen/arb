@@ -1,2 +1,2 @@
 web: npm start
-worker: node scripts/scan-driver.mjs
+# scan runs as a Heroku Scheduler one-off (`npm run scan:once`), not an always-on worker dyno.

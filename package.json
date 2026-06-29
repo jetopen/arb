@@ -9,6 +9,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "scan:once": "tsx scripts/scan-once.mts",
     "lint": "eslint",
     "test": "vitest"
   },
@@ -22,6 +23,7 @@
     "react-dom": "19.2.4",
     "recharts": "^3.8.1",
     "swr": "^2.4.1",
+    "tsx": "^4.19.2",
     "viem": "^2.52.2",
     "zod": "^4.4.3"
   },
