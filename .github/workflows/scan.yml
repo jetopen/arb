@@ -1,0 +1,48 @@
+# Runs the decoupled arbitrage scan on a schedule — replaces the Heroku worker dyno at $0.
+# `npm run scan:once` (scripts/scan-once.mts) builds/loads the lock-graph from the Supabase snapshot,
+# scans one batch, writes results, and exits. No timeout pressure here (Actions allows minutes), so the
+# ~15-25s graph rebuild at the 6h snapshot boundary runs fine — the constraint that blocked Vercel/Heroku.
+#
+# NOTE: scheduled workflows only run on the repo's DEFAULT branch. Make `solana-support` the default branch
+# (or merge it to the default) or this `schedule` will never fire. `workflow_dispatch` lets you test it now.
+#
+# Minutes: only PRIVATE repos consume Actions minutes (~50-60s/run incl. cached install). At every 30 min
+# that is ~1,440 min/mo — under the free 2,000 (private) and the 3,000 a GitHub Pro/Edu account gets.
+# A PUBLIC repo gets UNLIMITED Actions minutes — then you can drop to */10 if you want fresher scans.
+
+name: arb-scan
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # every 30 min (cron minimum is 5 min; runs on the default branch only)
+  workflow_dispatch: {} # manual "Run workflow" button for testing
+
+# Never overlap runs; let an in-flight scan finish rather than starting a second.
+concurrency:
+  group: arb-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci --omit=dev # scan path only needs runtime deps (tsx is a dep); skips playwright/vitest
+      - name: Scan one batch
+        run: npm run scan:once
+        env:
+          # Required — selects the Supabase store (set these as repo Actions secrets):
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Optional — alerts + tuning (set as secrets/vars if you use them):
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DEBRIDGE_API_KEY: ${{ secrets.DEBRIDGE_API_KEY }}
+          # Knobs (plain values are fine — not secret):
+          ARB_SCAN_N: "48"
+          ARB_SCAN_RPM: "120"
+          ARB_JUPITER_RPS: "2"
