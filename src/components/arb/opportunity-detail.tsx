@@ -78,6 +78,10 @@ export function OpportunityDetail({ opp, onClose }: { opp: Opportunity; onClose:
                 <Row label="Status">
                   {v.verified ? (
                     <span className="text-accent">✓ corroborated ({v.sourcesAgreed.join(" + ")})</span>
+                  ) : v.aggregatorRoutable ? (
+                    <span className="text-amber-600" title="No independent pool/spot source could corroborate this, but a DEX aggregator (deBridge/1inch, 0x) routes it. Real but unverified — hand-check before sizing up.">
+                      ⚡ 1inch-routable (no independent pool/spot; aggregator routes it)
+                    </span>
                   ) : (
                     <span className="text-muted">{v.rejectReason ?? "unverified"}</span>
                   )}

@@ -174,7 +174,7 @@ export interface DexQuote {
   priceImpactBps: number;
   gasUsd: number;
   recommendedSlippageBps: number;
-  source: "debridge" | "kyberswap" | "onchain" | "jupiter";
+  source: "debridge" | "kyberswap" | "onchain" | "jupiter" | "0x";
 }
 
 export type ArbKind = "redemption" | "cross_rep";
@@ -215,6 +215,14 @@ export interface Verification {
   liquidityUsd: number | null;
   /** Reason the candidate was rejected, when verified === false. */
   rejectReason?: string;
+  /**
+   * True when no INDEPENDENT pool/spot source (KyberSwap, GeckoTerminal) could corroborate the leg, but a
+   * DEX aggregator (0x / deBridge=1inch) confirms it routes at ~the quoted price — or no aggregator was
+   * available to check it. These are real-but-uncorroborated edges (e.g. a deAsset rep 1inch routes through a
+   * pool GeckoTerminal/Kyber don't index, like MGLD/deMGLD). Surfaced with a distinct badge, NOT rejected.
+   * `verified` stays false (no fully-independent corroboration); this flag is the "routable, hand-check" state.
+   */
+  aggregatorRoutable?: boolean;
 }
 
 export interface Opportunity {

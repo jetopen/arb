@@ -109,7 +109,14 @@ export function OpportunityRow({
         <td className="px-4 py-3 text-sm">
           {positive && verified ? (
             <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800">
-              ✓ verified
+              {opp.verification?.sourcesAgreed?.includes("0x") ? "✓ verified (0x)" : "✓ verified"}
+            </span>
+          ) : positive && opp.verification?.aggregatorRoutable ? (
+            <span
+              className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-amber-100 text-amber-800"
+              title="No independent pool/spot source could corroborate this, but a DEX aggregator (deBridge/1inch, 0x) routes it — like the MGLD class. Real but unverified; hand-check before sizing up."
+            >
+              ⚡ 1inch-routable
             </span>
           ) : opp.verification?.rejectReason ? (
             <span className="text-xs text-muted" title={opp.verification.rejectReason}>

@@ -8,6 +8,7 @@ import { getNativeUsd } from "../quotes/native-price";
 import { verifyCandidate, verifyViaGeckoTerminal } from "../quotes/verify";
 import { simulateOpportunity } from "../sim/simulate";
 import { fetchKyberQuote, kyberSlug } from "../quotes/kyberswap";
+import { fetchZeroExQuote } from "../quotes/zerox";
 import { getPoolLiquidityUsd, getTokenStats } from "../liquidity/geckoterminal";
 import { getStore } from "../db/store";
 import { supabaseConfigured } from "../db/supabase";
@@ -70,10 +71,13 @@ export async function buildScanDeps(): Promise<ScanDeps> {
     // quote (Solana, Sei, Tron, HyperEVM, Flow, Monad, MegaETH, …), use the GeckoTerminal path — it gates
     // both legs' liquidity AND price-checks the buy and (when a sell quote is passed) the sell leg, so a
     // depegged non-Kyber sell side can't slip through verifyCandidate's buy-leg-only cross-check.
+    // When Kyber/GeckoTerminal can't corroborate a leg (a pool 1inch/0x route but they don't index — the
+    // MGLD/deMGLD false-negative class), both paths fall back to a 0x routability check (fetchZeroEx) and badge
+    // it `aggregatorRoutable` rather than hard-rejecting. Needs ZEROX_API_KEY; absent → degrades to routable.
     verify: (args) =>
       kyberSlug(args.buyChainId) && kyberSlug(args.sellChainId)
-        ? verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd })
-        : verifyViaGeckoTerminal(args, { getTokenStats }),
+        ? verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd, fetchZeroEx: fetchZeroExQuote })
+        : verifyViaGeckoTerminal(args, { getTokenStats, fetchZeroEx: fetchZeroExQuote }),
     // Tx simulation of the executable path (build → eth_call with state overrides). Gated upstream by
     // ARB_SIMULATE in scanUnit; here we just supply the impl + the deBridge API key for the build calls.
     simulate: (args) => simulateOpportunity({ ...args, apiKey }),

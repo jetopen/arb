@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import {
   verifyCandidate,
   verifyViaGeckoTerminal,
@@ -119,15 +119,197 @@ describe("verifyCandidate", () => {
     expect(v.rejectReason).toMatch(/disagree/);
   });
 
-  it("stays unverified (not rejected) when no cross-check source exists", async () => {
+  it("stays unverified-but-ROUTABLE when no independent cross-check exists (Kyber/0x can't, deBridge routes it)", async () => {
+    // The MGLD class: Kyber has no route and 0x is unavailable (no key). Not a phantom — surface as routable.
     const deps: VerifyDeps = {
       getLiquidityUsd: async () => null, // unknown liquidity on both legs -> not a rejection
-      fetchKyber: async () => null, // e.g. HyperEVM unsupported by Kyber
+      fetchKyber: async () => null, // e.g. Kyber can't route the deAsset rep
     };
     const v = await verifyCandidate(baseArgs, deps);
     expect(v.verified).toBe(false);
+    expect(v.aggregatorRoutable).toBe(true);
     expect(v.sourcesAgreed).toEqual(["debridge"]);
-    expect(v.rejectReason).toMatch(/no independent/);
+    expect(v.rejectReason).toBeUndefined();
+  });
+});
+
+describe("verifyCandidate — 0x fallback (the MGLD false-negative class)", () => {
+  const argsWithOut: VerifyArgs = { ...baseArgs, buyAmountOut: "1000000", buyTokenDecimals: 6 };
+  const zeroExQuote = (amountOut: string): DexQuote => ({ ...kyberQuote(0), amountOut, source: "0x" });
+  afterEach(() => {
+    delete process.env.ZEROX_API_KEY;
+  });
+
+  it("0x confirms the leg when Kyber has no route → verified (debridge + 0x)", async () => {
+    process.env.ZEROX_API_KEY = "test"; // buyChainId 42161 (Arbitrum) is 0x-supported
+    const deps: VerifyDeps = {
+      getLiquidityUsd: async (c) => (c === 42161 ? 5_000_000 : null), // buy deep, sell rep unknown (GT misses it)
+      fetchKyber: async () => null, // Kyber can't route the rep — the MGLD case
+      fetchZeroEx: async () => zeroExQuote("1000000"), // 0x routes it at ~the deBridge output
+    };
+    const v = await verifyCandidate(argsWithOut, deps);
+    expect(v.verified).toBe(true);
+    expect(v.sourcesAgreed).toEqual(["debridge", "0x"]);
+  });
+
+  it("aggregatorRoutable when neither Kyber nor 0x can corroborate", async () => {
+    process.env.ZEROX_API_KEY = "test";
+    const deps: VerifyDeps = {
+      getLiquidityUsd: async (c) => (c === 42161 ? 5_000_000 : null),
+      fetchKyber: async () => null,
+      fetchZeroEx: async () => null, // 0x finds no route either
+    };
+    const v = await verifyCandidate(argsWithOut, deps);
+    expect(v.verified).toBe(false);
+    expect(v.aggregatorRoutable).toBe(true);
+    expect(v.rejectReason).toBeUndefined();
+  });
+
+  it("rejects when 0x routes the leg materially BELOW the quote (real phantom)", async () => {
+    process.env.ZEROX_API_KEY = "test";
+    const deps: VerifyDeps = {
+      getLiquidityUsd: async () => 5_000_000,
+      fetchKyber: async () => null,
+      fetchZeroEx: async () => zeroExQuote("500000"), // 0x gets 50% less → quote was optimistic
+    };
+    const v = await verifyCandidate(argsWithOut, deps);
+    expect(v.verified).toBe(false);
+    expect(v.aggregatorRoutable).toBeUndefined();
+    expect(v.rejectReason).toMatch(/0x output below quote/);
+  });
+
+  it("keeps the disagreement REJECT when Kyber disagrees AND 0x can't confirm", async () => {
+    process.env.ZEROX_API_KEY = "test";
+    const deps: VerifyDeps = {
+      getLiquidityUsd: async () => 5_000_000,
+      fetchKyber: async () => kyberQuote(9000), // 1000 bps off
+      fetchZeroEx: async () => null, // 0x can't corroborate → the disagreement stands
+    };
+    const v = await verifyCandidate(argsWithOut, deps);
+    expect(v.verified).toBe(false);
+    expect(v.aggregatorRoutable).toBeUndefined();
+    expect(v.rejectReason).toMatch(/disagree/);
+  });
+});
+
+describe("verifyCandidate — thin-leg 0x rehab (the SWYCH $3-pool class)", () => {
+  // Thin BUY leg ($2k pool < $10k tier) whose SELL leg cleared the gate. buyChainId 42161 is 0x-supported.
+  const argsThin: VerifyArgs = { ...baseArgs, buyAmountOut: "1000000", buyTokenDecimals: 6 };
+  const zeroExQuote = (amountOut: string): DexQuote => ({ ...kyberQuote(0), amountOut, source: "0x" });
+  afterEach(() => {
+    delete process.env.ZEROX_API_KEY;
+  });
+
+  it("0x routes the full tier through a thin BUY leg → verified (debridge + 0x), reports the observed reserve", async () => {
+    process.env.ZEROX_API_KEY = "test";
+    const deps: VerifyDeps = {
+      getLiquidityUsd: async (c) => (c === 42161 ? 2_000 : 5_000_000), // buy thin ($2k), sell deep
+      fetchKyber: async () => null, // never reached (thin gate is first), but required by the type
+      fetchZeroEx: async () => zeroExQuote("1000000"), // 0x fills the full $10k tier at ~the deBridge output
+    };
+    const v = await verifyCandidate(argsThin, deps);
+    expect(v.verified).toBe(true);
+    expect(v.sourcesAgreed).toEqual(["debridge", "0x"]);
+    expect(v.liquidityUsd).toBe(2_000); // honest about the indexer-observed reserve
+    expect(v.rejectReason).toBeUndefined();
+  });
+
+  it("keeps the thin reject when 0x finds NO route for the thin buy leg", async () => {
+    process.env.ZEROX_API_KEY = "test";
+    const deps: VerifyDeps = {
+      getLiquidityUsd: async (c) => (c === 42161 ? 2_000 : 5_000_000),
+      fetchKyber: async () => null,
+      fetchZeroEx: async () => null, // 0x can't fill the tier either → observed thinness stands
+    };
+    const v = await verifyCandidate(argsThin, deps);
+    expect(v.verified).toBe(false);
+    expect(v.rejectReason).toMatch(/liquidity/);
+    expect(v.liquidityUsd).toBe(2_000);
+  });
+
+  it("keeps the thin reject with NO 0x key (can't adjudicate → don't resurrect the phantom)", async () => {
+    delete process.env.ZEROX_API_KEY; // 0x unsupported → rehab returns null
+    const deps: VerifyDeps = {
+      getLiquidityUsd: async (c) => (c === 42161 ? 2_000 : 5_000_000),
+      fetchKyber: async () => null,
+      fetchZeroEx: async () => zeroExQuote("1000000"), // present, but no key → never consulted
+    };
+    const v = await verifyCandidate(argsThin, deps);
+    expect(v.verified).toBe(false);
+    expect(v.rejectReason).toMatch(/liquidity/);
+  });
+
+  it("does NOT rehab a thin SELL leg (only the buy leg is 0x-checkable) — keeps the reject", async () => {
+    process.env.ZEROX_API_KEY = "test";
+    const deps: VerifyDeps = {
+      getLiquidityUsd: async (c) => (c === 56 ? 2_000 : 5_000_000), // sell (chain 56) thin, buy deep
+      fetchKyber: async () => null,
+      fetchZeroEx: async () => zeroExQuote("1000000"), // even if 0x would confirm the buy, sell stays unchecked
+    };
+    const v = await verifyCandidate(argsThin, deps);
+    expect(v.verified).toBe(false);
+    expect(v.rejectReason).toContain("56");
+  });
+
+  it("keeps the reject when BOTH legs are thin (sell uncleared → no rehab)", async () => {
+    process.env.ZEROX_API_KEY = "test";
+    const deps: VerifyDeps = {
+      getLiquidityUsd: async (c) => (c === 42161 ? 2_000 : 1_000), // buy $2k, sell $1k — both < $10k tier
+      fetchKyber: async () => null,
+      fetchZeroEx: async () => zeroExQuote("1000000"),
+    };
+    const v = await verifyCandidate(argsThin, deps);
+    expect(v.verified).toBe(false);
+    expect(v.rejectReason).toContain("56"); // binding leg is the thinner sell side ($1k)
+  });
+});
+
+describe("verifyViaGeckoTerminal — thin-leg 0x rehab", () => {
+  // EVM buy leg (0x-supported) thin on GeckoTerminal, sell leg deep; the GT path must rehab via 0x too.
+  const gtEvmArgs: VerifyArgs = {
+    ...{
+      buyChainId: 42161,
+      usdcAddress: "0xusdc",
+      buyTokenAddress: "0xbuytoken",
+      amountInUsdcUnits: "1000000000",
+      debridgeBuyAmountOutUsd: 1000,
+      tierUsd: 1000,
+      buyAmountOut: "1000000000",
+      buyTokenDecimals: 6,
+      buyQuoteSource: "debridge",
+      sellChainId: 56,
+      sellTokenAddress: "0xnative",
+    },
+  };
+  const zeroExQuote = (amountOut: string): DexQuote => ({
+    internalChainId: 42161, tokenIn: "0xusdc", tokenOut: "0xbuytoken", amountIn: "1000000000",
+    amountOut, amountInUsd: 0, amountOutUsd: 0, priceImpactBps: 0, gasUsd: 0, recommendedSlippageBps: 0, source: "0x",
+  });
+  afterEach(() => {
+    delete process.env.ZEROX_API_KEY;
+  });
+
+  it("0x routes the full tier through a thin GT buy leg → verified (debridge + 0x)", async () => {
+    process.env.ZEROX_API_KEY = "test";
+    const deps: GeckoTerminalVerifyDeps = {
+      getTokenStats: async (c) => (c === 42161 ? { liquidityUsd: 100, priceUsd: 1.0 } : { liquidityUsd: 5_000_000, priceUsd: 1.0 }),
+      fetchZeroEx: async () => zeroExQuote("1000000000"),
+    };
+    const v = await verifyViaGeckoTerminal(gtEvmArgs, deps);
+    expect(v.verified).toBe(true);
+    expect(v.sourcesAgreed).toEqual(["debridge", "0x"]);
+    expect(v.liquidityUsd).toBe(100);
+  });
+
+  it("keeps the thin reject when 0x can't fill the thin GT buy leg", async () => {
+    process.env.ZEROX_API_KEY = "test";
+    const deps: GeckoTerminalVerifyDeps = {
+      getTokenStats: async (c) => (c === 42161 ? { liquidityUsd: 100, priceUsd: 1.0 } : { liquidityUsd: 5_000_000, priceUsd: 1.0 }),
+      fetchZeroEx: async () => null,
+    };
+    const v = await verifyViaGeckoTerminal(gtEvmArgs, deps);
+    expect(v.verified).toBe(false);
+    expect(v.rejectReason).toMatch(/liquidity/);
   });
 });
 
@@ -207,37 +389,37 @@ describe("verifyViaGeckoTerminal", () => {
     expect(v.rejectReason).toMatch(/off/);
   });
 
-  it("stays unverified when no GeckoTerminal price is available", async () => {
+  it("stays unverified-but-ROUTABLE when no GeckoTerminal price is available (0x unavailable on Solana)", async () => {
     const deps: GeckoTerminalVerifyDeps = {
       getTokenStats: async () => ({ liquidityUsd: 5_000_000, priceUsd: null }),
     };
     const v = await verifyViaGeckoTerminal(solArgs, deps);
     expect(v.verified).toBe(false);
+    expect(v.aggregatorRoutable).toBe(true);
     expect(v.sourcesAgreed).toEqual(["jupiter"]);
-    expect(v.rejectReason).toMatch(/no independent/);
   });
 
-  it("stays unverified (no throw) when the GeckoTerminal fetch fails entirely", async () => {
+  it("stays unverified-but-ROUTABLE (no throw) when the GeckoTerminal fetch fails entirely", async () => {
     const deps: GeckoTerminalVerifyDeps = {
       getTokenStats: async () => null,
     };
     const v = await verifyViaGeckoTerminal(solArgs, deps);
     expect(v.verified).toBe(false);
+    expect(v.aggregatorRoutable).toBe(true);
     expect(v.liquidityUsd).toBeNull();
-    expect(v.rejectReason).toMatch(/liquidity/); // no reserve on either leg → no liquidity evidence
   });
 
-  it("does NOT badge verified on a spot price alone when no pool reserve is known on either leg", async () => {
+  it("does NOT badge verified on a spot price alone when no pool reserve is known (routable instead)", async () => {
     // The egregious gate-bypass: GeckoTerminal returns a price but null reserve (common on its /tokens
     // endpoint), and the sell leg's reserve is unknown too. Price agreement must NOT alone mint a verified
-    // badge — fill-feasibility needs an observed reserve.
+    // badge — but with no reserve evidence it is now surfaced as aggregator-routable, not hard-rejected.
     const deps: GeckoTerminalVerifyDeps = {
       getTokenStats: async () => ({ liquidityUsd: null, priceUsd: 1.0 }), // price but no reserve on either leg
     };
     const v = await verifyViaGeckoTerminal(solArgs, deps);
     expect(v.verified).toBe(false);
+    expect(v.aggregatorRoutable).toBe(true);
     expect(v.liquidityUsd).toBeNull();
-    expect(v.rejectReason).toMatch(/liquidity/);
   });
 
   it("rejects when the SELL leg's effective price disagrees with market (deAsset depeg on the sell side)", async () => {

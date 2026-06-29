@@ -1,4 +1,42 @@
 import type { DexQuote, Verification } from "../types";
+import { zeroExSupported } from "./zerox";
+
+/** A 0x routability fallback type — used when the primary independent source (Kyber/GeckoTerminal) can't
+ *  corroborate a leg (no pool indexed / no route), the MGLD false-negative class. */
+type FetchAggregator = (chainId: number, tokenIn: string, tokenOut: string, amountIn: string) => Promise<DexQuote | null>;
+type LegConfirm = "confirmed" | "disagrees" | "no-route" | "unsupported";
+
+/**
+ * Ask 0x to route a leg and compare its raw token output against the expected (deBridge) output. 0x aggregates
+ * far more pools than GeckoTerminal indexes or KyberSwap routes, so it confirms thin deAsset reps the others
+ * miss. Returns:
+ *  - "confirmed"   — 0x routes it and its output is within `tolBps` (a better 0x route is fine — only a
+ *                    SHORTFALL beyond tolerance counts against the quote).
+ *  - "disagrees"   — 0x routes it but its output is materially below the quote (the quote is optimistic/phantom).
+ *  - "no-route"    — 0x is available for this chain but found no route.
+ *  - "unsupported" — no 0x key, chain not 0x-supported, or no expected output to compare against.
+ */
+async function confirmLegVia0x(
+  fetch0x: FetchAggregator | undefined,
+  chainId: number,
+  tokenIn: string,
+  tokenOut: string,
+  amountIn: string,
+  expectedAmountOut: number,
+  tolBps: number
+): Promise<LegConfirm> {
+  if (!fetch0x || !(expectedAmountOut > 0) || !zeroExSupported(chainId)) return "unsupported";
+  let q: DexQuote | null = null;
+  try {
+    q = await fetch0x(chainId, tokenIn, tokenOut, amountIn);
+  } catch {
+    q = null;
+  }
+  const out = q ? Number(q.amountOut) : 0;
+  if (!(out > 0)) return "no-route";
+  const shortfallBps = ((expectedAmountOut - out) / expectedAmountOut) * 10_000;
+  return shortfallBps > tolBps ? "disagrees" : "confirmed";
+}
 
 export interface VerifyArgs {
   buyChainId: number;
@@ -86,6 +124,45 @@ function thinLegRejection(
   };
 }
 
+/**
+ * The liquidity gate's thinnest leg is below tier — the primary phantom guard. But pool indexers
+ * (GeckoTerminal reserves / KyberSwap liquidity) undercount the depth 1inch/0x actually route: a token can
+ * fill the full tier through a pool/hop the indexer doesn't see (the SWYCH `$3 pool` class, where deBridge's
+ * 1inch-aggregated quote routes $10 that GeckoTerminal scores as a $3 reserve). Before rejecting, if the thin
+ * leg is the BUY leg AND the SELL leg already cleared the tier gate, ask 0x to route the FULL TIER through the
+ * buy swap (USDC→token). ONLY an affirmative full-tier route within tolerance overrides the observed thinness
+ * → verified[source, 0x]. 0x unavailable / no route / shortfall (incl. no key) → return null so the caller
+ * keeps the hard thin reject: observed thinness is positive evidence, so unlike the no-pool-indexed case we do
+ * NOT give the benefit of the doubt — that would resurrect the very phantoms this gate exists to kill.
+ *
+ * A thin SELL leg is not rehab-able here: VerifyArgs carries only the buy-chain USDC, so we can't 0x-route the
+ * sell swap, and a one-leg fill isn't a round-trip. Both-legs-thin likewise keeps the reject (sell uncleared).
+ */
+async function rehabThinBuyLegVia0x(
+  args: VerifyArgs,
+  fetch0x: FetchAggregator | undefined,
+  zeroExTolBps: number,
+  thin: { chainId: number; liquidityUsd: number },
+  sellLiquidityUsd: number | null,
+  tierUsd: number,
+  minMult: number,
+  source: string
+): Promise<Verification | null> {
+  const sellCleared = sellLiquidityUsd != null && sellLiquidityUsd >= tierUsd * minMult;
+  if (thin.chainId !== args.buyChainId || !sellCleared) return null;
+  const expectedBuyOut = args.buyAmountOut != null ? Number(args.buyAmountOut) : 0;
+  const conf = await confirmLegVia0x(
+    fetch0x, args.buyChainId, args.usdcAddress, args.buyTokenAddress, args.amountInUsdcUnits,
+    expectedBuyOut, zeroExTolBps
+  );
+  if (conf === "confirmed") {
+    // 0x found a full-tier route within tolerance → the indexer undercounted the real depth. Report the
+    // OBSERVED-thin reserve (honest about what the pool indexer saw) while badging it verified via 0x.
+    return { verified: true, sourcesAgreed: [source, "0x"], quoteDisagreementBps: null, liquidityUsd: thin.liquidityUsd };
+  }
+  return null;
+}
+
 export interface VerifyDeps {
   fetchKyber: (
     chainId: number,
@@ -94,8 +171,14 @@ export interface VerifyDeps {
     amountIn: string
   ) => Promise<DexQuote | null>;
   getLiquidityUsd: (chainId: number, tokenAddr: string) => Promise<number | null>;
+  /** 0x aggregator quote — fallback when Kyber can't corroborate a leg (no route on a pool 1inch/0x covers
+   *  but Kyber doesn't). Absent → that leg degrades to `aggregatorRoutable` instead of a hard reject. */
+  fetchZeroEx?: FetchAggregator;
   /** Max allowed disagreement between deBridge and Kyber, in bps (default 200). */
   toleranceBps?: number;
+  /** Max 0x-vs-quote output shortfall, in bps, before it counts as a phantom (default 500 — looser than the
+   *  Kyber USD check because it's an aggregator-route vs aggregator-route token comparison). */
+  zeroExToleranceBps?: number;
   /** Pool reserve must be ≥ tier × this multiple (default 1). */
   minLiquidityMultiple?: number;
 }
@@ -125,7 +208,13 @@ export async function verifyCandidate(args: VerifyArgs, deps: VerifyDeps): Promi
     args.tierUsd,
     minMult
   );
-  if (gate.thinLeg) return thinLegRejection(gate.thinLeg, args.tierUsd, "debridge");
+  if (gate.thinLeg) {
+    // Thin BUY leg whose sell side cleared the gate: 0x-route the full tier before rejecting (SWYCH class).
+    const rehab = await rehabThinBuyLegVia0x(
+      args, deps.fetchZeroEx, deps.zeroExToleranceBps ?? 500, gate.thinLeg, sellLiq, args.tierUsd, minMult, "debridge"
+    );
+    return rehab ?? thinLegRejection(gate.thinLeg, args.tierUsd, "debridge");
+  }
   const liquidityUsd = gate.liquidityUsd;
 
   let kyber: DexQuote | null = null;
@@ -134,34 +223,39 @@ export async function verifyCandidate(args: VerifyArgs, deps: VerifyDeps): Promi
   } catch {
     kyber = null;
   }
-  if (!kyber || kyber.amountOutUsd <= 0) {
-    return {
-      verified: false,
-      sourcesAgreed: ["debridge"],
-      quoteDisagreementBps: null,
-      liquidityUsd,
-      rejectReason: "no independent cross-check available",
-    };
-  }
 
   const db = args.debridgeBuyAmountOutUsd;
-  const disagreementBps = db > 0 ? (Math.abs(kyber.amountOutUsd - db) / db) * 10_000 : Infinity;
-  if (disagreementBps > tolerance) {
-    return {
-      verified: false,
-      sourcesAgreed: ["debridge"],
-      quoteDisagreementBps: disagreementBps,
-      liquidityUsd,
-      rejectReason: `sources disagree ${Math.round(disagreementBps)}bps`,
-    };
+  // Independent USD cross-check via Kyber — only meaningful when BOTH deBridge and Kyber priced the output.
+  let kyberDisagreementBps: number | null = null;
+  if (kyber && kyber.amountOutUsd > 0 && db > 0) {
+    kyberDisagreementBps = (Math.abs(kyber.amountOutUsd - db) / db) * 10_000;
+    if (kyberDisagreementBps <= tolerance) {
+      return { verified: true, sourcesAgreed: ["debridge", "kyberswap"], quoteDisagreementBps: kyberDisagreementBps, liquidityUsd };
+    }
+    // Kyber disagrees — but it routes fewer pools than 1inch/0x; fall through to a 0x token-level check to tell
+    // a real phantom (0x also can't match the quote) from a Kyber coverage gap, rather than reject outright.
   }
 
-  return {
-    verified: true,
-    sourcesAgreed: ["debridge", "kyberswap"],
-    quoteDisagreementBps: disagreementBps,
-    liquidityUsd,
-  };
+  // 0x fallback (token-level). Covers: Kyber returned no route, deBridge couldn't USD-price the output
+  // (db <= 0 → the old "sources disagree Infinitybps", the MGLD case), or Kyber disagreed. Compares 0x's
+  // routed output against deBridge's buy-leg output in the same (buy-token) base units.
+  const expectedBuyOut = args.buyAmountOut != null ? Number(args.buyAmountOut) : 0;
+  const conf = await confirmLegVia0x(
+    deps.fetchZeroEx, args.buyChainId, args.usdcAddress, args.buyTokenAddress, args.amountInUsdcUnits,
+    expectedBuyOut, deps.zeroExToleranceBps ?? 500
+  );
+  if (conf === "confirmed") {
+    return { verified: true, sourcesAgreed: ["debridge", "0x"], quoteDisagreementBps: kyberDisagreementBps, liquidityUsd };
+  }
+  if (conf === "disagrees") {
+    return { verified: false, sourcesAgreed: ["debridge", "0x"], quoteDisagreementBps: null, liquidityUsd, rejectReason: "0x output below quote" };
+  }
+  // 0x couldn't confirm. If Kyber ACTIVELY disagreed (routed but well off the quote), keep that as a phantom
+  // reject. If Kyber merely had no route (no opinion), deBridge (=1inch) still routes it → surface as routable.
+  if (kyberDisagreementBps != null) {
+    return { verified: false, sourcesAgreed: ["debridge"], quoteDisagreementBps: kyberDisagreementBps, liquidityUsd, rejectReason: `sources disagree ${Math.round(kyberDisagreementBps)}bps` };
+  }
+  return { verified: false, aggregatorRoutable: true, sourcesAgreed: ["debridge"], quoteDisagreementBps: null, liquidityUsd };
 }
 
 export interface GeckoTerminalVerifyDeps {
@@ -169,6 +263,11 @@ export interface GeckoTerminalVerifyDeps {
    *  (cross-check). Called for BOTH legs so each candidate makes exactly TWO GT requests total — one per
    *  leg — rather than the previous three (buy stats + sell liquidity + sell stats). */
   getTokenStats: (chainId: number, tokenAddr: string) => Promise<{ liquidityUsd: number | null; priceUsd: number | null } | null>;
+  /** 0x aggregator quote — fallback when GeckoTerminal has no pool/spot for a leg (a token 1inch/0x route
+   *  but GT doesn't index). Absent or chain-unsupported → that leg degrades to `aggregatorRoutable`. */
+  fetchZeroEx?: FetchAggregator;
+  /** Max 0x-vs-quote output shortfall, in bps, before counting as a phantom (default 500). */
+  zeroExToleranceBps?: number;
   /**
    * Max |effective price − GeckoTerminal spot| / spot, in bps. Looser than the Kyber path (200) on purpose:
    * this cross-check is a routed quote (Jupiter / deBridge aggregator) vs a SPOT price (GeckoTerminal), so
@@ -212,8 +311,31 @@ export async function verifyViaGeckoTerminal(args: VerifyArgs, deps: GeckoTermin
     args.tierUsd,
     minMult
   );
-  if (gate.thinLeg) return thinLegRejection(gate.thinLeg, args.tierUsd, source);
+  if (gate.thinLeg) {
+    // Thin BUY leg whose sell side cleared the gate: 0x-route the full tier before rejecting (SWYCH class).
+    const rehab = await rehabThinBuyLegVia0x(
+      args, deps.fetchZeroEx, deps.zeroExToleranceBps ?? 500, gate.thinLeg, sellStats?.liquidityUsd ?? null,
+      args.tierUsd, minMult, source
+    );
+    return rehab ?? thinLegRejection(gate.thinLeg, args.tierUsd, source);
+  }
   const liquidityUsd = gate.liquidityUsd;
+
+  // When GeckoTerminal can't corroborate (no pool indexed on either leg, or no spot price), fall back to a 0x
+  // token-level routability check on the buy leg before giving up: a token 1inch/0x route but GT doesn't index
+  // is real-but-uncorroborated (the MGLD class), not a phantom. 0x-confirmed → verified; 0x finds it materially
+  // worse → reject; 0x unavailable (non-EVM / no key) → surface as routable (hand-check), never a hard reject.
+  const aggFallback = async (qdb: number | null): Promise<Verification> => {
+    const expectedBuyOut =
+      args.buyAmountOut != null && args.buyTokenDecimals != null ? Number(args.buyAmountOut) : 0;
+    const conf = await confirmLegVia0x(
+      deps.fetchZeroEx, args.buyChainId, args.usdcAddress, args.buyTokenAddress, args.amountInUsdcUnits,
+      expectedBuyOut, deps.zeroExToleranceBps ?? 500
+    );
+    if (conf === "confirmed") return { verified: true, sourcesAgreed: [source, "0x"], quoteDisagreementBps: qdb, liquidityUsd };
+    if (conf === "disagrees") return { verified: false, sourcesAgreed: [source, "0x"], quoteDisagreementBps: qdb, liquidityUsd, rejectReason: "0x output below quote" };
+    return { verified: false, aggregatorRoutable: true, sourcesAgreed: [source], quoteDisagreementBps: qdb, liquidityUsd };
+  };
 
   // A "verified" badge asserts fill-feasibility, so require at least one OBSERVED pool reserve that cleared
   // the tier gate. With no reserve known on either leg (a chain GeckoTerminal can't price — e.g. a missing
@@ -221,13 +343,8 @@ export async function verifyViaGeckoTerminal(args: VerifyArgs, deps: GeckoTermin
   // liquidity evidence; leave it UNVERIFIED rather than badge it on a spot price alone. This closes the
   // gate-bypass where both legs' liquidity were null yet the price agreed.
   if (liquidityUsd == null) {
-    return {
-      verified: false,
-      sourcesAgreed: [source],
-      quoteDisagreementBps: null,
-      liquidityUsd: null,
-      rejectReason: "no liquidity evidence on either leg",
-    };
+    // GeckoTerminal indexes no pool on either leg — try 0x before rejecting (the MGLD/deMGLD class).
+    return aggFallback(null);
   }
 
   const gtPrice = stats?.priceUsd ?? null;
@@ -237,13 +354,8 @@ export async function verifyViaGeckoTerminal(args: VerifyArgs, deps: GeckoTermin
       : 0;
   const paidUsd = args.tierUsd;
   if (gtPrice == null || gtPrice <= 0 || tokensOut <= 0 || paidUsd <= 0) {
-    return {
-      verified: false,
-      sourcesAgreed: [source],
-      quoteDisagreementBps: null,
-      liquidityUsd,
-      rejectReason: "no independent cross-check available",
-    };
+    // GeckoTerminal has a reserve but no usable spot price — try 0x routability before rejecting.
+    return aggFallback(null);
   }
   const effectivePrice = paidUsd / tokensOut;
   const disagreementBps = (Math.abs(effectivePrice - gtPrice) / gtPrice) * 10_000;
