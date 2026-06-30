@@ -9,6 +9,16 @@
 # Minutes: only PRIVATE repos consume Actions minutes (~50-60s/run incl. cached install). At every 30 min
 # that is ~1,440 min/mo — under the free 2,000 (private) and the 3,000 a GitHub Pro/Edu account gets.
 # A PUBLIC repo gets UNLIMITED Actions minutes — then you can drop to */10 if you want fresher scans.
+#
+# RELIABILITY: GitHub's `schedule` is unreliable on PRIVATE repos and for this repo has NEVER fired (only
+# `workflow_dispatch` runs appear in `gh run list`). The schedule below is kept as a free best-effort backup,
+# but the actual driver is an EXTERNAL cron (cron-job.org, free) that POSTs to the workflow_dispatch API
+# every 30 min:
+#   POST https://api.github.com/repos/jetopen/arb/actions/workflows/scan.yml/dispatches
+#   headers: Authorization: Bearer <fine-grained PAT — Actions:read+write on jetopen/arb ONLY>,
+#            Accept: application/vnd.github+json, X-GitHub-Api-Version: 2022-11-28, Content-Type: application/json
+#   body: {"ref":"solana-support"}     -> 204 No Content
+# The `concurrency` guard below means the backup schedule (if it ever wakes up) can't double-run with the pinger.
 
 name: arb-scan
 

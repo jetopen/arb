@@ -6,7 +6,7 @@ import { TableSkeleton } from "../ui/skeleton";
 import { EmptyState } from "../ui/empty-state";
 import { ErrorState } from "../ui/error-state";
 
-const COLUMNS = ["", "#", "Token", "Route (buy → sell)", "Spread %", "Size", "dePort fee", "Verified", "Sim"];
+const COLUMNS = ["", "#", "Token", "Route (buy → sell)", "Spread %", "Size", "dePort fee", "Verified", "Sim", "Age"];
 
 interface Props {
   opportunities: Opportunity[];

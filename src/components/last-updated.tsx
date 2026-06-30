@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { timeAgo } from "@/lib/time";
 
 interface LastUpdatedProps {
   lastFetched?: number;
@@ -14,17 +15,9 @@ export function LastUpdated({ lastFetched }: LastUpdatedProps) {
       setAgo("—");
       return;
     }
-
-    function update() {
-      const seconds = Math.floor((Date.now() - lastFetched!) / 1000);
-      if (seconds < 5) setAgo("just now");
-      else if (seconds < 60) setAgo(`${seconds}s ago`);
-      else if (seconds < 3600) setAgo(`${Math.floor(seconds / 60)}m ago`);
-      else setAgo(`${Math.floor(seconds / 3600)}h ago`);
-    }
-
+    const update = () => setAgo(timeAgo(lastFetched));
     update();
-    const timer = setInterval(update, 1000);
+    const timer = setInterval(update, 1000); // tick the relative label every second
     return () => clearInterval(timer);
   }, [lastFetched]);
 

@@ -1,20 +1,13 @@
 "use client";
 
 import type { GraphSummary, ScanRunInfo } from "@/lib/hooks";
+import { timeAgo } from "@/lib/time";
 import { Skeleton } from "../ui/skeleton";
 
 interface Props {
   graph?: GraphSummary;
   scan?: { remaining: number; rpmAvailable: number };
   lastScan?: ScanRunInfo | null;
-}
-
-function ago(ts?: number): string {
-  if (!ts) return "—";
-  const s = Math.round((Date.now() - ts) / 1000);
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.round(s / 60)}m ago`;
-  return `${Math.round(s / 3600)}h ago`;
 }
 
 function Stat({ label, value, accent, loading }: { label: string; value: string; accent?: boolean; loading?: boolean }) {
@@ -43,7 +36,7 @@ export function ScanStatus({ graph, scan, lastScan }: Props) {
           loading={!scan && !graph}
         />
         <Stat label="RPM free" value={scan ? String(scan.rpmAvailable) : "—"} />
-        <Stat label="Last scan" value={ago(lastScan?.finishedAt)} />
+        <Stat label="Last scan" value={timeAgo(lastScan?.finishedAt)} />
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
         <span

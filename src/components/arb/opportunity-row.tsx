@@ -3,7 +3,11 @@
 import { useState } from "react";
 import type { Opportunity, SimulationResult } from "@/lib/types";
 import { chainName } from "@/lib/deport/registry";
+import { timeAgo } from "@/lib/time";
 import { LegAddress } from "./leg-address";
+
+/** A quote older than ~one scan cycle is getting stale — flag it amber so a decayed edge can't read as live. */
+const STALE_AFTER_MS = 35 * 60 * 1000;
 
 function pct(n: number): string {
   return `${n >= 0 ? "+" : ""}${n.toFixed(3)}%`;
@@ -72,6 +76,8 @@ export function OpportunityRow({
   const spread = opp.edge.grossSpreadPct;
   const positive = spread > 0;
   const verified = !!opp.verification?.verified;
+  const ageMs = opp.computedAt ? Date.now() - opp.computedAt : null;
+  const stale = ageMs != null && ageMs > STALE_AFTER_MS;
 
   return (
     <>
@@ -128,6 +134,14 @@ export function OpportunityRow({
         </td>
         <td className="px-4 py-3 text-sm">
           <SimBadge sim={opp.simulation} />
+        </td>
+        <td className="px-4 py-3 text-xs tabular-nums">
+          <span
+            className={stale ? "text-amber-600" : "text-muted"}
+            title={stale ? "Older than a scan cycle — this quote may be stale" : "When this row's quote was computed"}
+          >
+            {timeAgo(opp.computedAt)}
+          </span>
         </td>
       </tr>
       {expanded && (

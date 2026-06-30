@@ -319,10 +319,11 @@ describe("MemoryStore alert dedup (filterNewAlerts)", () => {
 });
 
 describe("read-freshness default decoupled from dead-route penalty (Fix 1)", () => {
-  it("DEFAULT_OPP_MAX_AGE_MS is 24h and wider than the 6h dead-route penalty", () => {
-    expect(DEFAULT_OPP_MAX_AGE_MS).toBe(24 * 60 * 60 * 1000);
-    expect(DEFAULT_OPP_MAX_AGE_MS).toBeGreaterThan(DEAD_ROUTE_PENALTY_MS);
-    expect(parsePenaltyMs(undefined, DEFAULT_OPP_MAX_AGE_MS)).toBe(24 * 60 * 60 * 1000); // unset env → 24h
+  it("DEFAULT_OPP_MAX_AGE_MS is 3h (tighter than the 6h dead-route penalty — the two are independent)", () => {
+    expect(DEFAULT_OPP_MAX_AGE_MS).toBe(3 * 60 * 60 * 1000);
+    // The read window (what the UI shows) and the re-scan penalty are decoupled, so a tighter read gate is fine.
+    expect(DEFAULT_OPP_MAX_AGE_MS).toBeLessThan(DEAD_ROUTE_PENALTY_MS);
+    expect(parsePenaltyMs(undefined, DEFAULT_OPP_MAX_AGE_MS)).toBe(3 * 60 * 60 * 1000); // unset env → 3h
   });
 });
 

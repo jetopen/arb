@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import type { Opportunity } from "@/lib/types";
 import { chainName } from "@/lib/deport/registry";
+import { timeAgo } from "@/lib/time";
 import { LegAddress } from "./leg-address";
 
 function money(n: number): string {
@@ -39,9 +40,14 @@ export function OpportunityDetail({ opp, onClose }: { opp: Opportunity; onClose:
         className={`fixed top-0 right-0 h-full w-full max-w-lg bg-white shadow-xl z-50 transition-transform duration-200 ${visible ? "translate-x-0" : "translate-x-full"}`}
       >
         <div className="flex items-center justify-between px-6 py-4 border-b border-border">
-          <h2 className="text-lg font-semibold text-foreground">
-            {opp.symbol ?? "Opportunity"} · {chainName(opp.buyChainId)} → {chainName(opp.sellChainId)}
-          </h2>
+          <div>
+            <h2 className="text-lg font-semibold text-foreground">
+              {opp.symbol ?? "Opportunity"} · {chainName(opp.buyChainId)} → {chainName(opp.sellChainId)}
+            </h2>
+            <p className="text-xs text-muted mt-0.5">
+              Quote computed {timeAgo(opp.computedAt)} — a time-sensitive snapshot, re-check before sizing.
+            </p>
+          </div>
           <button onClick={close} className="text-muted hover:text-foreground text-lg">✕</button>
         </div>
 
@@ -155,7 +161,7 @@ function OptimizeSection({ opp }: { opp: Opportunity }) {
 
   return (
     <Section title="Best trade size (small-capital)">
-      {loading && <p className="text-sm text-muted">Sweeping $25–$5k across live quotes…</p>}
+      {loading && <p className="text-sm text-muted">Sweeping $10–$5k across live quotes…</p>}
       {!loading && !data && <p className="text-sm text-muted">Couldn&apos;t size this route (one leg has no route).</p>}
       {!loading && data && (
         <>
