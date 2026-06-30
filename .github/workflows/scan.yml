@@ -52,6 +52,8 @@ jobs:
           # Optional — alerts + tuning (set as secrets/vars if you use them):
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DEBRIDGE_API_KEY: ${{ secrets.DEBRIDGE_API_KEY }}
+          # 0x aggregator key — upgrades the verifier's 1inch-routable class to verified(0x) / rehabs thin legs:
+          ZEROX_API_KEY: ${{ secrets.ZEROX_API_KEY }}
           # Knobs (plain values are fine — not secret):
           ARB_SCAN_N: "48"
           ARB_SCAN_RPM: "120"
