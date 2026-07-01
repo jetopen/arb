@@ -1,22 +1,24 @@
-# Runs the decoupled arbitrage scan on a schedule — replaces the Heroku worker dyno at $0.
-# `npm run scan:once` (scripts/scan-once.mts) builds/loads the lock-graph from the Supabase snapshot,
-# scans one batch, writes results, and exits. No timeout pressure here (Actions allows minutes), so the
-# ~15-25s graph rebuild at the 6h snapshot boundary runs fine — the constraint that blocked Vercel/Heroku.
+# Runs the arbitrage scan as a CONTINUOUS in-process loop — replaces the Heroku worker dyno at $0.
+# `npm run scan:loop` (scripts/scan-loop.mts) loads the lock-graph from the Supabase snapshot, then calls
+# runScan() back-to-back for ~5.5h (under GitHub's 6h job cap) and exits 0. One long-lived process keeps the
+# module-level 120-RPM budget + warm graph cache (scan-service.ts singletons), so it sustains ~60 units/min —
+# cycling the ~9.5k queue in ~2.6h (under the 3h freshness gate) instead of the old one-batch-per-dispatch
+# (scan:once) that cycled it in ~33h. The ~15-25s graph rebuild at the 6h boundary happens once, in-process.
 #
 # NOTE: scheduled workflows only run on the repo's DEFAULT branch. Make `solana-support` the default branch
 # (or merge it to the default) or this `schedule` will never fire. `workflow_dispatch` lets you test it now.
 #
-# Minutes: this repo is PUBLIC → UNLIMITED free Actions minutes, so cadence is now cost-free (tightened to
-# */10). Each run is ~50-60s incl. cached install. (If it's ever made PRIVATE again, */10 would blow the free
-# 2,000-min/mo tier — back off to ~30 min or add paid minutes.)
+# Minutes: this repo is PUBLIC → UNLIMITED free Actions minutes. That's what makes the continuous loop viable:
+# one ~5.5h job burns ~330 runner-min, so ~4-5 jobs/day ≈ ~44k min/mo — fine when unlimited, but it would
+# DWARF the 2,000-min/mo free tier if the repo ever went private again (revert to scan:once + */30 in that case).
 #
-# RELIABILITY: GitHub's `schedule` fires irregularly (drops most ticks), so it's only the best-effort
-# always-on backup. The PRIMARY driver is a Windows Scheduled Task on the user's PC ("arb-scan-dispatch",
-# every 10 min) running `gh workflow run scan.yml --ref solana-support` via the machine's gh login — no PAT.
-# Caveat: the PC must be on. For guaranteed 24/7 (PC off), the upgrade is an EXTERNAL cron (cron-job.org, free)
-# POSTing the workflow_dispatch API with a fine-grained PAT (Actions:read+write on jetopen/arb ONLY):
-#   POST https://api.github.com/repos/jetopen/arb/actions/workflows/scan.yml/dispatches   body: {"ref":"solana-support"} -> 204
-# The `concurrency` guard below means overlapping triggers (task + schedule) queue instead of double-running.
+# SELF-RESTART: each loop job self-exits(0) at ~5.5h. The `concurrency` guard below means any trigger that
+# fires during the run (the */10 schedule, or the Windows task "arb-scan-dispatch" on the user's PC) is held as
+# a single `pending` run and starts the INSTANT the loop ends — a seamless, PAT-free restart. So one tick per
+# 5.5h is enough to stay continuous; GitHub dropping most */10 ticks is fine. The Windows task
+# (`gh workflow run scan.yml --ref solana-support`, machine gh login, no PAT) covers restarts while the PC is on;
+# the schedule covers PC-off. Only a total trigger loss (schedule drops ALL ticks in 5.5h AND the PC is off)
+# leaves a short gap — an external cron-job.org + fine-grained PAT pinger is the only zero-gap upgrade (optional).
 
 name: arb-scan
 
@@ -33,7 +35,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 350 # backstop ABOVE the script's ~330-min self-exit; GitHub's 6h (360m) is the outer cap
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -41,8 +43,8 @@ jobs:
           node-version: "22"
           cache: "npm"
       - run: npm ci --omit=dev # scan path only needs runtime deps (tsx is a dep); skips playwright/vitest
-      - name: Scan one batch
-        run: npm run scan:once
+      - name: Continuous scan loop (~5.5h, self-restarts via concurrency)
+        run: npm run scan:loop
         env:
           # Required — selects the Supabase store (set these as repo Actions secrets):
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -54,5 +56,8 @@ jobs:
           ZEROX_API_KEY: ${{ secrets.ZEROX_API_KEY }}
           # Knobs (plain values are fine — not secret):
           ARB_SCAN_N: "48"
-          ARB_SCAN_RPM: "120"
+          ARB_SCAN_RPM: "120" # sustained cap for the WHOLE loop (one shared budget) — lower to ~60 if a provider 429s
           ARB_JUPITER_RPS: "2"
+          # Loop knobs (scan:loop): pause between ticks + self-exit deadline (kept < GitHub's 6h job cap).
+          ARB_LOOP_INTERVAL_MS: "3000"
+          ARB_LOOP_MAX_MS: "19800000" # 5.5h

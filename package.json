@@ -10,6 +10,7 @@
     "build": "next build",
     "start": "next start",
     "scan:once": "tsx scripts/scan-once.mts",
+    "scan:loop": "tsx scripts/scan-loop.mts",
     "lint": "eslint",
     "test": "vitest"
   },
