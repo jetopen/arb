@@ -12,6 +12,7 @@
     "scan:once": "tsx scripts/scan-once.mts",
     "scan:loop": "tsx scripts/scan-loop.mts",
     "lint": "eslint",
+    "typecheck": "tsc --noEmit",
     "test": "vitest"
   },
   "dependencies": {
