@@ -61,6 +61,20 @@ export function parseHotRatio(raw: string | undefined): number {
 }
 export const HOT_RATIO = parseHotRatio(process.env.ARB_SCAN_HOT_RATIO);
 
+/** Min time before a HOT unit (a token's proven best row) is eligible for the hot lane again. seedQueue now
+ * warms only ~1 row per token, so without a floor the tiny hot set would re-scan every couple minutes and
+ * waste the budget that shrink frees; with it, unfilled hot slots spill to the cold-discovery sweep. 4b. */
+export const HOT_MIN_INTERVAL_MS = parsePenaltyMs(process.env.ARB_HOT_MIN_INTERVAL_MS, 10 * 60 * 1000);
+
+/** A "proven" route (one that has produced an opportunity) stops counting as proven once its newest
+ * opportunity is older than this — so a route that quoted once long ago and has failed every scan since is
+ * demoted like any dead route instead of holding a hot slot forever. Override via ARB_PROVEN_MAX_AGE_MS. 4c. */
+export const PROVEN_MAX_AGE_MS = parsePenaltyMs(process.env.ARB_PROVEN_MAX_AGE_MS, 24 * 60 * 60 * 1000);
+
+/** Ceiling for the exponential dead-route backoff (6h·2^fail_count). Keeps a persistently-dead rep from being
+ * pushed absurdly far out while still cutting re-scan spend on the long tail. 4d. */
+export const MAX_DEAD_PENALTY_MS = 72 * 60 * 60 * 1000;
+
 export interface Store {
   upsertOpportunities(opps: Opportunity[]): Promise<void>;
   topOpportunities(filter: OpportunityFilter): Promise<{ opportunities: Opportunity[]; total: number }>;
@@ -99,7 +113,7 @@ const unitKey = workUnitId;
 /** In-memory store (Phase 1). Swapped for a Supabase-backed store in Phase 2 via getStore(). */
 export class MemoryStore implements Store {
   private opps = new Map<string, Opportunity>();
-  private queue: { unit: ScanUnit; priority: number; lastScannedAt: number | null }[] = [];
+  private queue: { unit: ScanUnit; priority: number; lastScannedAt: number | null; failCount: number }[] = [];
   private queued = new Set<string>();
   private lastRun: ScanRunRecord | null = null;
   private graph: LockGraph | null = null;
@@ -161,7 +175,7 @@ export class MemoryStore implements Store {
         continue;
       }
       this.queued.add(k);
-      this.queue.push({ unit: u, priority, lastScannedAt: null });
+      this.queue.push({ unit: u, priority, lastScannedAt: null, failCount: 0 });
     }
   }
 
@@ -205,7 +219,12 @@ export class MemoryStore implements Store {
     // Hot lane first (proven, priority>=1), then cold fills the rest from the REMAINING eligible. One
     // snapshot + a `taken` set ⇒ a row can never be taken by both lanes in a single dequeue.
     const hotN = Math.ceil(want * HOT_RATIO);
-    const hot = eligible.filter((i) => i.priority >= 1).sort(cmp).slice(0, hotN);
+    // Hot lane = proven best rows (priority>=1) that are at least HOT_MIN_INTERVAL_MS stale, so the tiny hot
+    // set doesn't busy-spin; unfilled hot slots fall through to the cold fill below (4b).
+    const hot = eligible
+      .filter((i) => i.priority >= 1 && (i.lastScannedAt === null || i.lastScannedAt <= now - HOT_MIN_INTERVAL_MS))
+      .sort(cmp)
+      .slice(0, hotN);
     const taken = new Set(hot);
     const cold = eligible.filter((i) => !taken.has(i)).sort(cmp).slice(0, want - hot.length);
     const batch = [...hot, ...cold];
@@ -219,12 +238,22 @@ export class MemoryStore implements Store {
       const k = unitKey(unit);
       const item = this.queue.find((i) => unitKey(i.unit) === k);
       if (!item) continue;
-      // A proven route (one that has ever produced a quote) is never demoted on a single failure — that's
-      // a blip, not a dead pool. Among UNproven failures, a TRANSIENT upstream error (5xx/429/network) gets
-      // only a short backoff so a flaky chain's live routes recover fast, while a permanent no-route
-      // (amountOut 0 / 4xx) gets the full dead-route penalty so dequeue stops re-scanning dead reps.
-      const keep = live || this.opps.has(k);
-      item.lastScannedAt = keep ? now : now + (transient ? TRANSIENT_RETRY_MS : DEAD_ROUTE_PENALTY_MS);
+      // Proven = has produced an opportunity WITHIN PROVEN_MAX_AGE_MS. A single failure on such a route is a
+      // blip, not a dead pool, so it keeps cycling. But a route that quoted once long ago and has failed
+      // since is NOT kept — it demotes like any dead route (4c). Among the non-kept: a TRANSIENT upstream
+      // error (5xx/429/network) gets a short backoff; a permanent no-route gets the exponential dead-route
+      // backoff (6h·2^fail_count, capped), so the persistent-dead long tail is re-checked ever more rarely (4d).
+      const opp = this.opps.get(k);
+      const keep = live || (opp != null && (opp.computedAt ?? 0) > now - PROVEN_MAX_AGE_MS);
+      if (keep) {
+        item.lastScannedAt = now;
+        item.failCount = 0; // recovery resets the dead-route backoff
+      } else if (transient) {
+        item.lastScannedAt = now + TRANSIENT_RETRY_MS;
+      } else {
+        item.lastScannedAt = now + Math.min(DEAD_ROUTE_PENALTY_MS * 2 ** item.failCount, MAX_DEAD_PENALTY_MS);
+        item.failCount++;
+      }
     }
   }
 

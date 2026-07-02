@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { enumerateUnits, scanUnit, runBatch, parseNotionalLadder, routeKeyOfId, DEFAULT_LADDER, DEFAULT_TIERS, type ScanDeps } from "../arb/scanner";
+import { enumerateUnits, scanUnit, runBatch, seedQueue, parseNotionalLadder, routeKeyOfId, DEFAULT_LADDER, DEFAULT_TIERS, type ScanDeps } from "../arb/scanner";
 import { MemoryStore } from "../db/store";
 import { RpmBudget } from "../arb/budget";
-import type { DexQuote, Family, LockGraph, SimulationResult } from "../types";
+import type { DexQuote, Family, LockGraph, Opportunity, SimulationResult } from "../types";
 import type { VerifyArgs } from "../quotes/verify";
 import { QuoteHttpError } from "../quotes/quote-error";
 
@@ -290,6 +290,47 @@ describe("scanUnit", () => {
       if (prev === undefined) delete process.env.ARB_SIMULATE;
       else process.env.ARB_SIMULATE = prev;
     }
+  });
+});
+
+describe("seedQueue (best-row hot warm-start, 4b)", () => {
+  const mkOpp = (id: string, gross: number): Opportunity => ({
+    id,
+    debridgeId: "0xfam",
+    kind: "redemption",
+    buyChainId: 42161,
+    sellChainId: 56,
+    nativeChainId: 56,
+    tierUsd: 100,
+    edge: {
+      grossSpreadPct: gross,
+      dexImpactBuyBps: 0,
+      dexImpactSellBps: 0,
+      deportFeeUsd: 0,
+      gasBuyUsd: 0,
+      gasSellUsd: 0,
+      netUsd: 0,
+      netEdgePct: 0,
+      netUsdConservative: 0,
+      profitable: false,
+    },
+    verification: null,
+    lockPath: [],
+    computedAt: Date.now(),
+  });
+
+  it("warms ONLY each token's best-spread row to the hot lane (not every proven rung)", async () => {
+    const store = new MemoryStore();
+    // Two proven rungs of the same token; the tier-100 rep->home row has the higher gross spread.
+    await store.upsertOpportunities([
+      mkOpp("0xfam:42161:56:10:redemption", 0.2),
+      mkOpp("0xfam:42161:56:100:redemption", 1.5), // best row per token
+    ]);
+    await seedQueue(store, graphOf([fam({})]), [10, 100]);
+    // The best row is the sole priority-1 (hot) unit → it's dequeued first over the priority-0 rungs.
+    expect(await store.dequeue(1)).toEqual([
+      { debridgeId: "0xfam", buyChainId: 42161, sellChainId: 56, tierUsd: 100, kind: "redemption" },
+    ]);
   });
 });
 

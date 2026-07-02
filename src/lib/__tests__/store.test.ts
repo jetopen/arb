@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { MemoryStore, parsePenaltyMs, parseHotRatio, DEAD_ROUTE_PENALTY_MS, TRANSIENT_RETRY_MS, DEFAULT_OPP_MAX_AGE_MS, HOT_RATIO } from "../db/store";
+import { MemoryStore, parsePenaltyMs, parseHotRatio, DEAD_ROUTE_PENALTY_MS, TRANSIENT_RETRY_MS, DEFAULT_OPP_MAX_AGE_MS, HOT_RATIO, HOT_MIN_INTERVAL_MS, PROVEN_MAX_AGE_MS } from "../db/store";
 import type { EdgeResult, Opportunity, ScanUnit } from "../types";
 
 function opp(
@@ -199,13 +199,88 @@ describe("MemoryStore adaptive demotion + realized quotability", () => {
   it("does NOT demote a proven route on a single failure (transient-blip protection)", async () => {
     const s = new MemoryStore();
     await s.enqueue([u("proven"), u("deadx")]);
-    await s.upsertOpportunities([opp("proven:1:56:1000:redemption", 0.3)]); // proven route
+    // proven route with a FRESH opportunity (recently produced a quote)
+    await s.upsertOpportunities([opp("proven:1:56:1000:redemption", 0.3, { computedAt: Date.now() })]);
     await s.dequeue(2);
     await s.markScanned([
-      { unit: u("proven"), live: false }, // failed this scan, but proven before → kept
+      { unit: u("proven"), live: false }, // failed this scan, but proven & fresh → kept
       { unit: u("deadx"), live: false }, // never proven → demoted
     ]);
     expect((await s.dequeue(1))[0].debridgeId).toBe("proven"); // proven cycles, deadx is in the future
+  });
+
+  it("demotes a STALE proven route (opportunity older than PROVEN_MAX_AGE_MS) instead of keeping it (4c)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2020-06-01T00:00:00Z"));
+      const s = new MemoryStore();
+      await s.enqueue([u("stale")]);
+      // proven, but the newest opportunity is older than the 24h window → no longer counts as proven
+      await s.upsertOpportunities([
+        opp("stale:1:56:1000:redemption", 0.3, { computedAt: Date.now() - PROVEN_MAX_AGE_MS - 1000 }),
+      ]);
+      await s.dequeue(1);
+      await s.markScanned([{ unit: u("stale"), live: false }]); // stale-proven → demoted, not kept
+      expect(await s.dequeue(1)).toEqual([]); // pushed 6h into the future
+      vi.advanceTimersByTime(DEAD_ROUTE_PENALTY_MS + 1000);
+      expect((await s.dequeue(1))[0].debridgeId).toBe("stale"); // eligible again after the dead penalty
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hot min-interval yields a recently-scanned best row's slot to cold discovery until it ages out (4b)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2020-06-01T00:00:00Z"));
+      const s = new MemoryStore();
+      await s.enqueue([u("hot"), u("cold1")]);
+      await s.requeueFresh(["hot:1:56:1000:redemption"]); // best row → priority 1 (hot)
+      expect((await s.dequeue(1))[0].debridgeId).toBe("hot"); // hot lane serves it; now within its interval
+      // Within the interval the hot slot isn't re-served → the batch goes to cold discovery instead.
+      vi.advanceTimersByTime(HOT_MIN_INTERVAL_MS - 60_000);
+      expect((await s.dequeue(1)).map((x) => x.debridgeId)).toEqual(["cold1"]);
+      // Past the interval the best row is hot-eligible again.
+      vi.advanceTimersByTime(120_000);
+      expect((await s.dequeue(1))[0].debridgeId).toBe("hot");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("dead-route backoff grows exponentially per fail and resets on recovery (4d)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2020-06-01T00:00:00Z"));
+      const s = new MemoryStore();
+      const dead = u("dead");
+      await s.enqueue([dead]);
+
+      // 1st failure → 6h penalty
+      await s.dequeue(1);
+      await s.markScanned([{ unit: dead, live: false }]);
+      vi.advanceTimersByTime(DEAD_ROUTE_PENALTY_MS - 1000);
+      expect(await s.dequeue(1)).toEqual([]);
+      vi.advanceTimersByTime(2000);
+      expect((await s.dequeue(1))[0].debridgeId).toBe("dead"); // eligible after 6h
+
+      // 2nd failure → 12h penalty (6h·2^1)
+      await s.markScanned([{ unit: dead, live: false }]);
+      vi.advanceTimersByTime(DEAD_ROUTE_PENALTY_MS + 1000); // past 6h but still within 12h
+      expect(await s.dequeue(1)).toEqual([]);
+      vi.advanceTimersByTime(DEAD_ROUTE_PENALTY_MS);
+      expect((await s.dequeue(1))[0].debridgeId).toBe("dead"); // eligible after 12h
+
+      // recovery resets fail_count → the next failure is back to 6h, not 24h
+      await s.markScanned([{ unit: dead, live: true }]);
+      await s.markScanned([{ unit: dead, live: false }]);
+      vi.advanceTimersByTime(DEAD_ROUTE_PENALTY_MS - 1000);
+      expect(await s.dequeue(1)).toEqual([]);
+      vi.advanceTimersByTime(2000);
+      expect((await s.dequeue(1))[0].debridgeId).toBe("dead");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("gives a TRANSIENT failure a short backoff, not the 6h dead penalty (flaky-chain live routes recover fast)", async () => {

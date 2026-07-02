@@ -2,6 +2,7 @@ import type { DexQuote, EdgeResult, Family, LockGraph, Opportunity, ScanUnit, Si
 import type { VerifyArgs } from "../quotes/verify";
 import type { SimulateArgs } from "../sim/simulate";
 import type { Store, ScanRunRecord } from "../db/store";
+import { PROVEN_MAX_AGE_MS } from "../db/store";
 import type { RpmBudget } from "./budget";
 import { redemptionEdge } from "./edge";
 import { baseToken, tierToBaseUnits, isQuotableChain, rescaleRaw } from "./base-tokens";
@@ -117,12 +118,8 @@ function opportunityId(u: ScanUnit): string {
   return `${u.debridgeId}:${u.buyChainId}:${u.sellChainId}:${u.tierUsd}:${u.kind}`;
 }
 
-/** Route identity WITHOUT the tier, so warm-start priority spans ALL ladder rungs of a proven route
- *  (proving any one rung warms every rung). The full id is dbId:buy:sell:tier:kind; this drops the tier. */
-function routeKey(u: ScanUnit): string {
-  return `${u.debridgeId}:${u.buyChainId}:${u.sellChainId}:${u.kind}`;
-}
-/** Strip the tier from a full opportunity/unit id to get its route key. debridgeId is 0x-hex (no colon). */
+/** Strip the tier from a full opportunity/unit id to get its route key. debridgeId is 0x-hex (no colon).
+ *  Retained for callers/tests that group ladder rungs by route; seedQueue now warms by best-row id (4b). */
 export function routeKeyOfId(id: string): string {
   const p = id.split(":");
   return p.length === 5 ? `${p[0]}:${p[1]}:${p[2]}:${p[4]}` : id;
@@ -359,17 +356,19 @@ export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord
  */
 export async function seedQueue(store: Store, graph: LockGraph, tiers: number[] = DEFAULT_TIERS): Promise<number> {
   const units = enumerateUnits(graph, tiers);
-  const known = await store.knownUnitIds().catch(() => new Set<string>());
-  // Warm-start by ROUTE (tier-agnostic), not by exact opportunity id. The screener moved from a single
-  // $1k probe to a micro-ladder, which rewrote every id (…:tier:…); an exact-id match would orphan every
-  // proven route (its old `:1000:` id never matches a new rung) and shove the genuinely-live routes into
-  // the cold lane. Keying on the route means proving ANY rung warms ALL rungs of that route. Route-dedup
-  // also shrinks the proven set, so more distinct routes fit under knownUnitIds' cap.
-  const knownRoutes = new Set([...known].map(routeKeyOfId));
-  await store.enqueue(units, (u) => (knownRoutes.has(routeKey(u)) ? 1 : 0));
-  // Bump the PRIORITY (not scan time) of every current rung of a proven route so it wins the dequeue
-  // tie-break among equally-stale peers, without re-flooding the queue front (preserves lastScannedAt).
-  const provenUnitIds = units.filter((u) => knownRoutes.has(routeKey(u))).map(opportunityId);
-  if (provenUnitIds.length > 0) await store.requeueFresh(provenUnitIds).catch(() => {});
+  // Warm the HOT lane with ONLY each token's BEST row (the max-gross-spread row the UI actually shows), not
+  // every proven rung — warming all ~12× rungs was pure overwork (audit 4b). topOpportunities(groupByToken)
+  // already computes "best row per token"; the PROVEN_MAX_AGE_MS bound (4c) drops dead tokens so a route that
+  // quoted once long ago never holds a hot slot. Secondary rungs stay priority 0 and refresh on the cold sweep;
+  // the UI shows only the best row and the drawer optimizer re-quotes any size on demand.
+  const best = await store
+    .topOpportunities({ groupByToken: true, take: 1000, maxAgeMs: PROVEN_MAX_AGE_MS })
+    .then((r) => new Set(r.opportunities.map((o) => o.id)))
+    .catch(() => new Set<string>());
+  await store.enqueue(units, (u) => (best.has(opportunityId(u)) ? 1 : 0));
+  // Bump PRIORITY (not scan time) of each token's best row so it wins the hot lane, without re-flooding the
+  // queue front (preserves lastScannedAt).
+  const bestUnitIds = units.filter((u) => best.has(opportunityId(u))).map(opportunityId);
+  if (bestUnitIds.length > 0) await store.requeueFresh(bestUnitIds).catch(() => {});
   return units.length;
 }
