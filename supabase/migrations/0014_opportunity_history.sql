@@ -18,6 +18,11 @@ create index if not exists arb_opp_hist_unit_idx on public.arb_opportunity_histo
 create index if not exists arb_opp_hist_ts_idx   on public.arb_opportunity_history (ts);
 alter table public.arb_opportunity_history enable row level security;
 
+-- Guard against 0010 drift: this DB's arb_upsert_opportunities predates the `simulation` column (0010 was
+-- applied inconsistently — the column is absent live). Add it idempotently so the rebuilt function below
+-- (which carries `simulation`, mirroring 0010) is valid on every DB. Harmless where the column already exists.
+alter table public.arb_opportunities add column if not exists simulation jsonb;
+
 -- Re-create the upsert (mirrors 0010) and append one history point per item, then prune >7d. Additive +
 -- backward-compatible: old code just doesn't read the new table; the history append is a no-op for callers.
 create or replace function public.arb_upsert_opportunities(items jsonb)
