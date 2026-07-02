@@ -1,0 +1,38 @@
+# Continuous integration gate — runs the checks that scan.yml (the scanner job) deliberately skips.
+# The scanner deploys from whatever is on the branch (`npm ci --omit=dev` → scan:loop, no tests), and the
+# Vercel dashboard deploys on push, so without this nothing runs the 350 vitest tests / typecheck / lint on
+# a public repo with two continuous-deploy surfaces. Fast (~1-2 min): the suite runs in ~5s.
+name: ci
+
+on:
+  push:
+    branches: [solana-support, main]
+  pull_request:
+    branches: [solana-support, main]
+
+# A newer push to the same ref supersedes an in-flight check run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci # full install — CI needs the devDeps (vitest, typescript, eslint)
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Tests
+        run: npx vitest run
+      # Lint is NON-BLOCKING for now: the repo carries ~30 pre-existing lint issues (stray root scripts +
+      # UI components) unrelated to correctness. Surfaced here for visibility; flip `continue-on-error` to
+      # false once the backlog is cleaned up so lint becomes a hard gate.
+      - name: Lint
+        run: npm run lint
+        continue-on-error: true

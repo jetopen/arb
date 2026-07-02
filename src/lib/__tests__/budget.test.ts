@@ -26,6 +26,21 @@ describe("RpmBudget", () => {
     const b = new RpmBudget(30, t0);
     expect(b.available(t0 + 10 * 60_000)).toBe(30);
   });
+
+  it("release() returns unspent tokens, capped at capacity, ignoring non-positive amounts", () => {
+    const t0 = 1_000_000;
+    const b = new RpmBudget(60, t0);
+    expect(b.tryAcquire(40, t0)).toBe(true);
+    expect(b.available(t0)).toBe(20);
+    b.release(30, t0);
+    expect(b.available(t0)).toBe(50);
+    b.release(100, t0); // would overflow → clamps to capacity
+    expect(b.available(t0)).toBe(60);
+    b.tryAcquire(10, t0);
+    b.release(0, t0);
+    b.release(-5, t0); // no-ops
+    expect(b.available(t0)).toBe(50);
+  });
 });
 
 describe("parseEstimation", () => {

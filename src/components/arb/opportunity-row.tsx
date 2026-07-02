@@ -17,6 +17,11 @@ function usd(n: number): string {
   return `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 }
 
+/** Signed USD with the minus BEFORE the $ (net is usually negative at probe sizes — the fee dominates). */
+function money(n: number): string {
+  return `${n < 0 ? "-" : ""}$${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+}
+
 /** First blocking leg's reason, for the "reverts" badge tooltip. */
 function failReason(sim: SimulationResult): string {
   if (sim.buy.status === "revert") return `buy swap: ${sim.buy.reason ?? "revert"}`;
@@ -105,6 +110,12 @@ export function OpportunityRow({
         </td>
         <td className={`px-4 py-3 text-sm font-semibold tabular-nums ${positive ? "text-accent" : "text-red-600"}`}>
           {pct(spread)}
+        </td>
+        <td
+          className={`px-4 py-3 text-sm font-medium tabular-nums ${opp.edge.netUsdConservative > 0 ? "text-accent" : "text-muted"}`}
+          title="Net USD after fees, gas, and a slippage haircut, at this probe size (open the row for the size sweep)"
+        >
+          {money(opp.edge.netUsdConservative)}
         </td>
         <td className="px-4 py-3 text-sm text-muted tabular-nums" title="Probe size this spread is measured at">
           ${opp.tierUsd.toLocaleString()}

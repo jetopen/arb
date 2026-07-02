@@ -1,12 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useArbOpportunities, useArbScanner, useLockGraphSummary } from "@/lib/hooks";
-import { OpportunityTable } from "@/components/arb/opportunity-table";
+import { OpportunityTable, type SortKey } from "@/components/arb/opportunity-table";
 import { OpportunityDetail } from "@/components/arb/opportunity-detail";
 import { ScanStatus } from "@/components/arb/scan-status";
 import { TrackedFamilies } from "@/components/arb/tracked-families";
 import { LastUpdated } from "@/components/last-updated";
+import { chainName } from "@/lib/deport/registry";
 import type { Opportunity } from "@/lib/types";
 
 type View = "opportunities" | "tracked";
@@ -21,8 +22,11 @@ export default function ArbitragePage() {
   const [view, setView] = useState<View>("opportunities");
   const [minSpreadPct, setMinSpreadPct] = useState<number | undefined>(undefined);
   const [tierUsd, setTierUsd] = useState<number | undefined>(undefined);
+  const [chainId, setChainId] = useState<number | undefined>(undefined);
   const [verifiedOnly, setVerifiedOnly] = useState(false);
   const [executableOnly, setExecutableOnly] = useState(false);
+  const [netPositiveOnly, setNetPositiveOnly] = useState(false);
+  const [sortKey, setSortKey] = useState<SortKey>("gross");
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Opportunity | null>(null);
 
@@ -30,6 +34,7 @@ export default function ArbitragePage() {
   const scan = useArbScanner(24);
   const { data, error, isLoading, mutate } = useArbOpportunities({
     minSpreadPct,
+    chainId,
     tierUsd,
     verifiedOnly,
     executableOnly,
@@ -42,6 +47,19 @@ export default function ArbitragePage() {
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   // Offer exactly the rungs the scanner actually probed (from the API), falling back before first load.
   const capitalTiers = data?.tiers ?? CAPITAL_TIERS_FALLBACK;
+
+  // Sort key + net-positive filter are CLIENT-SIDE: groupByToken returns ~1 row/token (all on one page), so we
+  // reorder/trim the returned rows directly rather than round-tripping. (Chain filter IS server-side via the hook.)
+  const displayed = useMemo(() => {
+    let list = netPositiveOnly ? opportunities.filter((o) => o.edge.netUsdConservative > 0) : opportunities;
+    const val = sortKey === "net" ? (o: Opportunity) => o.edge.netUsdConservative : (o: Opportunity) => o.edge.grossSpreadPct;
+    return [...list].sort((a, b) => val(b) - val(a));
+  }, [opportunities, netPositiveOnly, sortKey]);
+  // Chain selector options: the scanned-chain set (stable regardless of the active chain filter).
+  const chainOptions = useMemo(
+    () => (graph?.chainsScanned ?? []).map((id) => ({ id, name: chainName(id) })).sort((a, b) => a.name.localeCompare(b.name)),
+    [graph?.chainsScanned]
+  );
 
   return (
     <div className="space-y-6">
@@ -133,6 +151,25 @@ export default function ArbitragePage() {
                 <option value="1">≥ 1%</option>
               </select>
             </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-muted uppercase tracking-wider">Chain</label>
+              <select
+                value={chainId ?? ""}
+                onChange={(e) => {
+                  setChainId(e.target.value === "" ? undefined : Number(e.target.value));
+                  setPage(1);
+                }}
+                title="Show only routes whose buy or sell leg is on this chain"
+                className="px-3 py-2 text-sm rounded-md border border-border bg-white focus:outline-none focus:ring-2 focus:ring-accent/30"
+              >
+                <option value="">All chains</option>
+                {chainOptions.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </div>
             <button
               onClick={() => {
                 setVerifiedOnly((v) => !v);
@@ -152,15 +189,24 @@ export default function ArbitragePage() {
             >
               {executableOnly ? "✓ Executable only" : "Executable only"}
             </button>
-            <div className="self-end text-sm text-muted">{total} tokens</div>
+            <button
+              onClick={() => setNetPositiveOnly((v) => !v)}
+              title="Show only rows whose net (after fees, gas, slippage) is positive at the probe size"
+              className={`px-3 py-2 text-sm rounded-md border transition-colors self-end ${netPositiveOnly ? "bg-accent text-white border-accent" : "border-border hover:bg-muted/50"}`}
+            >
+              {netPositiveOnly ? "✓ Net-positive" : "Net-positive"}
+            </button>
+            <div className="self-end text-sm text-muted">{displayed.length} tokens</div>
           </div>
 
           <OpportunityTable
-            opportunities={opportunities}
+            opportunities={displayed}
             loading={isLoading}
             error={error?.message ?? null}
             onSelect={setSelected}
             onRetry={() => mutate()}
+            sortKey={sortKey}
+            onSort={setSortKey}
           />
 
           {totalPages > 1 && (

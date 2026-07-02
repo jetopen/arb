@@ -1,7 +1,54 @@
-import { describe, it, expect } from "vitest";
-import { rowToOpp, oppToItem, rowToUnit, famToRow, rowToFamily } from "../db/supabase-store";
+import { describe, it, expect, vi } from "vitest";
+import { rowToOpp, oppToItem, rowToUnit, famToRow, rowToFamily, SupabaseStore } from "../db/supabase-store";
 import { MemoryStore } from "../db/store";
-import type { Opportunity, Family, LockGraph } from "../types";
+import type { Opportunity, Family, LockGraph, ScanUnit } from "../types";
+
+// Fake service client so we can unit-test SupabaseStore's JS-side orchestration (query building + markScanned
+// classification + RPC dispatch) without a live Postgres — the audit-flagged untested production path. The SQL
+// RPC internals (two-statement lease, power() backoff) are covered by live verification, not this fake.
+const dbHolder = vi.hoisted(() => ({ client: null as any }));
+vi.mock("../db/supabase", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../db/supabase")>()),
+  getServiceClient: () => dbHolder.client,
+}));
+
+/** Minimal chainable/thenable stub of the supabase-js client — records every call for assertions. */
+function makeFakeClient(opts: { provenIds?: string[]; historyRows?: any[] } = {}) {
+  const provenIds = opts.provenIds ?? [];
+  const calls: { rpc?: string; args?: any; table?: string; op?: string; update?: any; filters?: any }[] = [];
+  const query = (table: string) => {
+    const state: any = { table, op: null, update: null, filters: {} };
+    const q: any = {
+      select() { state.op = "select"; return q; },
+      update(obj: any) { state.op = "update"; state.update = obj; return q; },
+      in(col: string, vals: any[]) { state.filters.in = { col, vals }; return q; },
+      eq(col: string, val: any) { state.filters.eq = { col, val }; return q; },
+      gte(col: string, val: any) { state.filters.gte = { col, val }; return q; },
+      order(col: string, o: any) { state.filters.order = { col, ...o }; return q; },
+      limit(n: number) { state.filters.limit = n; return q; },
+      then(resolve: any) {
+        calls.push({ table, op: state.op, update: state.update, filters: state.filters });
+        if (state.op === "select" && table === "arb_opportunities") {
+          const ids: string[] = state.filters.in?.vals ?? [];
+          return resolve({ data: ids.filter((id) => provenIds.includes(id)).map((id) => ({ id })), error: null });
+        }
+        if (state.op === "select" && table === "arb_opportunity_history") {
+          return resolve({ data: opts.historyRows ?? [], error: null });
+        }
+        return resolve({ data: null, error: null });
+      },
+    };
+    return q;
+  };
+  const client = {
+    from: (table: string) => query(table),
+    rpc: (name: string, args: any) => {
+      calls.push({ rpc: name, args });
+      return Promise.resolve({ data: null, error: null });
+    },
+  };
+  return { client, calls };
+}
 
 function opp(id: string, profitable: boolean, netEdgePct = 1): Opportunity {
   return {
@@ -165,5 +212,54 @@ describe("MemoryStore times tracking + families (Supabase parity)", () => {
     };
     await s.saveGraph(graph);
     expect(await s.loadGraph()).toEqual(graph);
+  });
+});
+
+describe("SupabaseStore.markScanned (fake-client contract)", () => {
+  const u = (id: string): ScanUnit => ({ debridgeId: id, buyChainId: 1, sellChainId: 56, tierUsd: 1000, kind: "redemption" });
+  const wid = (id: string) => `${id}:1:56:1000:redemption`;
+
+  it("classifies keep/transient/demote, applies the proven freshness bound, and demotes via arb_demote_dead", async () => {
+    // DB reports only "prov" as proven-AND-fresh (its computed_at passes the gte bound).
+    const { client, calls } = makeFakeClient({ provenIds: [wid("prov")] });
+    dbHolder.client = client;
+    const store = new SupabaseStore();
+
+    await store.markScanned([
+      { unit: u("live"), live: true }, // live → keep
+      { unit: u("prov"), live: false }, // proven & fresh → keep
+      { unit: u("blip"), live: false, transient: true }, // transient blip → short backoff
+      { unit: u("dead"), live: false }, // not proven → exponential dead-route backoff
+    ]);
+
+    // proven select applied the computed_at freshness bound (4c)
+    const provenSelect = calls.find((c) => c.table === "arb_opportunities" && c.op === "select");
+    expect(provenSelect?.filters.gte?.col).toBe("computed_at");
+
+    // dead route demoted via the RPC (per-row exponential backoff, 4d) — NOT a flat bump
+    const demote = calls.find((c) => c.rpc === "arb_demote_dead");
+    expect(demote?.args.p_ids).toEqual([wid("dead")]);
+
+    const updates = calls.filter((c) => c.table === "arb_work_queue" && c.op === "update");
+    // keep bump covers live + proven and resets fail_count
+    const keep = updates.find((c) => c.update.fail_count === 0);
+    expect(keep?.filters.in.vals.sort()).toEqual([wid("live"), wid("prov")].sort());
+    // transient bump does NOT touch fail_count
+    const transientUpd = updates.find((c) => c.update.fail_count === undefined);
+    expect(transientUpd?.filters.in.vals).toEqual([wid("blip")]);
+  });
+
+  it("opportunityHistory reads a unit's points newest-first and maps snake_case + timestamps (5c)", async () => {
+    const { client } = makeFakeClient({
+      historyRows: [
+        { ts: "2026-07-02T00:02:00.000Z", gross_spread_pct: 0.8, net_usd: -3, tier_usd: 100 },
+        { ts: "2026-07-02T00:01:00.000Z", gross_spread_pct: 0.5, net_usd: -4, tier_usd: 100 },
+      ],
+    });
+    dbHolder.client = client;
+    const pts = await new SupabaseStore().opportunityHistory("h:1:56:100:redemption", 50);
+    expect(pts).toHaveLength(2);
+    expect(pts[0]).toEqual({ ts: Date.parse("2026-07-02T00:02:00.000Z"), grossSpreadPct: 0.8, netUsd: -3, tierUsd: 100 });
+    expect(pts[1].netUsd).toBe(-4);
   });
 });

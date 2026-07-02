@@ -1,6 +1,6 @@
 import type { Family, LockGraph, Opportunity, OpportunityFilter, ScanUnit } from "../types";
-import type { Store, ScanRunRecord, ScanOutcome } from "./store";
-import { DEAD_ROUTE_PENALTY_MS, TRANSIENT_RETRY_MS, HOT_RATIO, workUnitId } from "./store";
+import type { Store, ScanRunRecord, ScanOutcome, OpportunityHistoryPoint } from "./store";
+import { TRANSIENT_RETRY_MS, HOT_RATIO, PROVEN_MAX_AGE_MS, workUnitId } from "./store";
 import { getServiceClient } from "./supabase";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -213,13 +213,17 @@ export class SupabaseStore implements Store {
     const failed = outcomes.filter((o) => !o.live);
     const failedIds = failed.map((o) => workUnitId(o.unit));
 
-    // A failed route that has ever produced an opportunity is "proven" — a single failure is a blip,
-    // not a dead pool, so it keeps cycling. Among UNproven failures, a TRANSIENT upstream error
-    // (5xx/429/network) gets a short backoff so a flaky chain's live routes recover fast; a permanent
-    // no-route (amountOut 0 / 4xx) gets the full dead-route penalty.
+    // A failed route that produced an opportunity WITHIN PROVEN_MAX_AGE_MS is "proven" — a single failure is
+    // a blip, not a dead pool, so it keeps cycling. The freshness bound (4c) stops a route that quoted once
+    // long ago and has failed since from holding a hot slot forever. Among the non-kept: a TRANSIENT upstream
+    // error (5xx/429/network) gets a short backoff; a permanent no-route gets exponential dead-route backoff.
     let provenSet = new Set<string>();
     if (failedIds.length > 0) {
-      const { data, error } = await this.db.from("arb_opportunities").select("id").in("id", failedIds);
+      const { data, error } = await this.db
+        .from("arb_opportunities")
+        .select("id")
+        .in("id", failedIds)
+        .gte("computed_at", new Date(now - PROVEN_MAX_AGE_MS).toISOString());
       if (error) throw new Error(`markScanned(proven): ${error.message}`);
       provenSet = new Set((data ?? []).map((r: any) => r.id as string));
     }
@@ -228,24 +232,32 @@ export class SupabaseStore implements Store {
     const demoteIds: string[] = [];
     for (const o of failed) {
       const id = workUnitId(o.unit);
-      if (provenSet.has(id)) keepIds.push(id); // proven → cycle normally
+      if (provenSet.has(id)) keepIds.push(id); // proven & fresh → cycle normally
       else if (o.transient) transientIds.push(id); // transient blip → short backoff
-      else demoteIds.push(id); // permanent no-route → full dead penalty
+      else demoteIds.push(id); // permanent no-route → exponential dead-route backoff (4d)
     }
 
-    // Bulk time-stamp updates (no RPC/DDL needed). Clearing the lease lets a kept route re-enter immediately.
-    const bump = async (ids: string[], whenMs: number, label: string) => {
+    // Bulk time-stamp updates. Clearing the lease lets a kept route re-enter immediately; keep also resets
+    // fail_count so a route that recovers restarts its backoff (4d).
+    const bump = async (ids: string[], whenMs: number, label: string, extra: Record<string, unknown> = {}) => {
       if (ids.length === 0) return;
       const { error } = await this.db
         .from("arb_work_queue")
-        .update({ last_scanned_at: new Date(whenMs).toISOString(), leased_until: null })
+        .update({ last_scanned_at: new Date(whenMs).toISOString(), leased_until: null, ...extra })
         .in("id", ids);
       if (error) throw new Error(`markScanned(${label}): ${error.message}`);
     };
+    // Dead routes get per-row exponential backoff (6h·2^fail_count, capped 72h) via the RPC — a bulk column
+    // update can't compute a per-row interval from the row's own fail_count.
+    const demoteDead = async () => {
+      if (demoteIds.length === 0) return;
+      const { error } = await this.db.rpc("arb_demote_dead", { p_ids: demoteIds });
+      if (error) throw new Error(`markScanned(demote): ${error.message}`);
+    };
     await Promise.all([
-      bump(keepIds, now, "keep"),
+      bump(keepIds, now, "keep", { fail_count: 0 }),
       bump(transientIds, now + TRANSIENT_RETRY_MS, "transient"),
-      bump(demoteIds, now + DEAD_ROUTE_PENALTY_MS, "demote"),
+      demoteDead(),
     ]);
   }
 
@@ -335,6 +347,22 @@ export class SupabaseStore implements Store {
     const { data, error } = await this.db.rpc("arb_filter_new_alerts", { p_ids: ids });
     if (error) throw new Error(`filterNewAlerts: ${error.message}`);
     return (data ?? []).map((r: any) => (typeof r === "string" ? r : r.id));
+  }
+
+  async opportunityHistory(unitId: string, limit: number): Promise<OpportunityHistoryPoint[]> {
+    const { data, error } = await this.db
+      .from("arb_opportunity_history")
+      .select("ts, gross_spread_pct, net_usd, tier_usd")
+      .eq("unit_id", unitId)
+      .order("ts", { ascending: false })
+      .limit(limit);
+    if (error) throw new Error(`opportunityHistory: ${error.message}`);
+    return (data ?? []).map((r: any) => ({
+      ts: new Date(r.ts).getTime(),
+      grossSpreadPct: r.gross_spread_pct,
+      netUsd: r.net_usd,
+      tierUsd: r.tier_usd,
+    }));
   }
 
   async loadGraph(): Promise<LockGraph | null> {

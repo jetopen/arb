@@ -1,27 +1,32 @@
 // Continuous in-process scan loop — the driver for the PUBLIC-repo GitHub Actions job (unlimited free
-// minutes). Replaces the one-batch-per-dispatch model (scripts/scan-once.mts): instead of a fresh process
-// per trigger, ONE job runs this loop for ~5.5h (under GitHub's 6h hard job cap), calling runScan() back to
-// back. That matters because the RPM limiter and the lock-graph cache are MODULE-LEVEL singletons in
-// scan-service.ts — a single long-lived process keeps ONE 120-RPM budget (so it can't overrun the DEX APIs)
-// and a warm graph (rebuilt only at the 6h TTL boundary). Re-spawning scan:once would reset both every tick.
+// minutes). ONE job runs this for ~5.5h (under GitHub's 6h hard job cap), calling runScan() back to back.
+// That matters because the RPM limiter and the lock-graph cache are MODULE-LEVEL singletons in
+// scan-service.ts — a single long-lived process keeps ONE shared RPM budget (so it can't overrun the DEX
+// APIs) and a warm graph (rebuilt only at the 6h TTL boundary). Re-spawning scan:once would reset both.
 //
-// Sustained ~120 RPM ≈ ~60 units/min cycles the ~9.5k queue in ~2.6h (just under the 3h freshness gate) and
-// the hot proven set every ~30 min, so the dashboard stays full instead of showing the last-scanned sliver.
+// Steady state is TWO-LANE, not a single full-queue sweep: the hot lane keeps the proven set fresh inside the
+// 3h read gate (~28-min cycle), while the cold-discovery sweep works the ~8.7k dead reps with the remaining
+// budget (~4-5h). So the dashboard stays full via the hot lane, not by cycling the whole queue every tick.
 //
-// SELF-RESTART: the job self-exits(0) at MAX_MS. The workflow's `concurrency` guard means the next scheduled
+// SELF-RESTART: the job self-exits at MAX_MS. The workflow's `concurrency` guard means the next scheduled
 // (*/10) or Windows-task trigger is already queued as `pending` and starts the instant this job ends — a
 // seamless, PAT-free restart. When the PC is off, the GitHub schedule restarts it.
 //
+// This file is a thin shell: all loop logic (backoff, deadline, sustained-failure alert+abort, 429-storm
+// detection) lives in the unit-tested src/lib/arb/scan-loop-core.ts. On sustained failure runLoop returns
+// exitCode 1 so the run goes RED (GitHub emails the owner) instead of a silent green 5.5h of errors.
+//
 // .mts (ESM) so top-level await works under tsx. Usage:
-//   npm run scan:loop                                   # loop ~5.5h then exit 0 (CI default)
-//   ARB_LOOP_MAX_MS=90000 ARB_SCAN_N=24 npm run scan:loop   # short local smoke test
+//   npm run scan:loop                                        # loop ~5.5h then exit (CI default)
+//   ARB_LOOP_MAX_MS=90000 ARB_SCAN_N=24 npm run scan:loop    # short local smoke test
 //
 // Env (loaded from .env.local in dev via @next/env; real config already in process.env in CI):
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY   required — selects the Supabase store
+//   DISCORD_WEBHOOK_URL                        optional — enables the ops alerts below
 //   ARB_SCAN_N            units per batch, 1..64 (default 48)
 //   ARB_LOOP_INTERVAL_MS  pause between ticks (default 3000; the RPM budget is the real throttle)
 //   ARB_LOOP_MAX_MS       self-exit deadline (default 5.5h; kept < GitHub's 6h cap so shutdown is graceful)
-//   ARB_SCAN_RPM, DISCORD_WEBHOOK_URL, ZEROX_API_KEY, …   optional, same as the scan:once path
+//   ARB_SCAN_RPM, ZEROX_API_KEY, …            optional, same as the scan:once path
 
 // @next/env is CommonJS — default-import the module object (named ESM import fails its CJS interop).
 import nextEnv from "@next/env";
@@ -34,43 +39,31 @@ const INTERVAL_MS = Math.max(Number(process.env.ARB_LOOP_INTERVAL_MS) || 3000, 0
 const MAX_MS = Math.max(Number(process.env.ARB_LOOP_MAX_MS) || 5.5 * 60 * 60 * 1000, 60_000);
 
 const { runScan } = await import("@/lib/arb/scan-service");
+const { runLoop } = await import("@/lib/arb/scan-loop-core");
+const { sendDiscordAlert } = await import("@/lib/alerts/providers/discord");
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const start = Date.now();
-let tick = 0;
-let errStreak = 0;
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const webhook = process.env.DISCORD_WEBHOOK_URL || "";
+const alert = webhook
+  ? async (msg: string) => {
+      await sendDiscordAlert(webhook, { content: `⚠️ ${msg}` });
+    }
+  : undefined;
 
-console.log(`[scan-loop] start N=${N} interval=${INTERVAL_MS}ms maxRuntime=${Math.round(MAX_MS / 60000)}min`);
+console.log(`[scan-loop] start N=${N} interval=${INTERVAL_MS}ms maxRuntime=${Math.round(MAX_MS / 60000)}min alerts=${webhook ? "on" : "off"}`);
 
-// Loop until the deadline. The check is between ticks, so we exit only AFTER a runScan() has fully returned
-// (its markScanned has already cleared the batch's leases) — a batch is never left half-marked.
-while (Date.now() - start < MAX_MS) {
-  tick++;
-  try {
-    const r = await runScan(N);
-    errStreak = 0;
-    console.log(
-      `[scan-loop] tick=${tick} units=${r.unitsProcessed ?? "?"} remaining=${r.remaining ?? "?"} ` +
-        `rpmFree=${r.rpmAvailable ?? "?"} elapsed=${((Date.now() - start) / 60000).toFixed(1)}min`
-    );
-    // Empty batch (queue momentarily drained / everything leased) → back off longer than a busy-poll.
-    await sleep((r.unitsProcessed ?? 0) > 0 ? INTERVAL_MS : 15_000);
-  } catch (err) {
-    // A transient upstream failure (deBridge/DEX 5xx/429, a DB blip) must NOT kill the long job. Log, back
-    // off exponentially (cap 60s), keep going. Everything is inside this try, so even a startup blip retries.
-    errStreak++;
-    const backoff = Math.min(60_000, (INTERVAL_MS || 1000) * 2 ** errStreak);
-    console.error(
-      `[scan-loop] tick=${tick} failed (streak=${errStreak}):`,
-      err instanceof Error ? err.message : err,
-      `— backoff ${backoff}ms`
-    );
-    await sleep(backoff);
-  }
-}
+const { ticks, exitCode } = await runLoop({
+  runScan,
+  sleep,
+  now: Date.now,
+  log: (m) => console.log(`[scan-loop] ${m}`),
+  alert,
+  n: N,
+  intervalMs: INTERVAL_MS,
+  maxMs: MAX_MS,
+  errThreshold: Number(process.env.ARB_LOOP_ERR_THRESHOLD) || undefined,
+  transientThreshold: Number(process.env.ARB_LOOP_TRANSIENT_THRESHOLD) || undefined,
+});
 
-console.log(
-  `[scan-loop] reached max runtime after ${tick} ticks (${((Date.now() - start) / 60000).toFixed(1)}min) — ` +
-    `exiting 0 for a clean restart`
-);
-process.exit(0);
+console.log(`[scan-loop] finished after ${ticks} ticks — exiting ${exitCode}${exitCode ? " (sustained failure)" : " (clean restart)"}`);
+process.exit(exitCode);

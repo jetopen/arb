@@ -10,6 +10,14 @@ export interface ScanRunRecord {
   partial: boolean;
 }
 
+/** One point in a scan-unit's spread/net trajectory (for the drawer sparkline). 5c. */
+export interface OpportunityHistoryPoint {
+  ts: number;
+  grossSpreadPct: number;
+  netUsd: number;
+  tierUsd: number;
+}
+
 /** Per-unit result fed back after a batch so the queue can demote routes that can't be quoted. */
 export interface ScanOutcome {
   unit: ScanUnit;
@@ -44,12 +52,13 @@ export const DEAD_ROUTE_PENALTY_MS = parsePenaltyMs(process.env.ARB_DEAD_ROUTE_P
  * within minutes instead of being hidden for the full 6h dead penalty. Default 10m; ARB_TRANSIENT_RETRY_MS. */
 export const TRANSIENT_RETRY_MS = parsePenaltyMs(process.env.ARB_TRANSIENT_RETRY_MS, 10 * 60 * 1000);
 
-/** Default read-freshness window for the Opportunities list — DECOUPLED from the dead-route penalty. With
- * scans now running every ~30 min (external cron → workflow_dispatch), a 3h window keeps the last several
- * cycles while dropping day-old phantoms — a stale quote (e.g. an edge that has since decayed) must NOT keep
+/** Default read-freshness window for the Opportunities list — DECOUPLED from the dead-route penalty. The
+ * continuous scan loop keeps the proven (hot-lane) set refreshed every ~28 min, so a 3h window holds the last
+ * several cycles while dropping day-old phantoms — a stale quote (an edge that has since decayed) must NOT keep
  * ranking #1 by spread. Deliberately SMALLER than the 6h dead-route penalty: the two are independent (this
  * gates what the UI shows; the penalty gates re-scan scheduling). Override live via ARB_OPP_MAX_AGE_MS (e.g.
- * loosen if the list looks too sparse); maxAgeMs<=0 (at the route) disables the gate entirely. */
+ * loosen if the list looks too sparse); maxAgeMs<=0 (at the route) disables the gate entirely. /api/health
+ * flips to 503 against this same window so a stalled scanner is caught, not silently blanked. */
 export const DEFAULT_OPP_MAX_AGE_MS = 3 * 60 * 60 * 1000;
 
 /** Fraction of each dequeue batch reserved for the proven/realized-quotability set (priority>=1) so the
@@ -59,6 +68,20 @@ export function parseHotRatio(raw: string | undefined): number {
   return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 0.5;
 }
 export const HOT_RATIO = parseHotRatio(process.env.ARB_SCAN_HOT_RATIO);
+
+/** Min time before a HOT unit (a token's proven best row) is eligible for the hot lane again. seedQueue now
+ * warms only ~1 row per token, so without a floor the tiny hot set would re-scan every couple minutes and
+ * waste the budget that shrink frees; with it, unfilled hot slots spill to the cold-discovery sweep. 4b. */
+export const HOT_MIN_INTERVAL_MS = parsePenaltyMs(process.env.ARB_HOT_MIN_INTERVAL_MS, 10 * 60 * 1000);
+
+/** A "proven" route (one that has produced an opportunity) stops counting as proven once its newest
+ * opportunity is older than this — so a route that quoted once long ago and has failed every scan since is
+ * demoted like any dead route instead of holding a hot slot forever. Override via ARB_PROVEN_MAX_AGE_MS. 4c. */
+export const PROVEN_MAX_AGE_MS = parsePenaltyMs(process.env.ARB_PROVEN_MAX_AGE_MS, 24 * 60 * 60 * 1000);
+
+/** Ceiling for the exponential dead-route backoff (6h·2^fail_count). Keeps a persistently-dead rep from being
+ * pushed absurdly far out while still cutting re-scan spend on the long tail. 4d. */
+export const MAX_DEAD_PENALTY_MS = 72 * 60 * 60 * 1000;
 
 export interface Store {
   upsertOpportunities(opps: Opportunity[]): Promise<void>;
@@ -86,6 +109,8 @@ export interface Store {
   /** Record alert ids and return ONLY the ones not previously recorded — dedup so each opportunity
    *  pings once, not every scan tick it stays profitable. */
   filterNewAlerts(ids: string[]): Promise<string[]>;
+  /** Recent spread/net history for one scan-unit id, newest first (for the drawer sparkline). 5c. */
+  opportunityHistory(unitId: string, limit: number): Promise<OpportunityHistoryPoint[]>;
 }
 
 /** Stable scan-unit / opportunity / queue-row id (same format across all three). */
@@ -98,7 +123,8 @@ const unitKey = workUnitId;
 /** In-memory store (Phase 1). Swapped for a Supabase-backed store in Phase 2 via getStore(). */
 export class MemoryStore implements Store {
   private opps = new Map<string, Opportunity>();
-  private queue: { unit: ScanUnit; priority: number; lastScannedAt: number | null }[] = [];
+  private history = new Map<string, OpportunityHistoryPoint[]>();
+  private queue: { unit: ScanUnit; priority: number; lastScannedAt: number | null; failCount: number }[] = [];
   private queued = new Set<string>();
   private lastRun: ScanRunRecord | null = null;
   private graph: LockGraph | null = null;
@@ -113,7 +139,17 @@ export class MemoryStore implements Store {
         timesProfitable: (prev?.timesProfitable ?? 0) + (o.edge.profitable ? 1 : 0),
         firstSeenAt: prev?.firstSeenAt ?? o.computedAt,
       });
+      // Append a history point (bounded ring) — mirrors the SQL history append in arb_upsert_opportunities. 5c.
+      const hist = this.history.get(o.id) ?? [];
+      hist.push({ ts: o.computedAt, grossSpreadPct: o.edge.grossSpreadPct, netUsd: o.edge.netUsd, tierUsd: o.tierUsd });
+      if (hist.length > 500) hist.shift();
+      this.history.set(o.id, hist);
     }
+  }
+
+  async opportunityHistory(unitId: string, limit: number): Promise<OpportunityHistoryPoint[]> {
+    const hist = this.history.get(unitId) ?? [];
+    return hist.slice(-limit).reverse(); // newest first
   }
 
   async topOpportunities(filter: OpportunityFilter): Promise<{ opportunities: Opportunity[]; total: number }> {
@@ -160,7 +196,7 @@ export class MemoryStore implements Store {
         continue;
       }
       this.queued.add(k);
-      this.queue.push({ unit: u, priority, lastScannedAt: null });
+      this.queue.push({ unit: u, priority, lastScannedAt: null, failCount: 0 });
     }
   }
 
@@ -204,7 +240,12 @@ export class MemoryStore implements Store {
     // Hot lane first (proven, priority>=1), then cold fills the rest from the REMAINING eligible. One
     // snapshot + a `taken` set ⇒ a row can never be taken by both lanes in a single dequeue.
     const hotN = Math.ceil(want * HOT_RATIO);
-    const hot = eligible.filter((i) => i.priority >= 1).sort(cmp).slice(0, hotN);
+    // Hot lane = proven best rows (priority>=1) that are at least HOT_MIN_INTERVAL_MS stale, so the tiny hot
+    // set doesn't busy-spin; unfilled hot slots fall through to the cold fill below (4b).
+    const hot = eligible
+      .filter((i) => i.priority >= 1 && (i.lastScannedAt === null || i.lastScannedAt <= now - HOT_MIN_INTERVAL_MS))
+      .sort(cmp)
+      .slice(0, hotN);
     const taken = new Set(hot);
     const cold = eligible.filter((i) => !taken.has(i)).sort(cmp).slice(0, want - hot.length);
     const batch = [...hot, ...cold];
@@ -218,12 +259,22 @@ export class MemoryStore implements Store {
       const k = unitKey(unit);
       const item = this.queue.find((i) => unitKey(i.unit) === k);
       if (!item) continue;
-      // A proven route (one that has ever produced a quote) is never demoted on a single failure — that's
-      // a blip, not a dead pool. Among UNproven failures, a TRANSIENT upstream error (5xx/429/network) gets
-      // only a short backoff so a flaky chain's live routes recover fast, while a permanent no-route
-      // (amountOut 0 / 4xx) gets the full dead-route penalty so dequeue stops re-scanning dead reps.
-      const keep = live || this.opps.has(k);
-      item.lastScannedAt = keep ? now : now + (transient ? TRANSIENT_RETRY_MS : DEAD_ROUTE_PENALTY_MS);
+      // Proven = has produced an opportunity WITHIN PROVEN_MAX_AGE_MS. A single failure on such a route is a
+      // blip, not a dead pool, so it keeps cycling. But a route that quoted once long ago and has failed
+      // since is NOT kept — it demotes like any dead route (4c). Among the non-kept: a TRANSIENT upstream
+      // error (5xx/429/network) gets a short backoff; a permanent no-route gets the exponential dead-route
+      // backoff (6h·2^fail_count, capped), so the persistent-dead long tail is re-checked ever more rarely (4d).
+      const opp = this.opps.get(k);
+      const keep = live || (opp != null && (opp.computedAt ?? 0) > now - PROVEN_MAX_AGE_MS);
+      if (keep) {
+        item.lastScannedAt = now;
+        item.failCount = 0; // recovery resets the dead-route backoff
+      } else if (transient) {
+        item.lastScannedAt = now + TRANSIENT_RETRY_MS;
+      } else {
+        item.lastScannedAt = now + Math.min(DEAD_ROUTE_PENALTY_MS * 2 ** item.failCount, MAX_DEAD_PENALTY_MS);
+        item.failCount++;
+      }
     }
   }
 
