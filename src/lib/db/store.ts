@@ -44,12 +44,13 @@ export const DEAD_ROUTE_PENALTY_MS = parsePenaltyMs(process.env.ARB_DEAD_ROUTE_P
  * within minutes instead of being hidden for the full 6h dead penalty. Default 10m; ARB_TRANSIENT_RETRY_MS. */
 export const TRANSIENT_RETRY_MS = parsePenaltyMs(process.env.ARB_TRANSIENT_RETRY_MS, 10 * 60 * 1000);
 
-/** Default read-freshness window for the Opportunities list — DECOUPLED from the dead-route penalty. With
- * scans now running every ~30 min (external cron → workflow_dispatch), a 3h window keeps the last several
- * cycles while dropping day-old phantoms — a stale quote (e.g. an edge that has since decayed) must NOT keep
+/** Default read-freshness window for the Opportunities list — DECOUPLED from the dead-route penalty. The
+ * continuous scan loop keeps the proven (hot-lane) set refreshed every ~28 min, so a 3h window holds the last
+ * several cycles while dropping day-old phantoms — a stale quote (an edge that has since decayed) must NOT keep
  * ranking #1 by spread. Deliberately SMALLER than the 6h dead-route penalty: the two are independent (this
  * gates what the UI shows; the penalty gates re-scan scheduling). Override live via ARB_OPP_MAX_AGE_MS (e.g.
- * loosen if the list looks too sparse); maxAgeMs<=0 (at the route) disables the gate entirely. */
+ * loosen if the list looks too sparse); maxAgeMs<=0 (at the route) disables the gate entirely. /api/health
+ * flips to 503 against this same window so a stalled scanner is caught, not silently blanked. */
 export const DEFAULT_OPP_MAX_AGE_MS = 3 * 60 * 60 * 1000;
 
 /** Fraction of each dequeue batch reserved for the proven/realized-quotability set (priority>=1) so the

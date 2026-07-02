@@ -1,9 +1,11 @@
 # Runs the arbitrage scan as a CONTINUOUS in-process loop — replaces the Heroku worker dyno at $0.
 # `npm run scan:loop` (scripts/scan-loop.mts) loads the lock-graph from the Supabase snapshot, then calls
-# runScan() back-to-back for ~5.5h (under GitHub's 6h job cap) and exits 0. One long-lived process keeps the
-# module-level 120-RPM budget + warm graph cache (scan-service.ts singletons), so it sustains ~60 units/min —
-# cycling the ~9.5k queue in ~2.6h (under the 3h freshness gate) instead of the old one-batch-per-dispatch
-# (scan:once) that cycled it in ~33h. The ~15-25s graph rebuild at the 6h boundary happens once, in-process.
+# runScan() back-to-back for ~5.5h (under GitHub's 6h job cap). One long-lived process keeps the module-level
+# RPM budget + warm graph cache (scan-service.ts singletons). Steady state is TWO-LANE: the hot lane keeps the
+# proven set fresh inside the 3h read gate (~28-min cycle) while the cold-discovery sweep works the ~8.7k dead
+# reps with the remaining budget (~4-5h) — the gate is held by the hot lane, NOT by full-queue cycling. This
+# replaces the old one-batch-per-dispatch (scan:once) that cycled once per ~33h. The ~15-25s graph rebuild at
+# the 6h boundary happens once, in-process. On sustained failure the loop exits NON-ZERO (red run → owner email).
 #
 # NOTE: scheduled workflows only run on the repo's DEFAULT branch. Make `solana-support` the default branch
 # (or merge it to the default) or this `schedule` will never fire. `workflow_dispatch` lets you test it now.
@@ -12,7 +14,7 @@
 # one ~5.5h job burns ~330 runner-min, so ~4-5 jobs/day ≈ ~44k min/mo — fine when unlimited, but it would
 # DWARF the 2,000-min/mo free tier if the repo ever went private again (revert to scan:once + */30 in that case).
 #
-# SELF-RESTART: each loop job self-exits(0) at ~5.5h. The `concurrency` guard below means any trigger that
+# SELF-RESTART: each loop job self-exits (0) at ~5.5h — or 1 early on sustained failure. The `concurrency` guard below means any trigger that
 # fires during the run (the */10 schedule, or the Windows task "arb-scan-dispatch" on the user's PC) is held as
 # a single `pending` run and starts the INSTANT the loop ends — a seamless, PAT-free restart. So one tick per
 # 5.5h is enough to stay continuous; GitHub dropping most */10 ticks is fine. The Windows task

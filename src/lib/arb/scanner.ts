@@ -285,8 +285,11 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T) => P
   return out;
 }
 
-/** Reserve budget, dequeue up to n units, scan with bounded concurrency, persist results. */
-export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord> {
+/** Reserve budget, dequeue up to n units, scan with bounded concurrency, persist results. Returns the
+ *  persisted ScanRunRecord plus `transientCount` (units that failed with a TRANSIENT upstream error this
+ *  tick — NOT persisted; the loop watches it to detect a provider 429/quota storm, which is otherwise
+ *  invisible because per-unit throws are swallowed and never reach the loop's errStreak). */
+export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord & { transientCount: number }> {
   const startedAt = Date.now();
   // Honor the RPM budget (fix #4): only scan what the budget can grant. Each unit costs 2 quotes, so
   // we can afford floor(available/2) units this tick; never dequeue/scan more than that.
@@ -326,7 +329,8 @@ export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord
     partial: false,
   };
   await deps.store.recordScanRun(run);
-  return run;
+  const transientCount = results.filter((r) => r.transient).length;
+  return { ...run, transientCount };
 }
 
 /**
