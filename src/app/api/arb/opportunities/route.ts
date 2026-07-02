@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getStore, DEFAULT_OPP_MAX_AGE_MS, parsePenaltyMs } from "@/lib/db/store";
 import { DEFAULT_TIERS } from "@/lib/arb/scanner";
+import { errorResponse } from "@/lib/api-error";
 import type { OpportunityFilter } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -42,7 +43,6 @@ export async function GET(request: NextRequest) {
     // rungs that were really scanned — never a hardcoded list that goes stale under an env override.
     return NextResponse.json({ ...result, lastScan, tiers: DEFAULT_TIERS });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Internal server error";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return errorResponse(error, "arb/opportunities");
   }
 }

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { tailDeportEvents } from "@/lib/deport/events";
 import { requireCron } from "@/lib/api-auth";
+import { errorResponse } from "@/lib/api-error";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,7 +16,6 @@ export async function GET(request: NextRequest) {
     const result = await tailDeportEvents();
     return NextResponse.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Internal server error";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return errorResponse(error, "arb/ingest");
   }
 }
