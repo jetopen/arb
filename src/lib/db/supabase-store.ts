@@ -1,5 +1,5 @@
 import type { Family, LockGraph, Opportunity, OpportunityFilter, ScanUnit } from "../types";
-import type { Store, ScanRunRecord, ScanOutcome } from "./store";
+import type { Store, ScanRunRecord, ScanOutcome, OpportunityHistoryPoint } from "./store";
 import { TRANSIENT_RETRY_MS, HOT_RATIO, PROVEN_MAX_AGE_MS, workUnitId } from "./store";
 import { getServiceClient } from "./supabase";
 
@@ -347,6 +347,22 @@ export class SupabaseStore implements Store {
     const { data, error } = await this.db.rpc("arb_filter_new_alerts", { p_ids: ids });
     if (error) throw new Error(`filterNewAlerts: ${error.message}`);
     return (data ?? []).map((r: any) => (typeof r === "string" ? r : r.id));
+  }
+
+  async opportunityHistory(unitId: string, limit: number): Promise<OpportunityHistoryPoint[]> {
+    const { data, error } = await this.db
+      .from("arb_opportunity_history")
+      .select("ts, gross_spread_pct, net_usd, tier_usd")
+      .eq("unit_id", unitId)
+      .order("ts", { ascending: false })
+      .limit(limit);
+    if (error) throw new Error(`opportunityHistory: ${error.message}`);
+    return (data ?? []).map((r: any) => ({
+      ts: new Date(r.ts).getTime(),
+      grossSpreadPct: r.gross_spread_pct,
+      netUsd: r.net_usd,
+      tierUsd: r.tier_usd,
+    }));
   }
 
   async loadGraph(): Promise<LockGraph | null> {

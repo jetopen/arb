@@ -13,7 +13,8 @@ vi.mock("../db/supabase", async (importOriginal) => ({
 }));
 
 /** Minimal chainable/thenable stub of the supabase-js client — records every call for assertions. */
-function makeFakeClient(provenIds: string[]) {
+function makeFakeClient(opts: { provenIds?: string[]; historyRows?: any[] } = {}) {
+  const provenIds = opts.provenIds ?? [];
   const calls: { rpc?: string; args?: any; table?: string; op?: string; update?: any; filters?: any }[] = [];
   const query = (table: string) => {
     const state: any = { table, op: null, update: null, filters: {} };
@@ -21,12 +22,18 @@ function makeFakeClient(provenIds: string[]) {
       select() { state.op = "select"; return q; },
       update(obj: any) { state.op = "update"; state.update = obj; return q; },
       in(col: string, vals: any[]) { state.filters.in = { col, vals }; return q; },
+      eq(col: string, val: any) { state.filters.eq = { col, val }; return q; },
       gte(col: string, val: any) { state.filters.gte = { col, val }; return q; },
+      order(col: string, o: any) { state.filters.order = { col, ...o }; return q; },
+      limit(n: number) { state.filters.limit = n; return q; },
       then(resolve: any) {
         calls.push({ table, op: state.op, update: state.update, filters: state.filters });
         if (state.op === "select" && table === "arb_opportunities") {
           const ids: string[] = state.filters.in?.vals ?? [];
           return resolve({ data: ids.filter((id) => provenIds.includes(id)).map((id) => ({ id })), error: null });
+        }
+        if (state.op === "select" && table === "arb_opportunity_history") {
+          return resolve({ data: opts.historyRows ?? [], error: null });
         }
         return resolve({ data: null, error: null });
       },
@@ -214,7 +221,7 @@ describe("SupabaseStore.markScanned (fake-client contract)", () => {
 
   it("classifies keep/transient/demote, applies the proven freshness bound, and demotes via arb_demote_dead", async () => {
     // DB reports only "prov" as proven-AND-fresh (its computed_at passes the gte bound).
-    const { client, calls } = makeFakeClient([wid("prov")]);
+    const { client, calls } = makeFakeClient({ provenIds: [wid("prov")] });
     dbHolder.client = client;
     const store = new SupabaseStore();
 
@@ -240,5 +247,19 @@ describe("SupabaseStore.markScanned (fake-client contract)", () => {
     // transient bump does NOT touch fail_count
     const transientUpd = updates.find((c) => c.update.fail_count === undefined);
     expect(transientUpd?.filters.in.vals).toEqual([wid("blip")]);
+  });
+
+  it("opportunityHistory reads a unit's points newest-first and maps snake_case + timestamps (5c)", async () => {
+    const { client } = makeFakeClient({
+      historyRows: [
+        { ts: "2026-07-02T00:02:00.000Z", gross_spread_pct: 0.8, net_usd: -3, tier_usd: 100 },
+        { ts: "2026-07-02T00:01:00.000Z", gross_spread_pct: 0.5, net_usd: -4, tier_usd: 100 },
+      ],
+    });
+    dbHolder.client = client;
+    const pts = await new SupabaseStore().opportunityHistory("h:1:56:100:redemption", 50);
+    expect(pts).toHaveLength(2);
+    expect(pts[0]).toEqual({ ts: Date.parse("2026-07-02T00:02:00.000Z"), grossSpreadPct: 0.8, netUsd: -3, tierUsd: 100 });
+    expect(pts[1].netUsd).toBe(-4);
   });
 });

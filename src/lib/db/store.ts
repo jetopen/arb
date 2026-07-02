@@ -10,6 +10,14 @@ export interface ScanRunRecord {
   partial: boolean;
 }
 
+/** One point in a scan-unit's spread/net trajectory (for the drawer sparkline). 5c. */
+export interface OpportunityHistoryPoint {
+  ts: number;
+  grossSpreadPct: number;
+  netUsd: number;
+  tierUsd: number;
+}
+
 /** Per-unit result fed back after a batch so the queue can demote routes that can't be quoted. */
 export interface ScanOutcome {
   unit: ScanUnit;
@@ -101,6 +109,8 @@ export interface Store {
   /** Record alert ids and return ONLY the ones not previously recorded — dedup so each opportunity
    *  pings once, not every scan tick it stays profitable. */
   filterNewAlerts(ids: string[]): Promise<string[]>;
+  /** Recent spread/net history for one scan-unit id, newest first (for the drawer sparkline). 5c. */
+  opportunityHistory(unitId: string, limit: number): Promise<OpportunityHistoryPoint[]>;
 }
 
 /** Stable scan-unit / opportunity / queue-row id (same format across all three). */
@@ -113,6 +123,7 @@ const unitKey = workUnitId;
 /** In-memory store (Phase 1). Swapped for a Supabase-backed store in Phase 2 via getStore(). */
 export class MemoryStore implements Store {
   private opps = new Map<string, Opportunity>();
+  private history = new Map<string, OpportunityHistoryPoint[]>();
   private queue: { unit: ScanUnit; priority: number; lastScannedAt: number | null; failCount: number }[] = [];
   private queued = new Set<string>();
   private lastRun: ScanRunRecord | null = null;
@@ -128,7 +139,17 @@ export class MemoryStore implements Store {
         timesProfitable: (prev?.timesProfitable ?? 0) + (o.edge.profitable ? 1 : 0),
         firstSeenAt: prev?.firstSeenAt ?? o.computedAt,
       });
+      // Append a history point (bounded ring) — mirrors the SQL history append in arb_upsert_opportunities. 5c.
+      const hist = this.history.get(o.id) ?? [];
+      hist.push({ ts: o.computedAt, grossSpreadPct: o.edge.grossSpreadPct, netUsd: o.edge.netUsd, tierUsd: o.tierUsd });
+      if (hist.length > 500) hist.shift();
+      this.history.set(o.id, hist);
     }
+  }
+
+  async opportunityHistory(unitId: string, limit: number): Promise<OpportunityHistoryPoint[]> {
+    const hist = this.history.get(unitId) ?? [];
+    return hist.slice(-limit).reverse(); // newest first
   }
 
   async topOpportunities(filter: OpportunityFilter): Promise<{ opportunities: Opportunity[]; total: number }> {

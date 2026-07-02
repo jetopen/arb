@@ -347,6 +347,18 @@ describe("MemoryStore adaptive demotion + realized quotability", () => {
     expect(known.has("0xabc:1:56:1000:redemption")).toBe(true);
     expect(known.size).toBe(1);
   });
+
+  it("opportunityHistory records a point per upsert, newest-first, bounded to the limit (5c)", async () => {
+    const s = new MemoryStore();
+    const id = "h:1:56:1000:redemption";
+    await s.upsertOpportunities([opp(id, 0.2, { computedAt: 1000 })]);
+    await s.upsertOpportunities([opp(id, 0.5, { computedAt: 2000 })]);
+    await s.upsertOpportunities([opp(id, 0.8, { computedAt: 3000 })]);
+    const hist = await s.opportunityHistory(id, 2);
+    expect(hist.map((p) => p.grossSpreadPct)).toEqual([0.8, 0.5]); // newest first, capped at 2
+    expect(hist[0].ts).toBe(3000);
+    expect(await s.opportunityHistory("nope", 10)).toEqual([]);
+  });
 });
 
 describe("DEAD_ROUTE_PENALTY_MS env parsing (fix #5)", () => {
