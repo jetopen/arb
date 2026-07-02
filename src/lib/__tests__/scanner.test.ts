@@ -343,6 +343,24 @@ describe("runBatch", () => {
     });
     expect(run.unitsProcessed).toBe(0);
   });
+
+  it("refunds reserved-but-unspent budget when units cost fewer than 2 quotes", async () => {
+    const store = new MemoryStore();
+    await store.enqueue(enumerateUnits(graphOf([fam({})]), [10000]));
+    const budget = new RpmBudget(100, 0);
+    const run = await runBatch(8, {
+      getFamily: () => undefined, // every unit guard-bails at the family lookup → 0 quotes spent
+      fetchQuote: async () => quote({}),
+      getFeeUsd: async () => 0,
+      verify: async () => ({ verified: false, sourcesAgreed: [], quoteDisagreementBps: null, liquidityUsd: null }),
+      store,
+      budget,
+    });
+    expect(run.unitsProcessed).toBe(2);
+    expect(run.quotesSpent).toBe(0);
+    // reserved 2/unit = 4, spent 0 → all refunded (WITHOUT the refund this would read 96)
+    expect(budget.available()).toBe(100);
+  });
 });
 
 describe("parseNotionalLadder", () => {

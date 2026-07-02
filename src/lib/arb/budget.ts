@@ -33,6 +33,17 @@ export class RpmBudget {
     return false;
   }
 
+  /**
+   * Return up to n unspent tokens to the bucket — e.g. a scan unit reserves 2 quotes up front but spends 0
+   * (guard bail) or 1 (first-leg failure), so the remainder must be refunded or the sustained rate collapses
+   * to a fraction of the cap. Never exceeds capacity; a non-positive n is a no-op.
+   */
+  release(n: number, now: number = Date.now()): void {
+    if (n <= 0) return;
+    this.refill(now);
+    this.tokens = Math.min(this.capacity, this.tokens + n);
+  }
+
   available(now: number = Date.now()): number {
     this.refill(now);
     return Math.floor(this.tokens);

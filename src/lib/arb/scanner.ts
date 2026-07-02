@@ -296,6 +296,7 @@ export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord
   const affordable = Math.floor(deps.budget.available() / 2);
   const count = Math.min(n, affordable);
   let units: ScanUnit[] = [];
+  let reserved = 0; // quotes reserved up front (2/unit); the unspent remainder is refunded after the batch
   if (count > 0) {
     units = await deps.store.dequeue(count);
     // Reserve for the units actually dequeued (dequeue may return fewer than `count`). units.length ≤
@@ -303,7 +304,10 @@ export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord
     // scan drained the bucket between available() and here, do NOT scan this tick (skip both scanning
     // and markScanned). The units keep their refreshed lastScannedAt and simply cycle next tick; the
     // point is that concurrent scans never over-spend the RPM budget.
-    if (units.length > 0 && !deps.budget.tryAcquire(units.length * 2)) units = [];
+    if (units.length > 0) {
+      if (deps.budget.tryAcquire(units.length * 2)) reserved = units.length * 2;
+      else units = [];
+    }
   }
 
   const results = await mapPool(units, deps.concurrency ?? 8, (u) =>
@@ -320,11 +324,17 @@ export async function runBatch(n: number, deps: ScanDeps): Promise<ScanRunRecord
       : Promise.resolve(),
   ]);
 
+  // Refund the reserved-but-UNSPENT quotes back to the RPM budget. We reserve 2/unit up front, but a unit
+  // spends 0 on a guard bail (missing family/decimals/kill-switch) and 1 on a first-leg failure — so without
+  // this refund most of the RPM cap was silently thrown away each tick, roughly halving real throughput.
+  const quotesSpent = results.reduce((s, r) => s + r.quotesSpent, 0);
+  if (reserved > quotesSpent) deps.budget.release(reserved - quotesSpent);
+
   const run: ScanRunRecord = {
     startedAt,
     finishedAt: Date.now(),
     unitsProcessed: units.length,
-    quotesSpent: results.reduce((s, r) => s + r.quotesSpent, 0),
+    quotesSpent,
     opportunitiesFound: opps.filter((o) => o.edge.profitable).length,
     partial: false,
   };
