@@ -17,10 +17,10 @@ export async function GET(request: NextRequest) {
       return Number.isFinite(v) ? v : undefined;
     };
     // Freshness gate so stale persistent rows (a route no longer being scanned) can't rank forever.
-    // DECOUPLED from the dead-route penalty: the queue can take well over 6h to cycle when scanning is
-    // sparse, so a 6h read gate hid most still-valid tokens (only those scanned in the last 6h showed).
-    // Default 24h surfaces the full live set; override via ?maxAgeMs= or ARB_OPP_MAX_AGE_MS; maxAgeMs<=0
-    // disables the gate. The env is parsed defensively (falls back to the default on a non-numeric value).
+    // DECOUPLED from the dead-route penalty (this gates what the UI shows; the penalty gates re-scan timing).
+    // Default is DEFAULT_OPP_MAX_AGE_MS = 3h (the continuous loop keeps the proven set fresh well inside it);
+    // override via ?maxAgeMs= or ARB_OPP_MAX_AGE_MS; maxAgeMs<=0 disables the gate. The env is parsed
+    // defensively (falls back to the default on a non-numeric value). /api/health flips 503 on this same window.
     const maxAgeParam = finite("maxAgeMs");
     const maxAgeMs = maxAgeParam ?? parsePenaltyMs(process.env.ARB_OPP_MAX_AGE_MS, DEFAULT_OPP_MAX_AGE_MS);
     const filter: OpportunityFilter = {

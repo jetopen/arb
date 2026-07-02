@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import type { Opportunity } from "@/lib/types";
 import { chainName } from "@/lib/deport/registry";
 import { timeAgo } from "@/lib/time";
+import { executeLinks } from "@/lib/arb/deep-links";
 import { LegAddress } from "./leg-address";
 
 function money(n: number): string {
@@ -67,6 +68,8 @@ export function OpportunityDetail({ opp, onClose }: { opp: Opportunity; onClose:
             <Row label="Net (optimistic)">{money(e.netUsd)}</Row>
             <Row label="Net (after slippage)">{money(e.netUsdConservative)}</Row>
           </Section>
+
+          <ExecuteSection opp={opp} />
 
           <OptimizeSection opp={opp} />
 
@@ -208,6 +211,30 @@ function OptimizeSection({ opp }: { opp: Opportunity }) {
           </p>
         </>
       )}
+    </Section>
+  );
+}
+
+/** Prefilled execution deep-links (bridge + per-leg swaps) built from the route's addresses + registry. */
+function ExecuteSection({ opp }: { opp: Opportunity }) {
+  const links = executeLinks(opp);
+  if (links.length === 0) return null;
+  return (
+    <Section title="Execute">
+      <div className="flex flex-col gap-1.5">
+        {links.map((l) => (
+          <a
+            key={l.url}
+            href={l.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex w-fit items-center gap-1 text-sm text-accent hover:underline"
+          >
+            {l.label} ↗
+          </a>
+        ))}
+      </div>
+      <p className="mt-1 text-xs text-muted">Prefilled — verify amounts before signing. Screener, not an executor.</p>
     </Section>
   );
 }
