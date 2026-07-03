@@ -1,6 +1,6 @@
 import type { Family, LockGraph, Opportunity, OpportunityFilter, ScanUnit } from "../types";
 import type { Store, ScanRunRecord, ScanOutcome, OpportunityHistoryPoint } from "./store";
-import { TRANSIENT_RETRY_MS, HOT_RATIO, PROVEN_MAX_AGE_MS, workUnitId } from "./store";
+import { TRANSIENT_RETRY_MS, HOT_RATIO, HOT_MIN_INTERVAL_MS, PROVEN_MAX_AGE_MS, workUnitId } from "./store";
 import { getServiceClient } from "./supabase";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -201,7 +201,9 @@ export class SupabaseStore implements Store {
     // refresh fast. The RPC leases the hot rows in its first statement, so the cold fill (second statement)
     // can't re-grab them — one round-trip, no double-lease.
     const n_hot = Math.ceil(Math.max(0, n) * HOT_RATIO);
-    const { data, error } = await this.db.rpc("arb_dequeue_batch", { n, n_hot });
+    // hot_min_interval_ms makes the ARB_HOT_MIN_INTERVAL_MS knob authoritative on the SQL path too
+    // (migration 0015; before that the RPC hard-coded 10 min and the env only affected MemoryStore).
+    const { data, error } = await this.db.rpc("arb_dequeue_batch", { n, n_hot, hot_min_interval_ms: HOT_MIN_INTERVAL_MS });
     if (error) throw new Error(`dequeue: ${error.message}`);
     return (data ?? []).map(rowToUnit);
   }
@@ -274,6 +276,16 @@ export class SupabaseStore implements Store {
         .update({ priority: 1 })
         .in("id", slice);
       if (error) throw new Error(`requeueFresh: ${error.message}`);
+    }
+  }
+
+  async deleteUnitsByDebridgeIds(debridgeIds: string[]): Promise<void> {
+    // Majors-denylist cleanup: drop every queued unit for these families. Chunked like requeueFresh so a
+    // large denylist can't blow the URL/param limits. arb_opportunities rows are deliberately untouched.
+    for (let i = 0; i < debridgeIds.length; i += 500) {
+      const slice = debridgeIds.slice(i, i + 500);
+      const { error } = await this.db.from("arb_work_queue").delete().in("debridge_id", slice);
+      if (error) throw new Error(`deleteUnitsByDebridgeIds: ${error.message}`);
     }
   }
 

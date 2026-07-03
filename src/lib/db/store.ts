@@ -99,6 +99,8 @@ export interface Store {
   requeueFresh(ids: string[]): Promise<void>;
   /** Ids of routes that have ever produced a quote (an opportunity row) — the realized-quotability set. */
   knownUnitIds(): Promise<Set<string>>;
+  /** Remove ALL queued units for these families (the majors-denylist cleanup). Opportunities are kept. */
+  deleteUnitsByDebridgeIds(debridgeIds: string[]): Promise<void>;
   queueSize(): Promise<number>;
   recordScanRun(run: ScanRunRecord): Promise<void>;
   lastScanRun(): Promise<ScanRunRecord | null>;
@@ -290,6 +292,16 @@ export class MemoryStore implements Store {
 
   async knownUnitIds(): Promise<Set<string>> {
     return new Set(this.opps.keys());
+  }
+
+  async deleteUnitsByDebridgeIds(debridgeIds: string[]): Promise<void> {
+    if (debridgeIds.length === 0) return;
+    const denied = new Set(debridgeIds);
+    this.queue = this.queue.filter((i) => !denied.has(i.unit.debridgeId));
+    for (const k of this.queued) {
+      // unit ids are `${debridgeId}:…` and debridgeId is 0x-hex (no colon), so the prefix is unambiguous.
+      if (denied.has(k.slice(0, k.indexOf(":")))) this.queued.delete(k);
+    }
   }
 
   async queueSize(): Promise<number> {

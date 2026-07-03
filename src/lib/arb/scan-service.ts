@@ -14,6 +14,7 @@ import { getStore } from "../db/store";
 import { supabaseConfigured } from "../db/supabase";
 import { chainName } from "../deport/registry";
 import { RpmBudget } from "./budget";
+import { passesLiquidityPrefilter } from "./liquidity-prefilter";
 import { runBatch, seedQueue, type ScanDeps } from "./scanner";
 import { optimizeRoute } from "./optimize";
 import { sendDiscordAlert } from "../alerts/providers/discord";
@@ -81,6 +82,9 @@ export async function buildScanDeps(): Promise<ScanDeps> {
     // Tx simulation of the executable path (build → eth_call with state overrides). Gated upstream by
     // ARB_SIMULATE in scanUnit; here we just supply the impl + the deBridge API key for the build calls.
     simulate: (args) => simulateOpportunity({ ...args, apiKey }),
+    // Cached GeckoTerminal liquidity pre-filter for the cold sweep: skips units whose deAsset rep has no
+    // indexed pool at all, for 0 quote spend. Fails open; kill-switch ARB_PREFILTER=false.
+    prefilter: (chainId, address) => passesLiquidityPrefilter(chainId, address),
     store,
     budget: getBudget(),
     concurrency: Number(process.env.ARB_SCAN_CONCURRENCY ?? 8),

@@ -178,6 +178,18 @@ describe("MemoryStore work queue", () => {
     expect(await s.queueSize()).toBe(2);
     expect((await s.dequeue(1))[0].debridgeId).toBe("a"); // 5 > 1
   });
+
+  it("deleteUnitsByDebridgeIds removes every unit of the family and allows re-enqueue afterwards", async () => {
+    const s = new MemoryStore();
+    const u = (id: string, tier: number): ScanUnit => ({ debridgeId: id, buyChainId: 1, sellChainId: 56, tierUsd: tier, kind: "redemption" });
+    await s.enqueue([u("0xdenied", 10), u("0xdenied", 25), u("0xkept", 10)]);
+    await s.deleteUnitsByDebridgeIds(["0xdenied"]);
+    expect(await s.queueSize()).toBe(1);
+    expect((await s.dequeue(10)).map((x) => x.debridgeId)).toEqual(["0xkept"]);
+    // The dedup index is cleaned too: a later reseed (rollback) can re-add the family's units.
+    await s.enqueue([u("0xdenied", 10)]);
+    expect(await s.queueSize()).toBe(2);
+  });
 });
 
 describe("MemoryStore adaptive demotion + realized quotability", () => {

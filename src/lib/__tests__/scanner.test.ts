@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { enumerateUnits, scanUnit, runBatch, seedQueue, parseNotionalLadder, routeKeyOfId, DEFAULT_LADDER, DEFAULT_TIERS, type ScanDeps } from "../arb/scanner";
+import { enumerateUnits, scanUnit, runBatch, seedQueue, parseNotionalLadder, parseDenySymbols, isDeniedFamily, routeKeyOfId, DEFAULT_LADDER, DEFAULT_TIERS, DEFAULT_DENY_SYMBOLS, type ScanDeps } from "../arb/scanner";
 import { MemoryStore } from "../db/store";
 import { RpmBudget } from "../arb/budget";
 import type { DexQuote, Family, LockGraph, Opportunity, SimulationResult } from "../types";
@@ -401,6 +401,96 @@ describe("runBatch", () => {
     expect(run.quotesSpent).toBe(0);
     // reserved 2/unit = 4, spent 0 → all refunded (WITHOUT the refund this would read 96)
     expect(budget.available()).toBe(100);
+  });
+});
+
+describe("majors denylist (3b)", () => {
+  it("parseDenySymbols: unset → defaults; explicit empty → deny nothing; list is trimmed/uppercased", () => {
+    expect(parseDenySymbols(undefined)).toEqual(new Set(DEFAULT_DENY_SYMBOLS));
+    expect(parseDenySymbols("")).toEqual(new Set()); // the rollback lever
+    expect(parseDenySymbols(" , ,")).toEqual(new Set());
+    expect(parseDenySymbols("weth, Usdt ,FOO")).toEqual(new Set(["WETH", "USDT", "FOO"]));
+  });
+
+  it("isDeniedFamily matches case-insensitively and never denies an unknown symbol", () => {
+    expect(isDeniedFamily("WETH")).toBe(true);
+    expect(isDeniedFamily("weth")).toBe(true);
+    expect(isDeniedFamily("TKN")).toBe(false);
+    expect(isDeniedFamily(undefined)).toBe(false);
+  });
+
+  it("enumerateUnits skips denied families entirely", () => {
+    const denied = fam({ debridgeId: "0xweth", symbol: "WETH" });
+    const kept = fam({});
+    const units = enumerateUnits(graphOf([denied, kept]), [1000]);
+    expect(units).toHaveLength(2); // only the kept family's two directions
+    expect(units.every((u) => u.debridgeId === "0xfam")).toBe(true);
+  });
+
+  it("seedQueue deletes previously-enqueued units of denied families", async () => {
+    const store = new MemoryStore();
+    const denied = fam({ debridgeId: "0xweth", symbol: "WETH" });
+    const kept = fam({});
+    // Simulate the pre-denylist state: WETH units already sit in the queue.
+    await store.enqueue([
+      { debridgeId: "0xweth", buyChainId: 42161, sellChainId: 56, tierUsd: 1000, kind: "redemption" },
+      { debridgeId: "0xweth", buyChainId: 56, sellChainId: 42161, tierUsd: 1000, kind: "redemption" },
+    ]);
+    await seedQueue(store, graphOf([denied, kept]), [1000]);
+    expect(await store.queueSize()).toBe(2); // kept family's 2 directions; WETH rows purged
+    const batch = await store.dequeue(10);
+    expect(batch.every((u) => u.debridgeId === "0xfam")).toBe(true);
+  });
+});
+
+describe("scanUnit liquidity pre-filter (3a)", () => {
+  const family = fam({});
+  const route = { debridgeId: "0xfam", buyChainId: 42161, sellChainId: 56, tierUsd: 10000, kind: "redemption" as const };
+  function deps(over: Partial<ScanDeps> = {}): ScanDeps {
+    return {
+      getFamily: () => family,
+      fetchQuote: async (_c, _tokenIn, tokenOut) =>
+        tokenOut === "0xdeasset"
+          ? quote({ amountOut: "100", amountInUsd: 10000, amountOutUsd: 10000 })
+          : quote({ amountOut: "10090000000", amountInUsd: 10090, amountOutUsd: 10090 }),
+      getFeeUsd: async () => 4,
+      verify: async () => ({ verified: true, sourcesAgreed: [], quoteDisagreementBps: null, liquidityUsd: null }),
+      store: new MemoryStore(),
+      budget: new RpmBudget(100, 0),
+      ...over,
+    };
+  }
+
+  it("skips the unit for 0 quotes (live:false, NOT transient) when the prefilter rejects", async () => {
+    const r = await scanUnit(route, deps({ prefilter: async () => false }));
+    expect(r).toEqual({ opportunity: null, quotesSpent: 0, live: false, transient: false });
+  });
+
+  it("probes the deAsset REP side regardless of scan direction", async () => {
+    const probed: Array<[number, string]> = [];
+    const prefilter = async (chainId: number, address: string) => {
+      probed.push([chainId, address]);
+      return true;
+    };
+    await scanUnit(route, deps({ prefilter })); // rep -> home (buy side is the rep)
+    await scanUnit({ ...route, buyChainId: 56, sellChainId: 42161 }, deps({ prefilter })); // home -> rep
+    expect(probed).toEqual([
+      [42161, "0xdeasset"],
+      [42161, "0xdeasset"],
+    ]);
+  });
+
+  it("proceeds to quotes when the prefilter passes, and fails open when it throws", async () => {
+    const pass = await scanUnit(route, deps({ prefilter: async () => true }));
+    expect(pass.live).toBe(true);
+    expect(pass.quotesSpent).toBe(2);
+    const thrown = await scanUnit(route, deps({ prefilter: async () => { throw new Error("GT down"); } }));
+    expect(thrown.live).toBe(true); // fail-open: a prefilter error never hides a route
+  });
+
+  it("scans normally when no prefilter is wired (back-compat)", async () => {
+    const r = await scanUnit(route, deps());
+    expect(r.live).toBe(true);
   });
 });
 

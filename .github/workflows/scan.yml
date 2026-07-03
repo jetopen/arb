@@ -58,7 +58,16 @@ jobs:
           ZEROX_API_KEY: ${{ secrets.ZEROX_API_KEY }}
           # Knobs (plain values are fine — not secret):
           ARB_SCAN_N: "48"
-          ARB_SCAN_RPM: "120" # sustained cap for the WHOLE loop (one shared budget) — lower to ~60 if a provider 429s
+          # Sustained cap for the WHOLE loop (one shared budget). Raised 120→200: a live probe recorded 0×429
+          # at 50-concurrent, and the loop's transient-storm alert (>=50% of a batch transient for 5 ticks →
+          # Discord ping) is the rollback signal — if it fires, drop back toward 120.
+          ARB_SCAN_RPM: "200"
+          # Concurrency 8→12 so ticks can actually spend the bigger budget (2 sequential quotes/unit at ~1-3s
+          # each caps real throughput well under the RPM ceiling at concurrency 8).
+          ARB_SCAN_CONCURRENCY: "12"
+          # Hot-lane refresh floor 10m→5m (needs migration 0015 so the SQL dequeue honors it). Budget check:
+          # ~70 hot rows / 5 min = 14 units/min = 28 quotes/min — small even against the old 120 RPM.
+          ARB_HOT_MIN_INTERVAL_MS: "300000"
           ARB_JUPITER_RPS: "2"
           # Loop knobs (scan:loop): pause between ticks + self-exit deadline (kept < GitHub's 6h job cap).
           ARB_LOOP_INTERVAL_MS: "3000"

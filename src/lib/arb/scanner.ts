@@ -45,6 +45,38 @@ export function parseNotionalLadder(raw: string | undefined): number[] {
 /** Notionals scanned per route — a small ladder; one ScanUnit/Opportunity per (route, direction, size). */
 export const DEFAULT_TIERS = parseNotionalLadder(process.env.ARB_SCAN_NOTIONAL_USD);
 
+/**
+ * Canonical majors whose deAsset reps are never profitable: efficiently priced everywhere, so their
+ * reps only ever show -87…-100% "spreads" while burning a full ladder of quotes per rep per cycle.
+ * seedQueue's priority comment has long acknowledged this class — this denylist finally stops
+ * enumerating it. Matched against the FAMILY symbol (the native root's), uppercased.
+ */
+export const DEFAULT_DENY_SYMBOLS = [
+  "WETH", "ETH", "WBNB", "BNB", "WPOL", "WMATIC", "POL", "WAVAX", "AVAX",
+  "USDT", "USDC", "WBTC", "BTCB", "DAI", "WMNT", "WCRO", "WHYPE",
+];
+
+/**
+ * Parse ARB_SCAN_DENY_SYMBOLS (comma list, case-insensitive) into the deny set. UNSET → the default
+ * majors list; explicitly EMPTY ("" or only whitespace/commas) → deny nothing (the rollback lever).
+ */
+export function parseDenySymbols(raw: string | undefined): Set<string> {
+  if (raw === undefined) return new Set(DEFAULT_DENY_SYMBOLS);
+  return new Set(
+    raw
+      .split(",")
+      .map((s) => s.trim().toUpperCase())
+      .filter((s) => s.length > 0)
+  );
+}
+
+const DENY_SYMBOLS = parseDenySymbols(process.env.ARB_SCAN_DENY_SYMBOLS);
+
+/** true when a family's symbol is on the majors denylist (unknown symbols are never denied). */
+export function isDeniedFamily(symbol: string | undefined, deny: Set<string> = DENY_SYMBOLS): boolean {
+  return symbol !== undefined && deny.has(symbol.toUpperCase());
+}
+
 /** Solana scanning is gated by ARB_SCAN_SOLANA (default on) — a no-deploy kill-switch if Jupiter throttles. */
 function solanaScanEnabled(): boolean {
   return process.env.ARB_SCAN_SOLANA !== "false";
@@ -70,6 +102,7 @@ export function enumerateUnits(graph: LockGraph, tiers: number[] = DEFAULT_TIERS
   for (const f of graph.families) {
     if (!scannableChain(f.nativeChainId)) continue; // need a quotable home leg (EVM, or Solana when enabled)
     if (f.decimals === undefined) continue; // can't confirm the 1:1 raw move is decimal-safe
+    if (isDeniedFamily(f.symbol)) continue; // canonical majors never net out — don't enumerate them
     for (const rep of f.reps) {
       if (rep.internalChainId === f.nativeChainId) continue;
       if (!scannableChain(rep.internalChainId)) continue;
@@ -106,6 +139,9 @@ export interface ScanDeps {
   verify: (args: VerifyArgs) => Promise<Verification>;
   /** Optional tx simulation of the executable path; gated by ARB_SIMULATE. Best-effort (null on failure). */
   simulate?: (args: SimulateArgs) => Promise<SimulationResult | null>;
+  /** Optional liquidity pre-filter (GeckoTerminal, cached): false → the deAsset rep has NO indexed pool,
+   *  so the unit is skipped for 0 quotes instead of burning aggregator calls. MUST fail open (true). */
+  prefilter?: (chainId: number, address: string) => Promise<boolean>;
   store: Store;
   budget: RpmBudget;
   concurrency?: number;
@@ -161,6 +197,18 @@ export async function scanUnit(unit: ScanUnit, deps: ScanDeps): Promise<ScanUnit
   const buyDecimals = memberDecimals(family, unit.buyChainId);
   const sellDecimals = memberDecimals(family, unit.sellChainId);
   if (buyDecimals === undefined || sellDecimals === undefined) return { opportunity: null, quotesSpent: 0, live: false, transient: false };
+
+  // Liquidity PRE-filter on the deAsset REP side (the non-native leg — the thin side; a real family's
+  // native root always has pools): a rep with no indexed pool at all can't quote on either direction, so
+  // bail for 0 quotes and let markScanned's dead-route backoff push the unit out. The prefilter fails
+  // open (true) on any uncertainty, so it can only skip provably-unindexed reps, never hide live routes.
+  if (deps.prefilter) {
+    const repChainId = unit.buyChainId === family.nativeChainId ? unit.sellChainId : unit.buyChainId;
+    const repAddress = memberAddress(family, repChainId);
+    if (repAddress && !(await deps.prefilter(repChainId, repAddress).catch(() => true))) {
+      return { opportunity: null, quotesSpent: 0, live: false, transient: false };
+    }
+  }
 
   let quotesSpent = 0;
   const amountIn = tierToBaseUnits(unit.tierUsd, buyBase);
@@ -370,5 +418,12 @@ export async function seedQueue(store: Store, graph: LockGraph, tiers: number[] 
   // queue front (preserves lastScannedAt).
   const bestUnitIds = units.filter((u) => best.has(opportunityId(u))).map(opportunityId);
   if (bestUnitIds.length > 0) await store.requeueFresh(bestUnitIds).catch(() => {});
+  // Denylist cleanup: enumeration only stops ADDING units for denied majors — units enqueued before the
+  // denylist (or a later-grown one) would keep cycling forever. Deleting by debridgeId self-heals that.
+  // Best-effort: a cleanup failure must never block scanning. Opportunities rows are deliberately kept —
+  // the read-freshness window ages them out naturally. Rollback: ARB_SCAN_DENY_SYMBOLS="" re-enqueues on
+  // the next reseed (enqueue is idempotent from enumerateUnits output).
+  const deniedIds = graph.families.filter((f) => isDeniedFamily(f.symbol)).map((f) => f.debridgeId);
+  if (deniedIds.length > 0) await store.deleteUnitsByDebridgeIds(deniedIds).catch(() => {});
   return units.length;
 }
