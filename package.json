@@ -11,6 +11,8 @@
     "start": "next start",
     "scan:once": "tsx scripts/scan-once.mts",
     "scan:loop": "tsx scripts/scan-loop.mts",
+    "backtest:0x": "tsx scripts/backtest-0x-liveness.mts",
+    "backtest:1inch": "tsx scripts/backtest-1inch-liveness.mts",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "vitest"
