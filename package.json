@@ -13,6 +13,7 @@
     "scan:loop": "tsx scripts/scan-loop.mts",
     "backtest:0x": "tsx scripts/backtest-0x-liveness.mts",
     "backtest:1inch": "tsx scripts/backtest-1inch-liveness.mts",
+    "backtest:hypersync": "tsx scripts/backtest-hypersync-activity.mts",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "vitest"
