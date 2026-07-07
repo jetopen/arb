@@ -11,11 +11,16 @@
 import nextEnv from "@next/env";
 nextEnv.loadEnvConfig(process.cwd(), true);
 
-const LOOKBACK_DAYS = Math.max(Number(process.env.ACTIVITY_LOOKBACK_DAYS) || 7, 0.5);
-const MIN_TRANSFERS = Math.max(Number(process.env.ACTIVITY_MIN_TRANSFERS) || 8, 1);
-const MAX_PAGES = Math.max(Number(process.env.ACTIVITY_MAX_PAGES) || 100, 1);
-const N = Math.min(Math.max(Number(process.env.BACKTEST_N) || 200, 1), 4000); // cap on active reps re-quoted
-const DELAY_MS = Math.max(Number(process.env.BACKTEST_DELAY_MS) || 250, 0);
+// Honor an explicit 0 (Number("0") || d wrongly substitutes the default): only fall back on NaN/absent.
+const envNum = (v: string | undefined, d: number) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+};
+const LOOKBACK_DAYS = Math.max(envNum(process.env.ACTIVITY_LOOKBACK_DAYS, 7), 0.5);
+const MIN_TRANSFERS = Math.max(envNum(process.env.ACTIVITY_MIN_TRANSFERS, 8), 1);
+const MAX_PAGES = Math.max(envNum(process.env.ACTIVITY_MAX_PAGES, 100), 1);
+const N = Math.min(Math.max(envNum(process.env.BACKTEST_N, 200), 1), 4000); // cap on active reps re-quoted
+const DELAY_MS = Math.max(envNum(process.env.BACKTEST_DELAY_MS, 250), 0);
 
 const { getLockGraph } = await import("@/lib/deport/graph");
 const { enumerateUnits, scanUnit } = await import("@/lib/arb/scanner");
@@ -61,8 +66,13 @@ const repKey = (c: number, a: string): RepKey => `${c}:${a.toLowerCase()}`;
 const reps = new Map<RepKey, { chainId: number; address: string; symbol?: string }>();
 const unitsByRep = new Map<RepKey, any[]>();
 
-for (const u of enumerateUnits(graph)) {
-  if (u.tierUsd !== 10 || everLive.has(u.debridgeId)) continue;
+// One tier is enough: the sweep is per-rep (tier-independent) and the re-quote runs at a single tier. Use
+// the SMALLEST enumerated tier rather than a hardcoded 10 — the ladder comes from ARB_SCAN_NOTIONAL_USD and
+// need not contain 10; hardcoding it made the whole gate silently no-op (0 reps) under a custom ladder.
+const allUnits = enumerateUnits(graph);
+const baseTier = Math.min(...[...new Set(allUnits.map((u: any) => u.tierUsd))]);
+for (const u of allUnits) {
+  if (u.tierUsd !== baseTier || everLive.has(u.debridgeId)) continue;
   const r = repOf(u);
   if (!r || !HYPERSYNC_CHAINS.has(r.chainId)) continue;
   const k = repKey(r.chainId, r.address);
@@ -77,6 +87,15 @@ console.log(
   `[activity] graph families=${graph.families.length} everLive=${everLive.size} | dead reps on HyperSync chains: ${reps.size} across ${byChain.size} chains (lookback ${LOOKBACK_DAYS}d, min-transfers ${MIN_TRANSFERS})`
 );
 for (const [c, addrs] of byChain) console.log(`  ${chainName(c).padEnd(12)} (${c}) — ${addrs.length} reps`);
+
+// Guard: an empty dead set (e.g. a graph with no families, or a tier ladder that enumerated nothing) must
+// NOT fall through to the all-zero distribution + "ceiling confirmed" conclusion — that would be a false
+// "settled" verdict from a run that tested nothing.
+if (reps.size === 0) {
+  console.log("\n[activity] dead set is EMPTY — no reps to sweep. This is NOT a 'ceiling confirmed' result;");
+  console.log("[activity] check the graph and the ARB_SCAN_NOTIONAL_USD ladder, then re-run.");
+  process.exit(0);
+}
 
 if (!process.env.ENVIO_API_TOKEN) {
   console.log("\n[activity] ENVIO_API_TOKEN not set — generate one at https://envio.dev/app/api-tokens,");

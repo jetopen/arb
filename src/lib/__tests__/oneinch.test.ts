@@ -85,6 +85,12 @@ describe("oneInchSupported / fetchOneInchQuote", () => {
     expect(await fetchOneInchQuote(1, "0xa", "0xb", "1000000")).toBeNull();
   });
 
+  it("throws on a transient 5xx (so scanUnit classifies it transient, not a 6h dead route)", async () => {
+    process.env.ONEINCH_API_KEY = "k";
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 502, json: async () => ({}) }) as unknown as Response));
+    await expect(fetchOneInchQuote(1, "0xa", "0xb", "1000000")).rejects.toThrow();
+  });
+
   it("throttles: a second call does not fire its request before the min interval elapses", async () => {
     process.env.ONEINCH_API_KEY = "k";
     vi.useFakeTimers();

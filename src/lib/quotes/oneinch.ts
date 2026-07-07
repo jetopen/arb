@@ -1,6 +1,7 @@
 import type { DexQuote } from "../types";
 import { fetchWithRetry } from "../api-client";
 import { internalToEvmChainId } from "../deport/registry";
+import { QuoteHttpError } from "./quote-error";
 
 /**
  * 1inch Swap API (v6.1) routability quote — backtest-gated: currently used ONLY by
@@ -67,8 +68,9 @@ export function parseOneInchQuote(
   };
 }
 
-/** Fetch an independent 1inch (v6.1) quote. Returns null on: no API key, unsupported chain, no route
- *  (HTTP 400), or error. Throttled to ONEINCH_RPS (default 1) for the free tier. */
+/** Fetch an independent 1inch (v6.1) quote. Returns null on no API key / unsupported chain / no route
+ *  (4xx). THROWS QuoteHttpError on a transient 5xx/429 so the caller (scanUnit) applies a short retry
+ *  instead of a 6h dead-route penalty. Throttled to ONEINCH_RPS (default 1) for the free tier. */
 export async function fetchOneInchQuote(
   internalChainId: number,
   tokenIn: string,
@@ -89,10 +91,14 @@ export async function fetchOneInchQuote(
       { method: "GET", headers: { Authorization: `Bearer ${key}`, Accept: "application/json" } },
       { maxRetries: 1 }
     );
-    if (!res.ok) return null; // 400 = no route / not-a-token; other statuses treated the same (best-effort)
+    // 5xx/429 = TRANSIENT upstream: throw so scanUnit applies a short retry, not a 6h dead-route penalty.
+    // 4xx (400/404 = no route / not-a-token) is a genuine dead route → null.
+    if (res.status >= 500 || res.status === 429) throw new QuoteHttpError(res.status, `1inch ${res.status}`);
+    if (!res.ok) return null;
     const json = (await res.json()) as OneInchQuoteResponse;
     return parseOneInchQuote(json, { internalChainId, tokenIn, tokenOut, amountIn });
-  } catch {
-    return null;
+  } catch (e) {
+    if (e instanceof QuoteHttpError) throw e; // transient — let the caller classify it
+    return null; // network / parse hiccup → best-effort null
   }
 }

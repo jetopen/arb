@@ -38,12 +38,20 @@ const store = getStore();
 const known: Set<string> = await store.knownUnitIds().catch(() => new Set<string>());
 const everLive = new Set([...known].map((id) => id.split(":")[0]));
 
-const isDead1inch = (u: any) => u.tierUsd === 10 && !everLive.has(u.debridgeId) && oiChain(u.buyChainId) && oiChain(u.sellChainId);
-const dead = enumerateUnits(graph).filter(isDead1inch).slice(0, N);
+const allUnits = enumerateUnits(graph);
+// Smallest enumerated tier, not a hardcoded 10 (the ladder comes from ARB_SCAN_NOTIONAL_USD and need not
+// contain 10 — hardcoding it makes `dead` empty under a custom ladder and prints a false "settled" verdict).
+const baseTier = Math.min(...[...new Set(allUnits.map((u: any) => u.tierUsd))]);
+const isDead1inch = (u: any) => u.tierUsd === baseTier && !everLive.has(u.debridgeId) && oiChain(u.buyChainId) && oiChain(u.sellChainId);
+const dead = allUnits.filter(isDead1inch).slice(0, N);
 
-// Total dead 1inch-eligible $10 routes (before the cap) — sizes the experiment even without a key.
-const deadTotal = enumerateUnits(graph).filter(isDead1inch).length;
-console.log(`[backtest] graph families=${graph.families.length} everLive=${everLive.size} | dead 1inch-eligible $10 routes: ${deadTotal} total, testing ${dead.length} (cap ${N})`);
+// Total dead 1inch-eligible routes at the base tier (before the cap) — sizes the experiment even without a key.
+const deadTotal = allUnits.filter(isDead1inch).length;
+console.log(`[backtest] graph families=${graph.families.length} everLive=${everLive.size} | dead 1inch-eligible $${baseTier} routes: ${deadTotal} total, testing ${dead.length} (cap ${N})`);
+if (deadTotal === 0) {
+  console.log("[backtest] dead set is EMPTY (no units at the base tier) — nothing to test; NOT a 'settled' result.");
+  process.exit(0);
+}
 
 if (!process.env.ONEINCH_API_KEY) {
   console.log("[backtest] ONEINCH_API_KEY not set — every 1inch leg reads dead, so the quote loop is a no-op.");
@@ -115,6 +123,9 @@ wins.sort((a, b) => b.net - a.net);
 for (const w of wins.slice(0, 15)) {
   console.log(`  ${w.sym.padEnd(12)} ${w.route.padEnd(16)} net $${w.net.toFixed(2).padStart(8)}  gross ${w.gross.toFixed(1)}%  ${w.status}`);
 }
+console.log(`\nNOTE: 1inch's quote endpoint returns no USD value, so amountInUsd/amountOutUsd are 0 → the`);
+console.log(`profitable / net-positive$ / wins columns above are NOT measured for 1inch (structurally 0).`);
+console.log(`Only 'newly-live' (both legs quoted) reflects real 1inch data; the decision rests on it.`);
 console.log(`\nBaseline: the 0x backtest over this same dead set found 0 newly-live / 0 net-positive (of 896).`);
 console.log(`Decision: newly-live > 0 → consider the verify-path 1inch fallback; 0 → the 1inch question is settled, rotate/drop the key.`);
 process.exit(0);

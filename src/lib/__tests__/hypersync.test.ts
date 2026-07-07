@@ -164,18 +164,57 @@ describe("getChainActivity", () => {
     expect(await getChainActivity(1, ["0xAA"], 0, 200)).toBeNull();
   });
 
-  it("stops at maxPages so a very active address can't loop forever", async () => {
+  it("returns null when the maxPages cap is hit before the tip (a partial scan is never returned as complete)", async () => {
     process.env.ENVIO_API_TOKEN = "t";
-    const fetchMock = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      // next_block always advances by 1 but never reaches the end → bounded only by maxPages
-      json: async () => ({ data: [{ logs: [{ address: "0xAA", block_number: 1 }] }], next_block: 2 }),
-    }) as unknown as Response);
+    // Strictly-advancing next_block that never reaches the far end → the loop is bounded ONLY by maxPages.
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const from = JSON.parse(String(init?.body ?? "{}")).from_block as number;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [{ logs: [{ address: "0xAA", block_number: from }] }], next_block: from + 1 }),
+      } as unknown as Response;
+    });
     vi.stubGlobal("fetch", fetchMock);
-    // next_block=2 <= cursor after first page? cursor becomes 2, then 2<=... stays; capped at maxPages
-    await getChainActivity(1, ["0xAA"], 0, 1_000_000, { maxPages: 3 });
-    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(3);
+    const m = await getChainActivity(1, ["0xAA"], 0, 1_000_000, { maxPages: 3 });
+    expect(fetchMock.mock.calls.length).toBe(3); // the cap actually bit
+    expect(m).toBeNull(); // partial (cap before tip) → fail-open null, not a truncated (false-dead) count
+  });
+
+  it("returns null when a mid-stream page fails (never a partial/false-dead count)", async () => {
+    process.env.ENVIO_API_TOKEN = "t";
+    let call = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        call++;
+        if (call === 1)
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ data: [{ logs: [{ address: "0xAA", block_number: 10 }] }], next_block: 100 }),
+          } as unknown as Response;
+        return { ok: false, status: 500 } as unknown as Response; // page 2 outage
+      })
+    );
+    const m = await getChainActivity(1, ["0xAA"], 0, 200);
+    expect(call).toBe(2);
+    expect(m).toBeNull(); // page-1 partial is discarded, not returned
+  });
+
+  it("returns null when a page body fails to parse (fail-open, not an empty false-dead map)", async () => {
+    process.env.ENVIO_API_TOKEN = "t";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => {
+          throw new Error("truncated body");
+        },
+      }) as unknown as Response)
+    );
+    expect(await getChainActivity(1, ["0xAA"], 0, 200)).toBeNull();
   });
 
   it("throttles sequential calls (getHeight) to the min interval", async () => {

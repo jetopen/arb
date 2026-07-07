@@ -15,14 +15,20 @@ export interface HyperSyncChain {
   evmChainId: number;
   /** HyperSync host, e.g. https://eth.hypersync.xyz — POST /query, GET /height. */
   url: string;
-  /** Approximate seconds per block, used to convert a lookback in days into a fromBlock offset. */
+  /**
+   * Approximate seconds per block, used to convert a lookback in days into a fromBlock offset. Bias these
+   * LOW (a lower bound on the real block time): under-estimating widens the swept window, over-estimating
+   * NARROWS it and silently under-samples activity (the fromBlock = height − days·86400/spb math puts spb
+   * in the denominator). A too-slow value is a false-dead risk; a too-fast one just costs a little scan.
+   */
   secondsPerBlock: number;
 }
 
 export const HYPERSYNC_CHAINS = new Map<number, HyperSyncChain>([
   [1, { evmChainId: 1, url: "https://eth.hypersync.xyz", secondsPerBlock: 12 }],
   [10, { evmChainId: 10, url: "https://optimism.hypersync.xyz", secondsPerBlock: 2 }],
-  [56, { evmChainId: 56, url: "https://bsc.hypersync.xyz", secondsPerBlock: 1.5 }],
+  [56, { evmChainId: 56, url: "https://bsc.hypersync.xyz", secondsPerBlock: 0.75 }], // post-Maxwell ~0.75s
+
   [137, { evmChainId: 137, url: "https://polygon.hypersync.xyz", secondsPerBlock: 2 }],
   [8453, { evmChainId: 8453, url: "https://base.hypersync.xyz", secondsPerBlock: 2 }],
   [42161, { evmChainId: 42161, url: "https://arbitrum.hypersync.xyz", secondsPerBlock: 0.25 }],

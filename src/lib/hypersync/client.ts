@@ -141,9 +141,11 @@ export async function getHeight(internalChainId: number): Promise<number | null>
 /**
  * Sweep Transfer activity for MANY rep addresses on one chain in a single query stream (address-array
  * filter), paginating on next_block across the 5-second processing window. Returns a per-address
- * {transferCount,lastBlock} map (addresses with no activity are simply absent), or null on total failure
- * (no successful response / no token / unsupported chain / empty input). FAIL-OPEN: a null return means
- * "unknown", never "dead".
+ * {transferCount,lastBlock} map (addresses with no activity are simply absent), or null when the sweep
+ * can't be COMPLETED to the tip of the requested window (no token / unsupported chain / empty input / any
+ * mid-sweep error / the maxPages cap). FAIL-OPEN: a null return means "unknown", never "dead" — and that
+ * MUST include a partial scan, since a truncated count would look identical to a genuinely-quiet rep and
+ * get mis-classified as dead. So we never return a partial map: it's the fully-scanned window or null.
  */
 export async function getChainActivity(
   internalChainId: number,
@@ -162,7 +164,10 @@ export async function getChainActivity(
   const acc = new Map<string, RepActivity>();
   let cursor = start;
   let pages = 0;
-  let anyOk = false;
+  // Only return `acc` once the window is scanned to the tip. Any interruption — a mid-stream outage, a
+  // parse throw, or the maxPages cap — returns null (unknown) so the caller skips the chain, never a
+  // partial (which would masquerade as a genuinely-quiet rep and mark a live route dead).
+  let completed = false;
   try {
     while (cursor <= end && pages < maxPages) {
       pages++;
@@ -173,16 +178,20 @@ export async function getChainActivity(
         { method: "POST", headers: { Authorization: `Bearer ${token}` }, body },
         { maxRetries: 1 }
       );
-      if (!res.ok) break; // fail-open: return what we have (or null if nothing succeeded)
-      anyOk = true;
-      const json = (await res.json()) as HyperSyncQueryResponse;
+      if (!res.ok) return null; // mid-sweep outage → unknown, NOT a truncated (false-dead) count
+      const json = (await res.json()) as HyperSyncQueryResponse; // parse throw → catch → null
       aggregateActivity(extractLogs(json), acc);
       const nb = nextBlockOf(json);
-      if (nb === undefined || nb <= cursor) break; // no progress → whole range scanned
+      if (nb === undefined || nb > end) {
+        completed = true; // reached the tip of the requested window
+        break;
+      }
+      if (nb <= cursor) return null; // server not advancing → can't guarantee full coverage
       cursor = nb;
     }
+    // Fell out of the loop with completed=false → the maxPages cap bit before the tip: partial, so null.
+    return completed ? acc : null;
   } catch {
-    // fall through — return partial results if any request succeeded, else null
+    return null; // parse / network error mid-sweep → unknown (never a partial map)
   }
-  return anyOk ? acc : null;
 }
