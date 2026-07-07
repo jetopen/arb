@@ -313,13 +313,15 @@ export class SupabaseStore implements Store {
   }
 
   async recordScanRun(run: ScanRunRecord): Promise<void> {
-    const { error } = await this.db.from("arb_scan_runs").insert({
-      started_at: new Date(run.startedAt).toISOString(),
-      finished_at: new Date(run.finishedAt).toISOString(),
-      units_processed: run.unitsProcessed,
-      quotes_spent: run.quotesSpent,
-      opportunities_found: run.opportunitiesFound,
-      partial: run.partial,
+    // RPC (0016) inserts AND prunes the >14d tail in one round trip — the table was append-only
+    // (~6-9k rows/day, unbounded) before. Requires migration 0016 applied ahead of this code.
+    const { error } = await this.db.rpc("arb_record_scan_run", {
+      p_started_at: new Date(run.startedAt).toISOString(),
+      p_finished_at: new Date(run.finishedAt).toISOString(),
+      p_units_processed: run.unitsProcessed,
+      p_quotes_spent: run.quotesSpent,
+      p_opportunities_found: run.opportunitiesFound,
+      p_partial: run.partial,
     });
     if (error) throw new Error(`recordScanRun: ${error.message}`);
   }

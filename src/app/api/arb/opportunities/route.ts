@@ -41,7 +41,9 @@ export async function GET(request: NextRequest) {
     const lastScan = await getStore().lastScanRun();
     // The actual scanned ladder (reflects ARB_SCAN_NOTIONAL_USD) so the UI capital selector offers the
     // rungs that were really scanned — never a hardcoded list that goes stale under an env override.
-    return NextResponse.json({ ...result, lastScan, tiers: DEFAULT_TIERS });
+    // gateMs = the freshness gate applied above, so the UI can alarm when lastScan exceeds the same
+    // window that hides rows here and flips /api/health to 503 (<=0 means the gate is disabled).
+    return NextResponse.json({ ...result, lastScan, tiers: DEFAULT_TIERS, gateMs: maxAgeMs });
   } catch (error) {
     return errorResponse(error, "arb/opportunities");
   }

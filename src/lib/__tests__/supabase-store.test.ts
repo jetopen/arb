@@ -249,6 +249,30 @@ describe("SupabaseStore.markScanned (fake-client contract)", () => {
     expect(transientUpd?.filters.in.vals).toEqual([wid("blip")]);
   });
 
+  it("recordScanRun dispatches the 0016 RPC (insert + 14d inline prune) with mapped p_ params", async () => {
+    const { client, calls } = makeFakeClient();
+    dbHolder.client = client;
+    await new SupabaseStore().recordScanRun({
+      startedAt: 1000,
+      finishedAt: 2000,
+      unitsProcessed: 48,
+      quotesSpent: 96,
+      opportunitiesFound: 3,
+      partial: false,
+    });
+    const call = calls.find((c) => c.rpc === "arb_record_scan_run");
+    expect(call?.args).toEqual({
+      p_started_at: new Date(1000).toISOString(),
+      p_finished_at: new Date(2000).toISOString(),
+      p_units_processed: 48,
+      p_quotes_spent: 96,
+      p_opportunities_found: 3,
+      p_partial: false,
+    });
+    // no plain-table insert remains — the RPC owns both insert and prune
+    expect(calls.find((c) => c.table === "arb_scan_runs")).toBeUndefined();
+  });
+
   it("opportunityHistory reads a unit's points newest-first and maps snake_case + timestamps (5c)", async () => {
     const { client } = makeFakeClient({
       historyRows: [

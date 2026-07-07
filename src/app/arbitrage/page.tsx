@@ -90,7 +90,7 @@ export default function ArbitragePage() {
         rows list but rarely net out. Screener only — not an auto-executor.
       </div>
 
-      <ScanStatus graph={graph} scan={scan.data} lastScan={data?.lastScan} />
+      <ScanStatus graph={graph} scan={scan.data} lastScan={data?.lastScan} gateMs={data?.gateMs} />
 
       {/* View tabs */}
       <div className="flex items-center gap-1 border-b border-border">

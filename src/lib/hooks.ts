@@ -108,6 +108,8 @@ export interface ArbResponse {
   lastScan: ScanRunInfo | null;
   /** The probe-size ladder actually scanned (mirrors ARB_SCAN_NOTIONAL_USD) — drives the capital selector. */
   tiers?: number[];
+  /** Freshness gate (ms) the server applied — lets the UI alarm when lastScan exceeds it (<=0 = disabled). */
+  gateMs?: number;
 }
 
 export interface GraphSummary {
