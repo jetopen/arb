@@ -58,13 +58,18 @@ jobs:
           ZEROX_API_KEY: ${{ secrets.ZEROX_API_KEY }}
           # Knobs (plain values are fine — not secret):
           ARB_SCAN_N: "48"
-          # Sustained cap for the WHOLE loop (one shared budget). Raised 120→200: a live probe recorded 0×429
-          # at 50-concurrent, and the loop's transient-storm alert (>=50% of a batch transient for 5 ticks →
-          # Discord ping) is the rollback signal — if it fires, drop back toward 120.
-          ARB_SCAN_RPM: "200"
-          # Concurrency 8→12 so ticks can actually spend the bigger budget (2 sequential quotes/unit at ~1-3s
-          # each caps real throughput well under the RPM ceiling at concurrency 8).
-          ARB_SCAN_CONCURRENCY: "12"
+          # 2026-07-08 INCIDENT: the transient-storm alert fired for real (48/48 units transient, 5+ ticks).
+          # Root cause: DEBRIDGE_API_KEY was NEVER set as a repo secret — every quote has been hitting
+          # deBridge's UNAUTHENTICATED public estimation endpoint, whose real sustained ceiling is well below
+          # our own RpmBudget's 200/min. Symptom was a clean 2-tick alternation (burst of ~40-77 quotes, then
+          # a near-total 429 storm the next ~30s tick) — a fixed rate-limit window filling/emptying, not a
+          # random outage. The 200→120 "rollback" this comment used to document was never load-tested itself,
+          # so dropping straight to 120 risked storming again; went lower for headroom instead. Concurrency
+          # halved too — high concurrency blows through a short rate window in the first few requests. Durable
+          # fix is a real DEBRIDGE_API_KEY (would very likely allow raising both back up); this is the interim
+          # stopgap the alert message itself recommended ("Consider lowering ARB_SCAN_RPM").
+          ARB_SCAN_RPM: "60"
+          ARB_SCAN_CONCURRENCY: "6"
           # Hot-lane refresh floor 10m→5m (needs migration 0015 so the SQL dequeue honors it). Budget check:
           # ~70 hot rows / 5 min = 14 units/min = 28 quotes/min — small even against the old 120 RPM.
           ARB_HOT_MIN_INTERVAL_MS: "300000"
