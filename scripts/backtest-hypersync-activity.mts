@@ -27,13 +27,8 @@ const { enumerateUnits, scanUnit } = await import("@/lib/arb/scanner");
 const { getStore } = await import("@/lib/db/store");
 const { getFixedFeeUsd } = await import("@/lib/deport/fees");
 const { getNativeUsd } = await import("@/lib/quotes/native-price");
-const { verifyCandidate, verifyViaGeckoTerminal } = await import("@/lib/quotes/verify");
-const { fetchKyberQuote, kyberSlug } = await import("@/lib/quotes/kyberswap");
-const { fetchZeroExQuote } = await import("@/lib/quotes/zerox");
-const { getPoolLiquidityUsd, getTokenStats } = await import("@/lib/liquidity/geckoterminal");
-const { fetchDexQuote } = await import("@/lib/quotes/debridge");
-const { fetchJupiterQuote } = await import("@/lib/quotes/jupiter");
-const { SOLANA_INTERNAL_ID } = await import("@/lib/deport/address-codec");
+const { makeScanQuoteFetcher } = await import("@/lib/quotes/scan-quote");
+const { buildVerify } = await import("@/lib/arb/scan-service");
 const { HYPERSYNC_CHAINS } = await import("@/lib/hypersync/chains");
 const { getHeight, getChainActivity } = await import("@/lib/hypersync/client");
 const { chainName } = await import("@/lib/deport/registry");
@@ -160,16 +155,13 @@ console.log(`\n[activity] re-quoting ${shortlist.length} active-but-dead reps (>
 const apiKey = process.env.DEBRIDGE_API_KEY || undefined;
 const deps: any = {
   getFamily: (id: string) => famMap.get(id),
-  // REAL scan path: deBridge estimation for EVM, Jupiter for Solana. NO prefilter — the point is to quote
-  // reps HyperSync flags active even where the GeckoTerminal prefilter would skip them (GRASS/MGLD class).
-  fetchQuote: (c: number, i: string, o: string, a: string) =>
-    c === SOLANA_INTERNAL_ID ? fetchJupiterQuote(i, o, a) : fetchDexQuote(c, i, o, a, apiKey),
+  // REAL scan path via the shared router (Kyber-primary / deBridge for the rest / Jupiter for Solana).
+  // NO prefilter — the point is to quote reps HyperSync flags active even where the GeckoTerminal
+  // prefilter would skip them (GRASS/MGLD class).
+  fetchQuote: makeScanQuoteFetcher(apiKey),
   getFeeUsd: async (chainId: number, dbId: string) => getFixedFeeUsd(chainId, dbId as any, await getNativeUsd(chainId)),
-  // Mirror buildScanDeps: judge net-positive AFTER the real verify gate (kills the ~100% artifacts).
-  verify: (args: any) =>
-    kyberSlug(args.buyChainId) && kyberSlug(args.sellChainId)
-      ? verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd, fetchZeroEx: fetchZeroExQuote })
-      : verifyViaGeckoTerminal(args, { getTokenStats, fetchZeroEx: fetchZeroExQuote }),
+  // Mirror buildScanDeps exactly — same source-aware verify (kills the ~100% artifacts).
+  verify: buildVerify(apiKey),
 };
 
 let tested = 0, newlyLive = 0, profitable = 0, verified = 0, routable = 0, netPositive = 0;

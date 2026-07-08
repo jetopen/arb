@@ -164,17 +164,22 @@ async function rehabThinBuyLegVia0x(
 }
 
 export interface VerifyDeps {
-  fetchKyber: (
+  /** The INDEPENDENT cross-check quote — must be a different source than the one that produced the scan
+   *  quote (Kyber when deBridge scanned; deBridge when Kyber scans, post the 2026-07-08 source swap). */
+  fetchCrossCheck: (
     chainId: number,
     tokenIn: string,
     tokenOut: string,
     amountIn: string
   ) => Promise<DexQuote | null>;
+  /** Label for the cross-check source in sourcesAgreed badges (default "kyberswap"). */
+  crossCheckSource?: string;
   getLiquidityUsd: (chainId: number, tokenAddr: string) => Promise<number | null>;
-  /** 0x aggregator quote — fallback when Kyber can't corroborate a leg (no route on a pool 1inch/0x covers
-   *  but Kyber doesn't). Absent → that leg degrades to `aggregatorRoutable` instead of a hard reject. */
+  /** 0x aggregator quote — fallback when the cross-check can't corroborate a leg (no route on a pool
+   *  1inch/0x covers but it doesn't). Absent → that leg degrades to `aggregatorRoutable` instead of a
+   *  hard reject. */
   fetchZeroEx?: FetchAggregator;
-  /** Max allowed disagreement between deBridge and Kyber, in bps (default 200). */
+  /** Max allowed disagreement between the scan quote and the cross-check, in bps (default 200). */
   toleranceBps?: number;
   /** Max 0x-vs-quote output shortfall, in bps, before it counts as a phantom (default 500 — looser than the
    *  Kyber USD check because it's an aggregator-route vs aggregator-route token comparison). */
@@ -195,6 +200,11 @@ export interface VerifyDeps {
 export async function verifyCandidate(args: VerifyArgs, deps: VerifyDeps): Promise<Verification> {
   const tolerance = deps.toleranceBps ?? 200;
   const minMult = deps.minLiquidityMultiple ?? 1;
+  // Source labels: `primary` names whatever produced the SCAN quote (deBridge historically; Kyber on the
+  // swapped chains); `cross` names the independent cross-check. NOTE args.debridgeBuyAmountOutUsd now means
+  // "the scan source's buy-leg output USD" — the field keeps its name to avoid churn across scanner/tests.
+  const primary = args.buyQuoteSource ?? "debridge";
+  const cross = deps.crossCheckSource ?? "kyberswap";
 
   const [buyLiq, sellLiq] = await Promise.all([
     legLiquidity(deps.getLiquidityUsd, args.buyChainId, args.buyTokenAddress),
@@ -211,51 +221,51 @@ export async function verifyCandidate(args: VerifyArgs, deps: VerifyDeps): Promi
   if (gate.thinLeg) {
     // Thin BUY leg whose sell side cleared the gate: 0x-route the full tier before rejecting (SWYCH class).
     const rehab = await rehabThinBuyLegVia0x(
-      args, deps.fetchZeroEx, deps.zeroExToleranceBps ?? 500, gate.thinLeg, sellLiq, args.tierUsd, minMult, "debridge"
+      args, deps.fetchZeroEx, deps.zeroExToleranceBps ?? 500, gate.thinLeg, sellLiq, args.tierUsd, minMult, primary
     );
-    return rehab ?? thinLegRejection(gate.thinLeg, args.tierUsd, "debridge");
+    return rehab ?? thinLegRejection(gate.thinLeg, args.tierUsd, primary);
   }
   const liquidityUsd = gate.liquidityUsd;
 
-  let kyber: DexQuote | null = null;
+  let crossQuote: DexQuote | null = null;
   try {
-    kyber = await deps.fetchKyber(args.buyChainId, args.usdcAddress, args.buyTokenAddress, args.amountInUsdcUnits);
+    crossQuote = await deps.fetchCrossCheck(args.buyChainId, args.usdcAddress, args.buyTokenAddress, args.amountInUsdcUnits);
   } catch {
-    kyber = null;
+    crossQuote = null;
   }
 
   const db = args.debridgeBuyAmountOutUsd;
-  // Independent USD cross-check via Kyber — only meaningful when BOTH deBridge and Kyber priced the output.
-  let kyberDisagreementBps: number | null = null;
-  if (kyber && kyber.amountOutUsd > 0 && db > 0) {
-    kyberDisagreementBps = (Math.abs(kyber.amountOutUsd - db) / db) * 10_000;
-    if (kyberDisagreementBps <= tolerance) {
-      return { verified: true, sourcesAgreed: ["debridge", "kyberswap"], quoteDisagreementBps: kyberDisagreementBps, liquidityUsd };
+  // Independent USD cross-check — only meaningful when BOTH the scan source and the cross-check priced the output.
+  let crossDisagreementBps: number | null = null;
+  if (crossQuote && crossQuote.amountOutUsd > 0 && db > 0) {
+    crossDisagreementBps = (Math.abs(crossQuote.amountOutUsd - db) / db) * 10_000;
+    if (crossDisagreementBps <= tolerance) {
+      return { verified: true, sourcesAgreed: [primary, cross], quoteDisagreementBps: crossDisagreementBps, liquidityUsd };
     }
-    // Kyber disagrees — but it routes fewer pools than 1inch/0x; fall through to a 0x token-level check to tell
-    // a real phantom (0x also can't match the quote) from a Kyber coverage gap, rather than reject outright.
+    // Cross-check disagrees — but it may route fewer pools; fall through to a 0x token-level check to tell
+    // a real phantom (0x also can't match the quote) from a coverage gap, rather than reject outright.
   }
 
-  // 0x fallback (token-level). Covers: Kyber returned no route, deBridge couldn't USD-price the output
-  // (db <= 0 → the old "sources disagree Infinitybps", the MGLD case), or Kyber disagreed. Compares 0x's
-  // routed output against deBridge's buy-leg output in the same (buy-token) base units.
+  // 0x fallback (token-level). Covers: cross-check returned no route, the scan source couldn't USD-price the
+  // output (db <= 0 → the old "sources disagree Infinitybps", the MGLD case), or the cross-check disagreed.
+  // Compares 0x's routed output against the scan quote's buy-leg output in the same (buy-token) base units.
   const expectedBuyOut = args.buyAmountOut != null ? Number(args.buyAmountOut) : 0;
   const conf = await confirmLegVia0x(
     deps.fetchZeroEx, args.buyChainId, args.usdcAddress, args.buyTokenAddress, args.amountInUsdcUnits,
     expectedBuyOut, deps.zeroExToleranceBps ?? 500
   );
   if (conf === "confirmed") {
-    return { verified: true, sourcesAgreed: ["debridge", "0x"], quoteDisagreementBps: kyberDisagreementBps, liquidityUsd };
+    return { verified: true, sourcesAgreed: [primary, "0x"], quoteDisagreementBps: crossDisagreementBps, liquidityUsd };
   }
   if (conf === "disagrees") {
-    return { verified: false, sourcesAgreed: ["debridge", "0x"], quoteDisagreementBps: null, liquidityUsd, rejectReason: "0x output below quote" };
+    return { verified: false, sourcesAgreed: [primary, "0x"], quoteDisagreementBps: null, liquidityUsd, rejectReason: "0x output below quote" };
   }
-  // 0x couldn't confirm. If Kyber ACTIVELY disagreed (routed but well off the quote), keep that as a phantom
-  // reject. If Kyber merely had no route (no opinion), deBridge (=1inch) still routes it → surface as routable.
-  if (kyberDisagreementBps != null) {
-    return { verified: false, sourcesAgreed: ["debridge"], quoteDisagreementBps: kyberDisagreementBps, liquidityUsd, rejectReason: `sources disagree ${Math.round(kyberDisagreementBps)}bps` };
+  // 0x couldn't confirm. If the cross-check ACTIVELY disagreed (routed but well off the quote), keep that as
+  // a phantom reject. If it merely had no route (no opinion), the scan source still routes it → routable.
+  if (crossDisagreementBps != null) {
+    return { verified: false, sourcesAgreed: [primary], quoteDisagreementBps: crossDisagreementBps, liquidityUsd, rejectReason: `sources disagree ${Math.round(crossDisagreementBps)}bps` };
   }
-  return { verified: false, aggregatorRoutable: true, sourcesAgreed: ["debridge"], quoteDisagreementBps: null, liquidityUsd };
+  return { verified: false, aggregatorRoutable: true, sourcesAgreed: [primary], quoteDisagreementBps: null, liquidityUsd };
 }
 
 export interface GeckoTerminalVerifyDeps {

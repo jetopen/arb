@@ -42,7 +42,7 @@ describe("verifyCandidate", () => {
   it("verifies when both legs are deep and Kyber agrees", async () => {
     const deps: VerifyDeps = {
       getLiquidityUsd: async () => 5_000_000, // deep on both legs
-      fetchKyber: async () => kyberQuote(10010), // 10 bps off -> within tolerance
+      fetchCrossCheck: async () => kyberQuote(10010), // 10 bps off -> within tolerance
     };
     const v = await verifyCandidate(baseArgs, deps);
     expect(v.verified).toBe(true);
@@ -54,7 +54,7 @@ describe("verifyCandidate", () => {
     // Both legs clear the tier; the reported liquidity must be the thinner of the two (not buy-only/max).
     const deps: VerifyDeps = {
       getLiquidityUsd: async (chainId) => (chainId === 42161 ? 8_000_000 : 2_000_000), // sell leg is the min
-      fetchKyber: async () => kyberQuote(10010),
+      fetchCrossCheck: async () => kyberQuote(10010),
     };
     const v = await verifyCandidate(baseArgs, deps);
     expect(v.verified).toBe(true);
@@ -64,7 +64,7 @@ describe("verifyCandidate", () => {
   it("does not reject on a lone unknown (null) sell leg; reports the known (buy) leg", async () => {
     const deps: VerifyDeps = {
       getLiquidityUsd: async (chainId) => (chainId === 42161 ? 5_000_000 : null), // sell unknown
-      fetchKyber: async () => kyberQuote(10010),
+      fetchCrossCheck: async () => kyberQuote(10010),
     };
     const v = await verifyCandidate(baseArgs, deps);
     expect(v.verified).toBe(true); // null leg is unverified-not-rejected
@@ -74,7 +74,7 @@ describe("verifyCandidate", () => {
   it("rejects when the BUY-leg pool is below the tier (phantom fill)", async () => {
     const deps: VerifyDeps = {
       getLiquidityUsd: async (chainId) => (chainId === 42161 ? 2_000 : 5_000_000), // buy thin
-      fetchKyber: async () => kyberQuote(10010),
+      fetchCrossCheck: async () => kyberQuote(10010),
     };
     const v = await verifyCandidate(baseArgs, deps);
     expect(v.verified).toBe(false);
@@ -87,7 +87,7 @@ describe("verifyCandidate", () => {
     // The realizable-proceeds (sell) side is thin — pre-existing home->rep blind spot. Must now reject.
     const deps: VerifyDeps = {
       getLiquidityUsd: async (chainId) => (chainId === 56 ? 1_000 : 5_000_000), // sell (chain 56) thin
-      fetchKyber: async () => kyberQuote(10010),
+      fetchCrossCheck: async () => kyberQuote(10010),
     };
     const v = await verifyCandidate(baseArgs, deps);
     expect(v.verified).toBe(false);
@@ -100,7 +100,7 @@ describe("verifyCandidate", () => {
     // Regression guard: the rejection must name the true minimum leg, not just the first one iterated.
     const deps: VerifyDeps = {
       getLiquidityUsd: async (chainId) => (chainId === 42161 ? 2_000 : 500), // buy 2k, sell (56) 500 = min
-      fetchKyber: async () => kyberQuote(10010),
+      fetchCrossCheck: async () => kyberQuote(10010),
     };
     const v = await verifyCandidate(baseArgs, deps);
     expect(v.verified).toBe(false);
@@ -111,7 +111,7 @@ describe("verifyCandidate", () => {
   it("rejects when the two sources disagree beyond tolerance", async () => {
     const deps: VerifyDeps = {
       getLiquidityUsd: async () => 5_000_000,
-      fetchKyber: async () => kyberQuote(9000), // 1000 bps off
+      fetchCrossCheck: async () => kyberQuote(9000), // 1000 bps off
     };
     const v = await verifyCandidate(baseArgs, deps);
     expect(v.verified).toBe(false);
@@ -123,7 +123,7 @@ describe("verifyCandidate", () => {
     // The MGLD class: Kyber has no route and 0x is unavailable (no key). Not a phantom — surface as routable.
     const deps: VerifyDeps = {
       getLiquidityUsd: async () => null, // unknown liquidity on both legs -> not a rejection
-      fetchKyber: async () => null, // e.g. Kyber can't route the deAsset rep
+      fetchCrossCheck: async () => null, // e.g. Kyber can't route the deAsset rep
     };
     const v = await verifyCandidate(baseArgs, deps);
     expect(v.verified).toBe(false);
@@ -144,7 +144,7 @@ describe("verifyCandidate — 0x fallback (the MGLD false-negative class)", () =
     process.env.ZEROX_API_KEY = "test"; // buyChainId 42161 (Arbitrum) is 0x-supported
     const deps: VerifyDeps = {
       getLiquidityUsd: async (c) => (c === 42161 ? 5_000_000 : null), // buy deep, sell rep unknown (GT misses it)
-      fetchKyber: async () => null, // Kyber can't route the rep — the MGLD case
+      fetchCrossCheck: async () => null, // Kyber can't route the rep — the MGLD case
       fetchZeroEx: async () => zeroExQuote("1000000"), // 0x routes it at ~the deBridge output
     };
     const v = await verifyCandidate(argsWithOut, deps);
@@ -156,7 +156,7 @@ describe("verifyCandidate — 0x fallback (the MGLD false-negative class)", () =
     process.env.ZEROX_API_KEY = "test";
     const deps: VerifyDeps = {
       getLiquidityUsd: async (c) => (c === 42161 ? 5_000_000 : null),
-      fetchKyber: async () => null,
+      fetchCrossCheck: async () => null,
       fetchZeroEx: async () => null, // 0x finds no route either
     };
     const v = await verifyCandidate(argsWithOut, deps);
@@ -169,7 +169,7 @@ describe("verifyCandidate — 0x fallback (the MGLD false-negative class)", () =
     process.env.ZEROX_API_KEY = "test";
     const deps: VerifyDeps = {
       getLiquidityUsd: async () => 5_000_000,
-      fetchKyber: async () => null,
+      fetchCrossCheck: async () => null,
       fetchZeroEx: async () => zeroExQuote("500000"), // 0x gets 50% less → quote was optimistic
     };
     const v = await verifyCandidate(argsWithOut, deps);
@@ -182,7 +182,7 @@ describe("verifyCandidate — 0x fallback (the MGLD false-negative class)", () =
     process.env.ZEROX_API_KEY = "test";
     const deps: VerifyDeps = {
       getLiquidityUsd: async () => 5_000_000,
-      fetchKyber: async () => kyberQuote(9000), // 1000 bps off
+      fetchCrossCheck: async () => kyberQuote(9000), // 1000 bps off
       fetchZeroEx: async () => null, // 0x can't corroborate → the disagreement stands
     };
     const v = await verifyCandidate(argsWithOut, deps);
@@ -204,7 +204,7 @@ describe("verifyCandidate — thin-leg 0x rehab (the SWYCH $3-pool class)", () =
     process.env.ZEROX_API_KEY = "test";
     const deps: VerifyDeps = {
       getLiquidityUsd: async (c) => (c === 42161 ? 2_000 : 5_000_000), // buy thin ($2k), sell deep
-      fetchKyber: async () => null, // never reached (thin gate is first), but required by the type
+      fetchCrossCheck: async () => null, // never reached (thin gate is first), but required by the type
       fetchZeroEx: async () => zeroExQuote("1000000"), // 0x fills the full $10k tier at ~the deBridge output
     };
     const v = await verifyCandidate(argsThin, deps);
@@ -218,7 +218,7 @@ describe("verifyCandidate — thin-leg 0x rehab (the SWYCH $3-pool class)", () =
     process.env.ZEROX_API_KEY = "test";
     const deps: VerifyDeps = {
       getLiquidityUsd: async (c) => (c === 42161 ? 2_000 : 5_000_000),
-      fetchKyber: async () => null,
+      fetchCrossCheck: async () => null,
       fetchZeroEx: async () => null, // 0x can't fill the tier either → observed thinness stands
     };
     const v = await verifyCandidate(argsThin, deps);
@@ -231,7 +231,7 @@ describe("verifyCandidate — thin-leg 0x rehab (the SWYCH $3-pool class)", () =
     delete process.env.ZEROX_API_KEY; // 0x unsupported → rehab returns null
     const deps: VerifyDeps = {
       getLiquidityUsd: async (c) => (c === 42161 ? 2_000 : 5_000_000),
-      fetchKyber: async () => null,
+      fetchCrossCheck: async () => null,
       fetchZeroEx: async () => zeroExQuote("1000000"), // present, but no key → never consulted
     };
     const v = await verifyCandidate(argsThin, deps);
@@ -243,7 +243,7 @@ describe("verifyCandidate — thin-leg 0x rehab (the SWYCH $3-pool class)", () =
     process.env.ZEROX_API_KEY = "test";
     const deps: VerifyDeps = {
       getLiquidityUsd: async (c) => (c === 56 ? 2_000 : 5_000_000), // sell (chain 56) thin, buy deep
-      fetchKyber: async () => null,
+      fetchCrossCheck: async () => null,
       fetchZeroEx: async () => zeroExQuote("1000000"), // even if 0x would confirm the buy, sell stays unchecked
     };
     const v = await verifyCandidate(argsThin, deps);
@@ -255,7 +255,7 @@ describe("verifyCandidate — thin-leg 0x rehab (the SWYCH $3-pool class)", () =
     process.env.ZEROX_API_KEY = "test";
     const deps: VerifyDeps = {
       getLiquidityUsd: async (c) => (c === 42161 ? 2_000 : 1_000), // buy $2k, sell $1k — both < $10k tier
-      fetchKyber: async () => null,
+      fetchCrossCheck: async () => null,
       fetchZeroEx: async () => zeroExQuote("1000000"),
     };
     const v = await verifyCandidate(argsThin, deps);
@@ -492,5 +492,42 @@ describe("quote/liquidity parsers", () => {
     expect(parsePriceUsd({})).toBeNull();
     expect(parsePriceUsd({ data: { attributes: { price_usd: "0" } } })).toBeNull();
     expect(parsePriceUsd({ data: { attributes: { price_usd: "-5" } } })).toBeNull();
+  });
+});
+
+describe("verifyCandidate source-label parameterization (Kyber-primary swap)", () => {
+  it("labels sourcesAgreed [kyberswap, debridge] when Kyber scanned and deBridge cross-checks", async () => {
+    const v = await verifyCandidate(
+      { ...baseArgs, buyQuoteSource: "kyberswap" },
+      { getLiquidityUsd: async () => 5_000_000, fetchCrossCheck: async () => kyberQuote(10010), crossCheckSource: "debridge" }
+    );
+    expect(v.verified).toBe(true);
+    expect(v.sourcesAgreed).toEqual(["kyberswap", "debridge"]);
+  });
+
+  it("uses the primary label on thin-leg rejects and disagree rejects", async () => {
+    // thin leg: min liquidity below tier — reject names the scan source
+    const thin = await verifyCandidate(
+      { ...baseArgs, buyQuoteSource: "kyberswap", buyChainId: 56 }, // buy=56 so thinLeg(sell 42161) isn't rehab-able
+      { getLiquidityUsd: async (c) => (c === 56 ? 5_000_000 : 100), fetchCrossCheck: async () => null, crossCheckSource: "debridge" }
+    );
+    expect(thin.verified).toBe(false);
+    expect(thin.sourcesAgreed).toEqual(["kyberswap"]);
+    // active disagree: cross-check routed but way off → phantom reject under the primary label
+    const dis = await verifyCandidate(
+      { ...baseArgs, buyQuoteSource: "kyberswap" },
+      { getLiquidityUsd: async () => 5_000_000, fetchCrossCheck: async () => kyberQuote(9000), crossCheckSource: "debridge" }
+    );
+    expect(dis.verified).toBe(false);
+    expect(dis.sourcesAgreed).toEqual(["kyberswap"]);
+    expect(dis.rejectReason).toContain("sources disagree");
+  });
+
+  it("keeps legacy default labels for callers that pass no source hints", async () => {
+    const v = await verifyCandidate(baseArgs, {
+      getLiquidityUsd: async () => 5_000_000,
+      fetchCrossCheck: async () => kyberQuote(10010),
+    });
+    expect(v.sourcesAgreed).toEqual(["debridge", "kyberswap"]);
   });
 });

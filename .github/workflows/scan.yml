@@ -58,18 +58,21 @@ jobs:
           ZEROX_API_KEY: ${{ secrets.ZEROX_API_KEY }}
           # Knobs (plain values are fine — not secret):
           ARB_SCAN_N: "48"
-          # 2026-07-08 INCIDENT: the transient-storm alert fired for real (48/48 units transient, 5+ ticks).
-          # Root cause: DEBRIDGE_API_KEY was NEVER set as a repo secret — every quote has been hitting
-          # deBridge's UNAUTHENTICATED public estimation endpoint, whose real sustained ceiling is well below
-          # our own RpmBudget's 200/min. Symptom was a clean 2-tick alternation (burst of ~40-77 quotes, then
-          # a near-total 429 storm the next ~30s tick) — a fixed rate-limit window filling/emptying, not a
-          # random outage. The 200→120 "rollback" this comment used to document was never load-tested itself,
-          # so dropping straight to 120 risked storming again; went lower for headroom instead. Concurrency
-          # halved too — high concurrency blows through a short rate window in the first few requests. Durable
-          # fix is a real DEBRIDGE_API_KEY (would very likely allow raising both back up); this is the interim
-          # stopgap the alert message itself recommended ("Consider lowering ARB_SCAN_RPM").
-          ARB_SCAN_RPM: "60"
-          ARB_SCAN_CONCURRENCY: "6"
+          # 2026-07-08 INCIDENT + DURABLE FIX: unauthenticated deBridge estimation 429-stormed at 200 RPM
+          # (clean 2-tick alternation = a rate window filling/emptying); stopgapped to 60/6. Durable fix
+          # (this config): KyberSwap (key-free) is now the PRIMARY scan quote source on its 10 slugged
+          # chains (scan-quote.ts router); deBridge only serves the 6 uncovered chains (HyperEVM/Sei/Flow/
+          # Monad/MegaETH/Tron) + the verify cross-check — residual volume well under its unauth ceiling.
+          # So RPM/concurrency go back to the designed targets. ROLLBACK (workflow-env only, no redeploy):
+          # ARB_SCAN_KYBER: "false" + RPM 60 / CONCURRENCY 6 reverts to deBridge-primary at the safe rate.
+          # If Kyber itself storms (the alert fires): halve ARB_KYBER_RPS first.
+          ARB_SCAN_RPM: "200"
+          ARB_SCAN_CONCURRENCY: "12"
+          # Kyber per-source burst-smoothing (its limit is unpublished): 5 RPS never binds at 200 RPM
+          # steady-state; it stops concurrency-12 spikes. Optional knobs, defaults in code:
+          # ARB_SCAN_KYBER (kill-switch), ARB_SCAN_1INCH_FALLBACK, ARB_SCAN_SLIPPAGE_FLOOR_BPS (50),
+          # ARB_KYBER_CLIENT_ID ("arb-scanner").
+          ARB_KYBER_RPS: "5"
           # Hot-lane refresh floor 10m→5m (needs migration 0015 so the SQL dequeue honors it). Budget check:
           # ~70 hot rows / 5 min = 14 units/min = 28 quotes/min — small even against the old 120 RPM.
           ARB_HOT_MIN_INTERVAL_MS: "300000"

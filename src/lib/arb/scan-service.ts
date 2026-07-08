@@ -1,8 +1,7 @@
 import type { Hex } from "viem";
 import { getLockGraph } from "../deport/graph";
 import { fetchDexQuote } from "../quotes/debridge";
-import { fetchJupiterQuote } from "../quotes/jupiter";
-import { SOLANA_INTERNAL_ID } from "../deport/address-codec";
+import { makeScanQuoteFetcher } from "../quotes/scan-quote";
 import { getFixedFeeUsd } from "../deport/fees";
 import { getNativeUsd } from "../quotes/native-price";
 import { verifyCandidate, verifyViaGeckoTerminal } from "../quotes/verify";
@@ -30,6 +29,32 @@ function getBudget(): RpmBudget {
 // get enqueued. Tracking builtAt (not a one-shot boolean) avoids a queueSize() round-trip every tick
 // while still propagating new routes. seedQueue's enqueue is idempotent (dedup / ON CONFLICT).
 let seededGraphAt = 0;
+
+/**
+ * Source-aware verify dispatch, shared by buildScanDeps and the backtest scripts (which mirror it).
+ * Independence rule: the cross-check must come from a DIFFERENT source than the scan quote. Kyber is the
+ * scan source on Kyber-slugged chains (post the 2026-07-08 deBridge-429 swap), so there the cross-check is
+ * deBridge estimation — its verify-only volume (profitable candidates, a handful/day) sits comfortably
+ * under the unauthenticated ceiling. Keying on args.buyQuoteSource (not the env) keeps verify consistent
+ * with whatever source ACTUALLY produced the quote, even across a mid-run ARB_SCAN_KYBER flip. A
+ * 1inch-sourced buy leg (fallback rung) lands in the else branch → Kyber cross-check → still independent.
+ */
+export function buildVerify(apiKey?: string): ScanDeps["verify"] {
+  return (args) => {
+    if (!(kyberSlug(args.buyChainId) && kyberSlug(args.sellChainId))) {
+      return verifyViaGeckoTerminal(args, { getTokenStats, fetchZeroEx: fetchZeroExQuote });
+    }
+    const kyberIsPrimary = args.buyQuoteSource === "kyberswap";
+    return verifyCandidate(args, {
+      fetchCrossCheck: kyberIsPrimary
+        ? (c, i, o, a) => fetchDexQuote(c, i, o, a, apiKey).catch(() => null)
+        : fetchKyberQuote,
+      crossCheckSource: kyberIsPrimary ? "debridge" : "kyberswap",
+      getLiquidityUsd: getPoolLiquidityUsd,
+      fetchZeroEx: fetchZeroExQuote,
+    });
+  };
+}
 
 /** Wire the production scan dependencies (real quotes, fees, verification) onto the cached graph. */
 export async function buildScanDeps(): Promise<ScanDeps> {
@@ -65,20 +90,18 @@ export async function buildScanDeps(): Promise<ScanDeps> {
 
   return {
     getFamily: (id) => famMap.get(id),
-    fetchQuote: (c, i, o, a) =>
-      c === SOLANA_INTERNAL_ID ? fetchJupiterQuote(i, o, a) : fetchDexQuote(c, i, o, a, apiKey),
+    // Per-chain source routing (scan-quote.ts): Jupiter for Solana, Kyber for its 10 slugged chains,
+    // deBridge estimation for the rest — with the optional 1inch last-resort rung on Kyber transients.
+    fetchQuote: makeScanQuoteFetcher(apiKey),
     getFeeUsd: async (chainId, dbId) => getFixedFeeUsd(chainId, dbId as Hex, await getNativeUsd(chainId)),
-    // Cross-check via KyberSwap only when it covers BOTH legs; if EITHER leg is on a chain Kyber can't
-    // quote (Solana, Sei, Tron, HyperEVM, Flow, Monad, MegaETH, …), use the GeckoTerminal path — it gates
+    // Independent cross-check when an aggregator covers BOTH legs, else the GeckoTerminal path — it gates
     // both legs' liquidity AND price-checks the buy and (when a sell quote is passed) the sell leg, so a
-    // depegged non-Kyber sell side can't slip through verifyCandidate's buy-leg-only cross-check.
-    // When Kyber/GeckoTerminal can't corroborate a leg (a pool 1inch/0x route but they don't index — the
-    // MGLD/deMGLD false-negative class), both paths fall back to a 0x routability check (fetchZeroEx) and badge
-    // it `aggregatorRoutable` rather than hard-rejecting. Needs ZEROX_API_KEY; absent → degrades to routable.
-    verify: (args) =>
-      kyberSlug(args.buyChainId) && kyberSlug(args.sellChainId)
-        ? verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd, fetchZeroEx: fetchZeroExQuote })
-        : verifyViaGeckoTerminal(args, { getTokenStats, fetchZeroEx: fetchZeroExQuote }),
+    // depegged non-aggregator sell side can't slip through verifyCandidate's buy-leg-only cross-check.
+    // When the cross-check/GeckoTerminal can't corroborate a leg (a pool 1inch/0x route but they don't
+    // index — the MGLD/deMGLD false-negative class), both paths fall back to a 0x routability check
+    // (fetchZeroEx) and badge it `aggregatorRoutable` rather than hard-rejecting. Needs ZEROX_API_KEY;
+    // absent → degrades to routable. Source-independence logic lives in buildVerify above.
+    verify: buildVerify(apiKey),
     // Tx simulation of the executable path (build → eth_call with state overrides). Gated upstream by
     // ARB_SIMULATE in scanUnit; here we just supply the impl + the deBridge API key for the build calls.
     simulate: (args) => simulateOpportunity({ ...args, apiKey }),
@@ -130,8 +153,7 @@ export async function runOptimize(debridgeId: string, buyChainId: number, sellCh
   return optimizeRoute(
     { debridgeId, buyChainId, sellChainId, buyToken, sellToken, symbol: family.symbol, buyDecimals, sellDecimals },
     {
-      fetchQuote: (c, i, o, a) =>
-        c === SOLANA_INTERNAL_ID ? fetchJupiterQuote(i, o, a) : fetchDexQuote(c, i, o, a, apiKey),
+      fetchQuote: makeScanQuoteFetcher(apiKey),
       getFeeUsd: async (chainId, dbId) => getFixedFeeUsd(chainId, dbId as Hex, await getNativeUsd(chainId)),
     }
   );

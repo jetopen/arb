@@ -45,8 +45,9 @@ The scanner works correctly, and the correct conclusion is that **the dePort red
                                          │ dequeue batch
                                          ▼
    quote sources ──────▶ ┌─────────────────────────────────────────────┐
-   deBridge (scan)       │  scanUnit (src/lib/arb/scanner.ts)          │
-   Jupiter (Solana)      │  liquidity prefilter → buy leg → rescale     │
+   Kyber (primary scan)  │  scanUnit (src/lib/arb/scanner.ts)          │
+   deBridge (6 chains)   │  liquidity prefilter → buy leg → rescale     │
+   Jupiter (Solana)      │                                             │
                          │  → sell leg → edge → verify → simulate        │
    verify sources ─────▶ │                                             │
    Kyber / GeckoTerminal │  Verification: independent price + liquidity │
@@ -62,7 +63,8 @@ The scanner works correctly, and the correct conclusion is that **the dePort red
 - **Two-lane queue** — a HOT lane keeps proven routes fresh inside the UI's read window; a COLD lane sweeps the ~8.7k mostly-dead reps with leftover budget. Dead routes get exponential backoff (6h·2ⁿ, capped 72h); *transient* failures (5xx/429/network) get a short 10-min retry and never count as dead.
 - **RPM budget** — a shared token bucket (`ARB_SCAN_RPM`) throttles all aggregator calls.
 - **Liquidity prefilter** — a cached GeckoTerminal check skips reps with no indexed pool for zero quote spend (fail-open; can't hide a live route).
-- **Verification** — profitable candidates are only badged when an *independent* source (KyberSwap, or GeckoTerminal, with a 0x routability fallback) corroborates both price and liquidity, killing phantom edges.
+- **Verification** — profitable candidates are only badged when an *independent* source corroborates both price and liquidity, killing phantom edges. Independence is source-aware: Kyber-scanned chains cross-check against deBridge estimation, others against KyberSwap or GeckoTerminal, all with a 0x routability fallback.
+- **Quote routing** (`src/lib/quotes/scan-quote.ts`) — KyberSwap (key-free) is the primary scan source on its 10 chains; deBridge estimation covers the rest (HyperEVM/Sei/Flow/Monad/MegaETH/Tron); Jupiter handles Solana; an optional 1inch rung rescues isolated Kyber blips (needs `ONEINCH_API_KEY`).
 
 ---
 
@@ -166,9 +168,10 @@ Set these in `.env.local` (local) or as **GitHub Actions secrets / vars** (scann
 
 | Var | Purpose |
 |---|---|
-| `DEBRIDGE_API_KEY` | higher deBridge estimation rate limits |
+| `DEBRIDGE_API_KEY` | higher deBridge estimation rate limits (residual chains + verify cross-check) |
 | `ZEROX_API_KEY` | 0x routability fallback in the verifier (`verified(0x)`) |
 | `JUPITER_API_KEY` | Jupiter pro API for Solana quotes (else free lite tier) |
+| `ONEINCH_API_KEY` | enables the optional 1inch last-resort scan fallback (also used by its backtest) |
 | `ONEINCH_API_KEY` | 1inch — **backtest only**, not wired into scanning |
 | `ENVIO_API_TOKEN` | HyperSync activity sweep — **backtest only** (get one at [envio.dev/app/api-tokens](https://envio.dev/app/api-tokens)) |
 | `SOLANA_RPC_URL`, `TRON_RPC_URL`, `RPC_URL_<chainId>` | on-chain reads / simulation |
@@ -186,8 +189,12 @@ Set these in `.env.local` (local) or as **GitHub Actions secrets / vars** (scann
 | Var | Default | Purpose |
 |---|---|---|
 | `ARB_SCAN_N` | 24 / 48 | units dequeued per batch |
-| `ARB_SCAN_RPM` | 120 | shared aggregator rate budget |
+| `ARB_SCAN_RPM` | 120 | shared aggregator rate budget (all sources; Kyber adds its own RPS throttle) |
 | `ARB_SCAN_CONCURRENCY` | 8 | parallel scan workers |
+| `ARB_SCAN_KYBER` | on | `false` reverts the scan source to deBridge on all EVM chains |
+| `ARB_KYBER_RPS` | 5 | Kyber per-source burst-smoothing throttle |
+| `ARB_SCAN_1INCH_FALLBACK` | on (needs key) | `false` disables the 1inch last-resort rung |
+| `ARB_SCAN_SLIPPAGE_FLOOR_BPS` | 50 | conservative-haircut floor for sources returning no slippage rec |
 | `ARB_SCAN_NOTIONAL_USD` | `10,25,50,100` | trade-size ladder |
 | `ARB_HOT_MIN_INTERVAL_MS` | 600000 | hot-lane refresh floor |
 | `ARB_PREFILTER` | on | `false` disables the liquidity prefilter |

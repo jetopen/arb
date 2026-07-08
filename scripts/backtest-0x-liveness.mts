@@ -62,7 +62,7 @@ const deps: any = {
   // Mirror buildScanDeps: judge net-positive AFTER the real verify gate (kills the ~100% artifacts).
   verify: (args: any) =>
     kyberSlug(args.buyChainId) && kyberSlug(args.sellChainId)
-      ? verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd, fetchZeroEx: fetchZeroExQuote })
+      ? verifyCandidate(args, { fetchCrossCheck: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd, fetchZeroEx: fetchZeroExQuote })
       : verifyViaGeckoTerminal(args, { getTokenStats, fetchZeroEx: fetchZeroExQuote }),
 };
 
