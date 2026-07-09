@@ -71,11 +71,15 @@ export function OpportunityRow({
   index,
   colSpan,
   onSelect,
+  gateMs,
 }: {
   opp: Opportunity;
   index: number;
   colSpan: number;
   onSelect: (o: Opportunity) => void;
+  /** Freshness gate (ms): rows older than this are HARD-stale — dimmed + badged, since all-time rows are
+   *  now shown instead of hidden. Absent/<=0 → tier-2 styling off (only the amber age text applies). */
+  gateMs?: number;
 }) {
   const [expanded, setExpanded] = useState(false);
   const spread = opp.edge.grossSpreadPct;
@@ -83,12 +87,15 @@ export function OpportunityRow({
   const verified = !!opp.verification?.verified;
   const ageMs = opp.computedAt ? Date.now() - opp.computedAt : null;
   const stale = ageMs != null && ageMs > STALE_AFTER_MS;
+  // Tier 2: past the same gate that flips /api/health stale. A weeks-old "+24%" must not impersonate a
+  // live edge, so the whole row dims and the symbol carries an explicit stale badge with its age.
+  const hardStale = !!gateMs && gateMs > 0 && ageMs != null && ageMs > gateMs;
 
   return (
     <>
       <tr
         onClick={() => onSelect(opp)}
-        className="border-b border-border hover:bg-muted/30 transition-colors cursor-pointer"
+        className={`border-b border-border hover:bg-muted/30 transition-colors cursor-pointer ${hardStale ? "opacity-55" : ""}`}
       >
         <td className="px-2 py-3 text-sm">
           <button
@@ -104,7 +111,17 @@ export function OpportunityRow({
           </button>
         </td>
         <td className="px-4 py-3 text-sm text-muted">{index + 1}</td>
-        <td className="px-4 py-3 text-sm font-medium text-foreground">{opp.symbol ?? "—"}</td>
+        <td className="px-4 py-3 text-sm font-medium text-foreground">
+          {opp.symbol ?? "—"}
+          {hardStale && (
+            <span
+              className="ml-2 inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium bg-amber-100 text-amber-800"
+              title="Last two-sided quote is older than the freshness gate — open the row to re-quote it live"
+            >
+              stale · {timeAgo(opp.computedAt)}
+            </span>
+          )}
+        </td>
         <td className="px-4 py-3 text-sm text-muted">
           {chainName(opp.buyChainId)} <span className="text-muted">→</span> {chainName(opp.sellChainId)}
         </td>

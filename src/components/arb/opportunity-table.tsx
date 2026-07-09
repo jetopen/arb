@@ -20,9 +20,11 @@ interface Props {
   onRetry?: () => void;
   sortKey: SortKey;
   onSort: (k: SortKey) => void;
+  /** Freshness gate (ms) — rows older than this render dimmed with a stale badge. Absent → tier-2 off. */
+  gateMs?: number;
 }
 
-export function OpportunityTable({ opportunities, loading, error, onSelect, onRetry, sortKey, onSort }: Props) {
+export function OpportunityTable({ opportunities, loading, error, onSelect, onRetry, sortKey, onSort, gateMs }: Props) {
   if (loading && opportunities.length === 0) return <TableSkeleton columns={COLUMNS} />;
   if (error) return <ErrorState message={error} onRetry={onRetry} />;
   if (opportunities.length === 0)
@@ -56,7 +58,7 @@ export function OpportunityTable({ opportunities, loading, error, onSelect, onRe
         </thead>
         <tbody>
           {opportunities.map((o, i) => (
-            <OpportunityRow key={o.debridgeId} opp={o} index={i} colSpan={COLUMNS.length} onSelect={onSelect} />
+            <OpportunityRow key={o.debridgeId} opp={o} index={i} colSpan={COLUMNS.length} onSelect={onSelect} gateMs={gateMs} />
           ))}
         </tbody>
       </table>

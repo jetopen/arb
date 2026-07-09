@@ -89,6 +89,8 @@ export interface ArbFilters {
   verifiedOnly?: boolean;
   /** Keep only rows whose tx simulation proved the executable path (needs ARB_SIMULATE on the scanner). */
   executableOnly?: boolean;
+  /** Freshness override: 0 disables the server gate (all-time rows; staleness shown per-row instead). */
+  maxAgeMs?: number;
   take?: number;
   page?: number;
 }
@@ -129,6 +131,7 @@ function buildArbUrl(f: ArbFilters): string {
   if (f.tierUsd != null) p.set("tierUsd", String(f.tierUsd));
   if (f.verifiedOnly) p.set("verifiedOnly", "true");
   if (f.executableOnly) p.set("executableOnly", "true");
+  if (f.maxAgeMs != null) p.set("maxAgeMs", String(f.maxAgeMs));
   if (f.take) p.set("take", String(f.take));
   if (f.page && f.page > 1) p.set("page", String(f.page));
   const qs = p.toString();

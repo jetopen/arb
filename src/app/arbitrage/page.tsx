@@ -38,12 +38,22 @@ export default function ArbitragePage() {
     tierUsd,
     verifiedOnly,
     executableOnly,
+    // Show every token that EVER produced a two-sided quote (all-time), not just the fresh window —
+    // staleness is surfaced per-row (amber pill + dimming past gateMs) instead of by hiding rows.
+    maxAgeMs: 0,
     take: PAGE_SIZE,
     page,
   });
 
   const opportunities = data?.opportunities ?? [];
   const total = data?.total ?? 0;
+  // Fresh-vs-all-time context chip: the row count used to carry this signal by omission (stale rows were
+  // hidden); now that all-time rows show, say explicitly how many are inside the freshness gate.
+  const gateMs = data?.gateMs;
+  const freshCount = useMemo(
+    () => (gateMs && gateMs > 0 ? opportunities.filter((o) => o.computedAt && Date.now() - o.computedAt <= gateMs).length : opportunities.length),
+    [opportunities, gateMs]
+  );
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   // Offer exactly the rungs the scanner actually probed (from the API), falling back before first load.
   const capitalTiers = data?.tiers ?? CAPITAL_TIERS_FALLBACK;
@@ -196,7 +206,9 @@ export default function ArbitragePage() {
             >
               {netPositiveOnly ? "✓ Net-positive" : "Net-positive"}
             </button>
-            <div className="self-end text-sm text-muted">{displayed.length} tokens</div>
+            <div className="self-end text-sm text-muted" title="Fresh = quoted inside the freshness gate; the rest are shown dimmed with a stale badge">
+              {displayed.length} tokens · <span className="text-foreground">{freshCount} fresh</span>
+            </div>
           </div>
 
           <OpportunityTable
@@ -207,6 +219,7 @@ export default function ArbitragePage() {
             onRetry={() => mutate()}
             sortKey={sortKey}
             onSort={setSortKey}
+            gateMs={gateMs}
           />
 
           {totalPages > 1 && (

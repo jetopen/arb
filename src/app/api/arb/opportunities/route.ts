@@ -22,7 +22,8 @@ export async function GET(request: NextRequest) {
     // override via ?maxAgeMs= or ARB_OPP_MAX_AGE_MS; maxAgeMs<=0 disables the gate. The env is parsed
     // defensively (falls back to the default on a non-numeric value). /api/health flips 503 on this same window.
     const maxAgeParam = finite("maxAgeMs");
-    const maxAgeMs = maxAgeParam ?? parsePenaltyMs(process.env.ARB_OPP_MAX_AGE_MS, DEFAULT_OPP_MAX_AGE_MS);
+    const configuredGateMs = parsePenaltyMs(process.env.ARB_OPP_MAX_AGE_MS, DEFAULT_OPP_MAX_AGE_MS);
+    const maxAgeMs = maxAgeParam ?? configuredGateMs;
     const filter: OpportunityFilter = {
       minSpreadPct: finite("minSpreadPct"),
       chainId: finite("chainId"),
@@ -41,9 +42,10 @@ export async function GET(request: NextRequest) {
     const lastScan = await getStore().lastScanRun();
     // The actual scanned ladder (reflects ARB_SCAN_NOTIONAL_USD) so the UI capital selector offers the
     // rungs that were really scanned — never a hardcoded list that goes stale under an env override.
-    // gateMs = the freshness gate applied above, so the UI can alarm when lastScan exceeds the same
-    // window that hides rows here and flips /api/health to 503 (<=0 means the gate is disabled).
-    return NextResponse.json({ ...result, lastScan, tiers: DEFAULT_TIERS, gateMs: maxAgeMs });
+    // gateMs = the CONFIGURED freshness gate (NOT the per-request maxAgeMs override): the dashboard
+    // fetches with maxAgeMs=0 to show all-time rows, but still needs the real gate for the per-row
+    // stale styling and the ScanStatus alarm banner (which must not be disabled by that override).
+    return NextResponse.json({ ...result, lastScan, tiers: DEFAULT_TIERS, gateMs: configuredGateMs });
   } catch (error) {
     return errorResponse(error, "arb/opportunities");
   }
