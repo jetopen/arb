@@ -1,25 +1,15 @@
 import type { Hex } from "viem";
 import { getFixedFeeWei } from "../onchain/debridge-gate";
-import { getChainByInternalId } from "./registry";
+import { DEPORT_CHAINS, getChainByInternalId } from "./registry";
 
 /**
  * Documented flat dePort fee per chain (native token), used as a fallback when the live
- * `getDebridgeChainAssetFixedFee` read fails. Source: deBridge DMP fees doc. These are deliberately
- * NOT authoritative — the live read is preferred; this only keeps the scanner running on RPC hiccups.
+ * `getDebridgeChainAssetFixedFee` read fails. Now sourced from the chain registry's `docFeeNative` (single
+ * source of truth); kept as a derived view for back-compat. The live read is still preferred.
  */
-export const DOC_FIXED_FEE_NATIVE: Record<number, number> = {
-  1: 0.001, // Ethereum (ETH)
-  10: 0.001, // Optimism (ETH)
-  56: 0.005, // BNB
-  137: 0.5, // Polygon (POL)
-  8453: 0.001, // Base (ETH)
-  42161: 0.001, // Arbitrum (ETH)
-  43114: 0.05, // Avalanche (AVAX)
-  59144: 0.001, // Linea (ETH)
-  100000019: 15, // Cronos (CRO)
-  100000023: 2, // Mantle (MNT) — approximate
-  100000022: 0.05, // HyperEVM (HYPE) — approximate
-};
+export const DOC_FIXED_FEE_NATIVE: Record<number, number> = Object.fromEntries(
+  DEPORT_CHAINS.filter((c) => c.docFeeNative != null).map((c) => [c.internalId, c.docFeeNative as number])
+);
 
 /** PURE: convert a native-wei fee to USD. */
 export function feeWeiToUsd(feeWei: bigint, nativeDecimals: number, nativeUsdPrice: number): number {
@@ -29,7 +19,7 @@ export function feeWeiToUsd(feeWei: bigint, nativeDecimals: number, nativeUsdPri
 
 /** PURE: convert the documented (human-unit) native fee to USD. */
 export function docFeeToUsd(internalChainId: number, nativeUsdPrice: number): number {
-  const native = DOC_FIXED_FEE_NATIVE[internalChainId] ?? 0;
+  const native = getChainByInternalId(internalChainId)?.docFeeNative ?? 0;
   return native * nativeUsdPrice;
 }
 

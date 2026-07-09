@@ -2,15 +2,25 @@
   "name": "arb-next",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "scan:once": "tsx scripts/scan-once.mts",
+    "scan:loop": "tsx scripts/scan-loop.mts",
+    "backtest:0x": "tsx scripts/backtest-0x-liveness.mts",
+    "backtest:1inch": "tsx scripts/backtest-1inch-liveness.mts",
+    "backtest:hypersync": "tsx scripts/backtest-hypersync-activity.mts",
     "lint": "eslint",
+    "typecheck": "tsc --noEmit",
     "test": "vitest"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.1",
+    "bs58": "^6.0.0",
     "date-fns": "^4.4.0",
     "lucide-react": "^1.17.0",
     "next": "16.2.7",
@@ -18,6 +28,7 @@
     "react-dom": "19.2.4",
     "recharts": "^3.8.1",
     "swr": "^2.4.1",
+    "tsx": "^4.19.2",
     "viem": "^2.52.2",
     "zod": "^4.4.3"
   },

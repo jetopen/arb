@@ -1,3 +1,6 @@
+import type { SimulationResult } from "./sim/types";
+export type { SimulationResult } from "./sim/types";
+
 export type MessageStatus =
   | "Awaiting Confirmation"
   | "Awaiting Execution"
@@ -171,7 +174,7 @@ export interface DexQuote {
   priceImpactBps: number;
   gasUsd: number;
   recommendedSlippageBps: number;
-  source: "debridge" | "kyberswap" | "onchain";
+  source: "debridge" | "kyberswap" | "onchain" | "jupiter" | "0x" | "1inch";
 }
 
 export type ArbKind = "redemption" | "cross_rep";
@@ -208,10 +211,18 @@ export interface Verification {
   sourcesAgreed: string[];
   /** Disagreement between primary and cross-check, in bps. */
   quoteDisagreementBps: number | null;
-  /** Pool liquidity (USD) observed for the traded leg, if checked. */
+  /** Pool liquidity (USD) of the binding (thinnest) gated leg across the round-trip, if checked. */
   liquidityUsd: number | null;
   /** Reason the candidate was rejected, when verified === false. */
   rejectReason?: string;
+  /**
+   * True when no INDEPENDENT pool/spot source (KyberSwap, GeckoTerminal) could corroborate the leg, but a
+   * DEX aggregator (0x / deBridge=1inch) confirms it routes at ~the quoted price — or no aggregator was
+   * available to check it. These are real-but-uncorroborated edges (e.g. a deAsset rep 1inch routes through a
+   * pool GeckoTerminal/Kyber don't index, like MGLD/deMGLD). Surfaced with a distinct badge, NOT rejected.
+   * `verified` stays false (no fully-independent corroboration); this flag is the "routable, hand-check" state.
+   */
+  aggregatorRoutable?: boolean;
 }
 
 export interface Opportunity {
@@ -225,6 +236,8 @@ export interface Opportunity {
   tierUsd: number;
   edge: EdgeResult;
   verification: Verification | null;
+  /** Tx-simulation result (executable path tested before surfacing); absent when ARB_SIMULATE is off. */
+  simulation?: SimulationResult;
   /** Ordered legs describing the executable lock path. */
   lockPath: Array<{ chainId: number; address: string; role: string }>;
   computedAt: number;
@@ -236,12 +249,24 @@ export interface Opportunity {
 }
 
 export interface OpportunityFilter {
-  minNetPct?: number;
-  tierUsd?: number;
+  /** Minimum gross round-trip spread % (the price gap). Primary filter for the spread screener. */
+  minSpreadPct?: number;
   chainId?: number;
+  /** Pin to one probe size (a rung of the scan ladder). Unset = best size per token across the ladder. */
+  tierUsd?: number;
   verifiedOnly?: boolean;
+  /** Keep only opportunities whose tx simulation verdict is executable (simulation.executable === true). */
+  executableOnly?: boolean;
   /** Exclude opportunities whose computedAt is older than this many ms (freshness gate). */
   maxAgeMs?: number;
+  /** Fresh-first band (ms) for the groupByToken pick: rows within this window outrank ALL older rows
+   *  and compete on gross; among all-stale rows the MOST RECENT wins (a dead token's honest
+   *  representative is its last-known state, not its best-ever gross). Opt-in — unset keeps the pure
+   *  max-gross pick. NOT an exclusion: unlike maxAgeMs, stale rows still appear when a token has no
+   *  fresh row (the all-time dashboard view). */
+  freshBandMs?: number;
+  /** Collapse to one row per token (family): keep the highest-spread row per debridgeId. */
+  groupByToken?: boolean;
   page?: number;
   take?: number;
 }

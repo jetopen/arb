@@ -1,7 +1,8 @@
 import type { DexQuote } from "../types";
 import { fetchWithRetry } from "../api-client";
+import { QuoteHttpError } from "./quote-error";
 
-const DLN_BASE = "https://dln.debridge.finance";
+export const DLN_BASE = "https://dln.debridge.finance";
 
 interface AggregatorRoute {
   name: string;
@@ -74,7 +75,7 @@ export async function fetchDexQuote(
     `${DLN_BASE}/v1.0/chain/estimation?chainId=${internalChainId}` +
     `&tokenIn=${tokenIn}&tokenInAmount=${amountIn}&tokenOut=${tokenOut}`;
   const res = await fetchWithRetry(url, { method: "GET" }, { apiKey });
-  if (!res.ok) throw new Error(`estimation ${res.status} for chain ${internalChainId}`);
+  if (!res.ok) throw new QuoteHttpError(res.status, `estimation ${res.status} for chain ${internalChainId}`);
   const json = (await res.json()) as EstimationResponse;
   return parseEstimation(json, { internalChainId, tokenIn, tokenOut });
 }

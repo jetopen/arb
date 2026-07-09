@@ -1,6 +1,6 @@
 import type { DexQuote } from "../types";
 import { redemptionEdge } from "./edge";
-import { baseToken, tierToBaseUnits } from "./base-tokens";
+import { baseToken, tierToBaseUnits, rescaleRaw } from "./base-tokens";
 
 /**
  * Trade-size optimization for a dePort redemption route.
@@ -11,7 +11,26 @@ import { baseToken, tierToBaseUnits } from "./base-tokens";
  * net-maximizing size) and the break-even notional, which fixed tiers ($1k/$10k/$50k) miss entirely.
  */
 
-export const DEFAULT_SIZE_GRID = [25, 50, 100, 250, 500, 1000, 2500, 5000];
+export const DEFAULT_SIZE_GRID = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000];
+
+/** Max simultaneous upstream quote pairs PER optimize call. Caps the burst (the grid is ~9 sizes × 2 legs
+ *  = 18 quotes) so one drawer open can't fire 18 concurrent paid quotes. Override via ARB_OPTIMIZE_CONCURRENCY. */
+const OPTIMIZE_CONCURRENCY = Math.max(1, Number(process.env.ARB_OPTIMIZE_CONCURRENCY) || 4);
+
+/** Bounded-concurrency map (no external dep): at most `limit` of `fn` run at once; results stay in order. */
+async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) break;
+      out[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
 
 export interface SizePoint {
   sizeUsd: number;
@@ -27,6 +46,10 @@ export interface OptimizeRoute {
   buyToken: string;
   sellToken: string;
   symbol?: string;
+  /** Decimals of the buy/sell family members. The dePort move is 1:1 by value, so the bridged raw amount
+   *  is rescaled by their delta before the sell leg (mirrors scanUnit). Omit both → no rescale (back-compat). */
+  buyDecimals?: number;
+  sellDecimals?: number;
 }
 
 export interface OptimizeResult {
@@ -102,19 +125,28 @@ export async function optimizeRoute(
 
   const feeUsd = await deps.getFeeUsd(route.buyChainId, route.debridgeId);
 
-  const points = await Promise.all(
-    sizes.map(async (sizeUsd): Promise<SizePoint | null> => {
+  const points = await mapPool(
+    sizes,
+    OPTIMIZE_CONCURRENCY,
+    async (sizeUsd): Promise<SizePoint | null> => {
       try {
         const amountIn = tierToBaseUnits(sizeUsd, buyBase);
         const buyLeg = await deps.fetchQuote(route.buyChainId, buyBase.address, route.buyToken, amountIn);
         if (buyLeg.amountOut === "0") return null;
-        const sellLeg = await deps.fetchQuote(route.sellChainId, route.sellToken, sellBase.address, buyLeg.amountOut);
+        // dePort is 1:1 by value: rescale the bought amount across the buy→sell decimal delta (mirrors
+        // scanUnit). Both decimals must be known to rescale; otherwise pass through unchanged.
+        const bridged =
+          route.buyDecimals !== undefined && route.sellDecimals !== undefined
+            ? rescaleRaw(buyLeg.amountOut, route.buyDecimals, route.sellDecimals)
+            : buyLeg.amountOut;
+        if (bridged === "0") return null;
+        const sellLeg = await deps.fetchQuote(route.sellChainId, route.sellToken, sellBase.address, bridged);
         const edge = redemptionEdge(buyLeg, sellLeg, feeUsd);
         return { sizeUsd, grossPct: edge.grossSpreadPct, netUsd: edge.netUsd, netEdgePct: edge.netEdgePct };
       } catch {
         return null;
       }
-    })
+    }
   );
 
   const curve = points.filter((p): p is SizePoint => p !== null);

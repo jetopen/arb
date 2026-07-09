@@ -9,7 +9,11 @@ import {
   type FamilyKey,
 } from "../onchain/debridge-gate";
 import { isEvmDeportChain, EVM_DEPORT_CHAINS } from "./registry";
+import { toCanonicalAddress } from "./address-codec";
+import { enumerateTronReps } from "../onchain/tron-reps";
 import { getTokenListForChain } from "../api-client";
+import { deriveFamiliesFromEvents, mergeEventReps, type DerivedEvents } from "./events-graph";
+import { getStore, parsePenaltyMs } from "../db/store";
 
 export interface TokenMeta {
   symbol?: string;
@@ -34,7 +38,9 @@ export function assembleFamilies(
 ): Family[] {
   const groups = new Map<string, RawDeAsset[]>();
   for (const r of raw) {
-    const id = computeDebridgeId(r.nativeChainId, r.nativeAddress as Hex);
+    // Forward-found reps carry the authoritative debridgeId (their native address may be a base58
+    // Solana/Tron string that can't be re-hashed); discovered reps carry raw-hex natives we re-derive.
+    const id = r.debridgeId ?? computeDebridgeId(r.nativeChainId, r.nativeAddress as Hex);
     const list = groups.get(id);
     if (list) list.push(r);
     else groups.set(id, [r]);
@@ -42,7 +48,10 @@ export function assembleFamilies(
 
   const families: Family[] = [];
   for (const [debridgeId, members] of groups) {
-    const { nativeChainId, nativeAddress } = members[0];
+    const { nativeChainId } = members[0];
+    // memberAddress() quotes the native leg straight off Family.nativeAddress, so it MUST be canonical
+    // (base58 for a Solana/Tron native, hex for EVM) — members may carry either raw-hex or base58.
+    const nativeAddress = toCanonicalAddress(nativeChainId, members[0].nativeAddress);
     // Dedupe reps by (chain,address) — a token can legitimately appear once per chain.
     const seen = new Set<string>();
     const reps: DeAsset[] = [];
@@ -133,12 +142,54 @@ export function fillMeta(
 }
 
 /**
- * Build the lock-graph live in four passes:
- *  1. DISCOVERY  — per-chain token-list -> multicall getNativeInfo -> the family universe (debridgeIds).
- *  2. FORWARD    — for each discovered chain, multicall getDebridge(debridgeId) over that universe to
- *                  find EVERY deployed rep, including the (majority) that no token-list carries.
- *  3. META FILL  — read decimals()/symbol() on-chain for forward-found reps absent from token-lists.
- *  4. ASSEMBLE   — group the merged reps by debridgeId (pure).
+ * PURE: the debridgeId universe to forward-expand (getDebridge) over every scanned chain. Built from the
+ * token-list-discovered reps PLUS event-derived families, so families no token-list carried still get their
+ * on-chain EVM reps resolved — including RECEIVE-ONLY chains, whose deAsset address the submission log never
+ * carries (getEvents only records the SOURCE-chain token). Only EVM-native event families can be added: a
+ * non-hex (non-EVM, e.g. Solana base58) native address can't seed computeDebridgeId, so it is skipped — those
+ * families keep the event-merge path (PASS 5), which preserves their canonical native leg. Deduped by
+ * debridgeId (first writer wins; for EVM the discovered and event native addresses are byte-identical
+ * lowercase hex, so the ordering is immaterial — the isEvmDeportChain filter, not the dedup order, is what
+ * keeps non-EVM native legs out).
+ */
+export function forwardUniverse(discovered: RawDeAsset[], eventFamilies: Family[]): FamilyKey[] {
+  const keys = new Map<string, FamilyKey>();
+  const add = (nativeChainId: number, nativeAddress: string) => {
+    try {
+      const id = computeDebridgeId(nativeChainId, nativeAddress as Hex);
+      const k = id.toLowerCase();
+      if (!keys.has(k)) keys.set(k, { debridgeId: id, nativeChainId, nativeAddress });
+    } catch {
+      /* DEFENSE (not the filter): a malformed native address shouldn't reach here, but if one ever does,
+         skip that single family rather than aborting the whole graph build — matching the best-effort,
+         flag-partial posture of every other pass. The isEvmDeportChain check below is the real guard. */
+    }
+  };
+  // Discovered reps always carry a raw-hex native address (from getNativeInfo) — add them all.
+  for (const r of discovered) add(r.nativeChainId, r.nativeAddress);
+  // Event families of EVERY native-chain kind (Solana, Tron, Sei, … included). We seed from the family's
+  // AUTHORITATIVE debridgeId (it came straight from deBridge's submission log — no recompute, so a base58
+  // native address is a non-issue), then getDebridge resolves that family's reps on every scanned EVM
+  // chain — including the receive-only ones the submission log can't carry a deAsset address for. This is
+  // what unblocks forward expansion for non-EVM-native families (e.g. the 244 Solana-native families);
+  // their canonical native leg still rides in via the PASS-5 event merge.
+  for (const f of eventFamilies) {
+    const k = f.debridgeId.toLowerCase();
+    if (!keys.has(k)) keys.set(k, { debridgeId: f.debridgeId as Hex, nativeChainId: f.nativeChainId, nativeAddress: f.nativeAddress });
+  }
+  return [...keys.values()];
+}
+
+/**
+ * Build the lock-graph live:
+ *  1. DISCOVERY   — per-chain token-list -> multicall getNativeInfo -> the family universe (debridgeIds).
+ *  -  EVENT SEED  — derive the event-sourced family set; its EVM-native families WIDEN the universe so
+ *                   families no token-list carried still get forward-expanded.
+ *  2. FORWARD     — for each scanned chain, multicall getDebridge(debridgeId) over that (widened) universe
+ *                   to find EVERY deployed rep, including the (majority) that no token-list carries.
+ *  3. META FILL   — read decimals()/symbol() on-chain for forward-found reps absent from token-lists.
+ *  4. ASSEMBLE    — group the merged reps by debridgeId (pure).
+ *  5. EVENT MERGE — overlay event-sourced reps on-chain enumeration can't reach (chiefly non-EVM/Solana).
  * Chains are scanned concurrently per pass, so wall-time ≈ the slowest single chain, not the sum.
  */
 export async function buildLockGraph(
@@ -162,15 +213,21 @@ export async function buildLockGraph(
     chainsScanned.push(s.internalChainId);
   }
 
-  // The family universe: one FamilyKey per distinct debridgeId (lock origin).
-  const familyKeys = new Map<string, FamilyKey>();
-  for (const r of discovered) {
-    const id = computeDebridgeId(r.nativeChainId, r.nativeAddress as Hex);
-    if (!familyKeys.has(id)) {
-      familyKeys.set(id, { debridgeId: id, nativeChainId: r.nativeChainId, nativeAddress: r.nativeAddress });
-    }
+  // ---- EVENT SEED: derive the event-sourced family set up front (best-effort). Used both to WIDEN the
+  // forward-pass universe (below) with families no token-list carried, and to merge non-EVM reps after
+  // assembly (PASS 5). A failure (e.g. the derive RPC timing out) drops non-EVM/Solana coverage, so flag
+  // the build partial — the exact silent-drop migration 0005 was written to avoid. ----
+  let derived: DerivedEvents = { repsByDebridgeId: new Map(), families: [] };
+  try {
+    derived = await deriveFamiliesFromEvents();
+  } catch {
+    partial = true;
   }
-  const families = [...familyKeys.values()];
+
+  // The family universe to forward-expand: discovered debridgeIds PLUS EVM-native event-only families
+  // (forwardUniverse skips non-EVM natives). getDebridge then resolves their on-chain EVM reps, including
+  // the receive-only chains the submission log can't carry a deAsset address for.
+  const families = forwardUniverse(discovered, derived.families);
 
   // ---- PASS 2: forward expansion (only over chains discovery succeeded on) ----
   const forwardByChain = await Promise.all(
@@ -181,11 +238,23 @@ export async function buildLockGraph(
     if (!f.ok) partial = true;
     forward.push(...f.reps);
   }
+
+  // ---- PASS 2b: forward expansion on Tron (non-EVM gate, same getDebridge via TronGrid eth_call). Finds
+  // Tron reps the EVM multicall can't reach and the case-lossy event index can't anchor. Best-effort:
+  // a transport failure flags partial, never aborts. (Solana's gate has no equivalent cold read — its
+  // reachable families are already covered by the event seed + forward pass above.) ----
+  const tron = await enumerateTronReps(families).catch(() => ({ reps: [] as RawDeAsset[], ok: false }));
+  if (!tron.ok) partial = true;
+  forward.push(...tron.reps);
+
   const raw = mergeForwardReps(discovered, forward);
 
   // ---- PASS 3: metadata fill for reps with no (or decimals-less) token-list entry ----
   const missingByChain = new Map<number, Set<string>>();
   for (const r of raw) {
+    // On-chain ERC20 reads only work on EVM chains (getPublicClient throws for quote-only). Non-EVM reps
+    // (Tron, Solana) take their decimals from the token-list / event index, never an on-chain probe.
+    if (!isEvmDeportChain(r.internalChainId)) continue;
     const m = metaByKey.get(metaKey(r.internalChainId, r.address));
     if (!m || m.decimals === undefined) {
       let set = missingByChain.get(r.internalChainId);
@@ -210,9 +279,14 @@ export async function buildLockGraph(
     })
   );
 
-  // ---- PASS 4: assemble (pure) ----
+  // ---- PASS 4: assemble on-chain EVM families (pure) ----
+  const onChain = assembleFamilies(raw, metaByKey);
+
+  // ---- PASS 5: merge the event-sourced reps onto the assembled on-chain graph. The event set was derived
+  // up front (and seeded the forward pass); here it overlays the reps on-chain enumeration can't reach —
+  // chiefly non-EVM/Solana reps, plus the native metadata of event-only families. ----
   return {
-    families: assembleFamilies(raw, metaByKey),
+    families: mergeEventReps(onChain, derived),
     builtAt: Date.now(),
     chainsScanned,
     partial,
@@ -220,11 +294,69 @@ export async function buildLockGraph(
 }
 
 const GRAPH_TTL = 6 * 60 * 60 * 1000; // 6h — deAsset sets change slowly
+/**
+ * Freshness window for BOTH cache tiers (the in-memory entry and the Supabase snapshot). deAsset sets
+ * change slowly and rep addresses are immutable, so a slightly stale snapshot is safe (only ever missing
+ * a brand-new rep) — overridable to serve staler snapshots and rebuild less often. A non-positive value
+ * (incl. a blank env, which parses to 0) would make every entry "stale" and force a ~15-25s live rebuild
+ * on EVERY call, so clamp back to the default rather than let a misconfig self-DoS.
+ */
+const rawSnapshotTtl = parsePenaltyMs(process.env.ARB_GRAPH_SNAPSHOT_TTL_MS, GRAPH_TTL);
+const SNAPSHOT_TTL = rawSnapshotTtl > 0 ? rawSnapshotTtl : GRAPH_TTL;
 let cached: LockGraph | null = null;
 
+export interface GraphCacheDeps {
+  now: number;
+  cached: LockGraph | null;
+  ttlMs: number;
+  loadSnapshot: () => Promise<LockGraph | null>;
+  build: () => Promise<LockGraph>;
+  saveSnapshot: (g: LockGraph) => Promise<void>;
+}
+
+/**
+ * PURE tiering for the lock-graph cache: in-memory (tier 1) → Supabase snapshot (tier 2) → live build
+ * (tier 3, written back). Store/network access is injected so the policy is unit-testable without a DB.
+ * A graph is served only while within `ttlMs` of its `builtAt` AND non-empty: a zero-family graph is a
+ * failed/degenerate build (e.g. every chain RPC and the event derive failed at once) and must never be
+ * cached or persisted — otherwise a transient total-discovery outage would mask itself as "no
+ * opportunities" for the whole TTL, and would even suppress an otherwise-good snapshot (tier 1 wins
+ * before tier 2). `force` bypasses both fresh tiers. loadSnapshot/saveSnapshot are best-effort — a
+ * failure falls through / is swallowed, never blocks.
+ */
+export async function resolveLockGraph(force: boolean, d: GraphCacheDeps): Promise<LockGraph> {
+  const usable = (g: LockGraph | null): g is LockGraph =>
+    !!g && g.families.length > 0 && Number.isFinite(g.builtAt);
+  const fresh = (g: LockGraph | null): g is LockGraph => usable(g) && d.now - g.builtAt < d.ttlMs;
+  const inMem = d.cached;
+  if (!force && fresh(inMem)) return inMem; // tier 1
+  let snap: LockGraph | null = null;
+  if (!force) {
+    snap = await d.loadSnapshot().catch(() => null);
+    if (fresh(snap)) return snap; // tier 2 — shared across instances / survives restarts
+  }
+  const built = await d.build(); // tier 3
+  if (usable(built)) {
+    await d.saveSnapshot(built).catch(() => {}); // write-back so the next cold cache reads it
+    return built;
+  }
+  // Empty build: prefer ANY non-empty graph we already have — a stale snapshot or the last good
+  // in-memory entry — over serving zero families. Never persist the empty build.
+  if (usable(snap)) return snap;
+  if (usable(inMem)) return inMem;
+  return built; // nothing better exists; caller surfaces the empty/partial graph
+}
+
 export async function getLockGraph(force = false): Promise<LockGraph> {
-  if (!force && cached && Date.now() - cached.builtAt < GRAPH_TTL) return cached;
-  cached = await buildLockGraph();
+  const store = getStore();
+  cached = await resolveLockGraph(force, {
+    now: Date.now(),
+    cached,
+    ttlMs: SNAPSHOT_TTL,
+    loadSnapshot: () => store.loadGraph(),
+    build: buildLockGraph,
+    saveSnapshot: (g) => store.saveGraph(g),
+  });
   return cached;
 }
 

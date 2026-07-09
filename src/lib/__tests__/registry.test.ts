@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import {
+  DEPORT_CHAINS,
   EVM_DEPORT_CHAINS,
   getChainByInternalId,
   getChainByEvmId,
@@ -58,12 +59,57 @@ describe("deport registry", () => {
     expect(MULTICALL3_ADDRESS).toBe("0xcA11bde05977b3631167028862bE2a173976CA11");
   });
 
-  it("every chain has a gate, rpc, and native metadata", () => {
+  it("every on-chain chain has a gate, rpc, and native metadata", () => {
     for (const c of EVM_DEPORT_CHAINS) {
       expect(c.gate).toMatch(/^0x[0-9a-fA-F]{40}$/);
       expect(c.defaultRpcUrl).toMatch(/^https:\/\//);
       expect(c.nativeSymbol.length).toBeGreaterThan(0);
       expect(c.nativeDecimals).toBeGreaterThan(0);
     }
+  });
+});
+
+/**
+ * Guards the single-source registry against the "half-wired chain" bug class this consolidation fixed:
+ * a chain quotable (base token) but missing its GeckoTerminal slug (never verifiable — was MegaETH) or its
+ * native-price key (dePort fee silently $0 → overstated profit — was Monad). Now a test failure, not a
+ * silent runtime gap.
+ */
+describe("DEPORT_CHAINS completeness (no half-wired chains)", () => {
+  it("every quotable chain has gtSlug + a native-price source + docFeeNative", () => {
+    const quotable = DEPORT_CHAINS.filter((c) => c.baseToken);
+    expect(quotable.length).toBeGreaterThan(10);
+    for (const c of quotable) {
+      expect(c.gtSlug, `${c.name} (${c.internalId}) quotable but no gtSlug`).toBeTruthy();
+      expect(
+        Boolean(c.llamaKey || c.llamaSlug),
+        `${c.name} (${c.internalId}) quotable but no native-price key (fee would be $0)`
+      ).toBe(true);
+      expect(typeof c.docFeeNative, `${c.name} (${c.internalId}) missing docFeeNative`).toBe("number");
+    }
+  });
+
+  it("only the non-EVM chains (Solana, Tron) remain quote-only / off-chain", () => {
+    for (const id of [7565164, 100000026]) {
+      const c = getChainByInternalId(id);
+      expect(c, `chain ${id} missing from registry`).toBeTruthy();
+      expect(c!.baseToken, `chain ${id} not quotable`).toBeTruthy();
+      expect(c!.onChain).toBe(false);
+    }
+  });
+
+  it("the promoted EVM chains (Sei/Flow/Monad/MegaETH/Story/Injective) are on-chain with a gate + RPC", () => {
+    for (const id of [100000027, 100000009, 100000030, 100000031, 100000013, 100000029]) {
+      const c = getChainByInternalId(id);
+      expect(c, `chain ${id} missing from registry`).toBeTruthy();
+      expect(c!.onChain, `chain ${id} should be on-chain`).toBe(true);
+      expect(c!.gate, `chain ${id} missing gate`).toBeTruthy();
+      expect(c!.defaultRpcUrl, `chain ${id} missing rpc`).toBeTruthy();
+    }
+  });
+
+  it("internal ids are unique", () => {
+    const ids = DEPORT_CHAINS.map((c) => c.internalId);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });

@@ -49,6 +49,27 @@ export const GATE_ABI = [
   },
 ] as const;
 
+/** deBridgeGate.send ABI fragment — initiates a dePort transfer (burns/locks the input token). Exported
+ *  so the sim subsystem can reuse the definition rather than duplicate it. */
+export const GATE_SEND_ABI = [
+  {
+    type: "function",
+    name: "send",
+    stateMutability: "payable",
+    inputs: [
+      { name: "_tokenAddress", type: "address" },
+      { name: "_amount", type: "uint256" },
+      { name: "_chainIdTo", type: "uint256" },
+      { name: "_receiver", type: "bytes" },
+      { name: "_permitEnvelope", type: "bytes" },
+      { name: "_useAssetFee", type: "bool" },
+      { name: "_referralCode", type: "uint32" },
+      { name: "_autoParams", type: "bytes" },
+    ],
+    outputs: [{ name: "submissionId", type: "bytes32" }],
+  },
+] as const;
+
 /** ERC20 metadata — read on-chain for forward-found reps that no token-list covers. */
 export const ERC20_META_ABI = [
   { type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint8" }] },
@@ -74,8 +95,12 @@ export interface RawDeAsset {
   address: string;
   /** lock-origin internal chain id (from getNativeInfo) */
   nativeChainId: number;
-  /** lock-origin token address (lowercased) */
+  /** lock-origin token address — `0x`-hex lowercased for EVM/Solana; base58 verbatim for Tron. */
   nativeAddress: string;
+  /** Authoritative debridgeId for forward-found reps (from the FamilyKey). Absent on discovered reps,
+   *  which carry a raw-hex nativeAddress that `computeDebridgeId` can re-derive correctly. Lets the
+   *  assembler group non-EVM-native families (Solana/Tron) without re-hashing a base58 native address. */
+  debridgeId?: string;
 }
 
 const CHUNK = 400;
@@ -216,7 +241,9 @@ export async function enumerateDebridgeReps(
       internalChainId,
       address: addr,
       nativeChainId: fam.nativeChainId,
-      nativeAddress: fam.nativeAddress.toLowerCase(),
+      // Preserve a base58 (Tron/Solana) native address; only 0x-hex is safe to lowercase.
+      nativeAddress: fam.nativeAddress.startsWith("0x") ? fam.nativeAddress.toLowerCase() : fam.nativeAddress,
+      debridgeId: fam.debridgeId,
     });
   });
   return { reps, ok };
@@ -266,4 +293,38 @@ export async function getFixedFeeWei(internalChainId: number, debridgeId: Hex): 
     functionName: "getDebridgeChainAssetFixedFee",
     args: [debridgeId, BigInt(internalChainId)],
   });
+}
+
+/** Live gate reserve/limit state for a family on a given chain — the readable inputs to the claim
+ *  precheck (a dePort claim can't be eth_call'd cold). Throws on RPC failure (caller treats as skipped). */
+export interface DebridgeInfo {
+  /** native (origin) internal chain id — same value on every chain. */
+  nativeChainId: number;
+  /** per-tx transfer cap in the asset's units (0 = no cap). */
+  maxAmount: bigint;
+  /** locked balance backing the asset on THIS chain (meaningful on the native/home chain). */
+  balance: bigint;
+  /** portion of `balance` lent out to strategies (not idle / not claimable right now). */
+  lockedInStrategies: bigint;
+  /** this family's token address ON THE QUERIED CHAIN. */
+  tokenAddress: string;
+  minReservesBps: number;
+  /** whether the family is registered on the queried chain. */
+  exist: boolean;
+}
+
+export async function readDebridgeInfo(internalChainId: number, debridgeId: Hex): Promise<DebridgeInfo> {
+  const client = getPublicClient(internalChainId);
+  const gate = deBridgeGate(internalChainId) as Address;
+  const [nativeChainId, maxAmount, balance, lockedInStrategies, tokenAddress, minReservesBps, exist] =
+    await client.readContract({ address: gate, abi: GATE_ABI, functionName: "getDebridge", args: [debridgeId] });
+  return {
+    nativeChainId: Number(nativeChainId),
+    maxAmount,
+    balance,
+    lockedInStrategies,
+    tokenAddress,
+    minReservesBps: Number(minReservesBps),
+    exist,
+  };
 }

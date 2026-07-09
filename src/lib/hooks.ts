@@ -82,11 +82,17 @@ export function useTokens() {
 import type { Opportunity } from "./types";
 
 export interface ArbFilters {
-  minNetPct?: number;
-  tier?: number;
+  minSpreadPct?: number;
   chainId?: number;
+  /** Pin to one probe size (a rung of the scan ladder); unset = best size per token. */
+  tierUsd?: number;
   verifiedOnly?: boolean;
+  /** Keep only rows whose tx simulation proved the executable path (needs ARB_SIMULATE on the scanner). */
+  executableOnly?: boolean;
+  /** Freshness override: 0 disables the server gate (all-time rows; staleness shown per-row instead). */
+  maxAgeMs?: number;
   take?: number;
+  page?: number;
 }
 
 export interface ScanRunInfo {
@@ -102,6 +108,10 @@ export interface ArbResponse {
   opportunities: Opportunity[];
   total: number;
   lastScan: ScanRunInfo | null;
+  /** The probe-size ladder actually scanned (mirrors ARB_SCAN_NOTIONAL_USD) — drives the capital selector. */
+  tiers?: number[];
+  /** Freshness gate (ms) the server applied — lets the UI alarm when lastScan exceeds it (<=0 = disabled). */
+  gateMs?: number;
 }
 
 export interface GraphSummary {
@@ -116,11 +126,14 @@ export interface GraphSummary {
 
 function buildArbUrl(f: ArbFilters): string {
   const p = new URLSearchParams();
-  if (f.minNetPct != null) p.set("minNetPct", String(f.minNetPct));
-  if (f.tier) p.set("tier", String(f.tier));
+  if (f.minSpreadPct != null) p.set("minSpreadPct", String(f.minSpreadPct));
   if (f.chainId) p.set("chainId", String(f.chainId));
+  if (f.tierUsd != null) p.set("tierUsd", String(f.tierUsd));
   if (f.verifiedOnly) p.set("verifiedOnly", "true");
+  if (f.executableOnly) p.set("executableOnly", "true");
+  if (f.maxAgeMs != null) p.set("maxAgeMs", String(f.maxAgeMs));
   if (f.take) p.set("take", String(f.take));
+  if (f.page && f.page > 1) p.set("page", String(f.page));
   const qs = p.toString();
   return `/api/arb/opportunities${qs ? `?${qs}` : ""}`;
 }
@@ -133,10 +146,16 @@ export function useArbOpportunities(filters: ArbFilters) {
   });
 }
 
-/** Polls the scan endpoint to keep the cycling scanner advancing while the page is open. */
+/**
+ * Polls the scan endpoint to keep the cycling scanner advancing while the page is open. When a dedicated
+ * scan driver owns scanning (NEXT_PUBLIC_ARB_DRIVER=1), the browser must NOT also poll — the key goes null
+ * (SWR disabled), and it would 401 anyway if CRON_SECRET is set. ScanStatus then falls back to the queue
+ * depth from the graph summary.
+ */
 export function useArbScanner(n = 12) {
+  const driverOwnsScanning = process.env.NEXT_PUBLIC_ARB_DRIVER === "1";
   return useSWR<{ unitsProcessed: number; remaining: number; rpmAvailable: number }>(
-    `/api/arb/scan?n=${n}`,
+    driverOwnsScanning ? null : `/api/arb/scan?n=${n}`,
     fetcher,
     { refreshInterval: 7_000, revalidateOnFocus: false, dedupingInterval: 5_000 }
   );

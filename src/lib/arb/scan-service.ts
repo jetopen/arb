@@ -1,17 +1,23 @@
 import type { Hex } from "viem";
 import { getLockGraph } from "../deport/graph";
 import { fetchDexQuote } from "../quotes/debridge";
+import { makeScanQuoteFetcher } from "../quotes/scan-quote";
 import { getFixedFeeUsd } from "../deport/fees";
 import { getNativeUsd } from "../quotes/native-price";
-import { verifyCandidate } from "../quotes/verify";
-import { fetchKyberQuote } from "../quotes/kyberswap";
-import { getPoolLiquidityUsd } from "../liquidity/geckoterminal";
+import { verifyCandidate, verifyViaGeckoTerminal } from "../quotes/verify";
+import { simulateOpportunity } from "../sim/simulate";
+import { fetchKyberQuote, kyberSlug } from "../quotes/kyberswap";
+import { fetchZeroExQuote } from "../quotes/zerox";
+import { getPoolLiquidityUsd, getTokenStats } from "../liquidity/geckoterminal";
 import { getStore } from "../db/store";
 import { supabaseConfigured } from "../db/supabase";
 import { chainName } from "../deport/registry";
 import { RpmBudget } from "./budget";
+import { passesLiquidityPrefilter } from "./liquidity-prefilter";
 import { runBatch, seedQueue, type ScanDeps } from "./scanner";
 import { optimizeRoute } from "./optimize";
+import { sendDiscordAlert } from "../alerts/providers/discord";
+import { shouldAlert, bestPerToken, formatOpportunityEmbed, parseAlertMinSpread, ALERT_BATCH_CAP } from "../alerts/opportunity-alert";
 
 let budget: RpmBudget | null = null;
 function getBudget(): RpmBudget {
@@ -24,6 +30,32 @@ function getBudget(): RpmBudget {
 // while still propagating new routes. seedQueue's enqueue is idempotent (dedup / ON CONFLICT).
 let seededGraphAt = 0;
 
+/**
+ * Source-aware verify dispatch, shared by buildScanDeps and the backtest scripts (which mirror it).
+ * Independence rule: the cross-check must come from a DIFFERENT source than the scan quote. Kyber is the
+ * scan source on Kyber-slugged chains (post the 2026-07-08 deBridge-429 swap), so there the cross-check is
+ * deBridge estimation — its verify-only volume (profitable candidates, a handful/day) sits comfortably
+ * under the unauthenticated ceiling. Keying on args.buyQuoteSource (not the env) keeps verify consistent
+ * with whatever source ACTUALLY produced the quote, even across a mid-run ARB_SCAN_KYBER flip. A
+ * 1inch-sourced buy leg (fallback rung) lands in the else branch → Kyber cross-check → still independent.
+ */
+export function buildVerify(apiKey?: string): ScanDeps["verify"] {
+  return (args) => {
+    if (!(kyberSlug(args.buyChainId) && kyberSlug(args.sellChainId))) {
+      return verifyViaGeckoTerminal(args, { getTokenStats, fetchZeroEx: fetchZeroExQuote });
+    }
+    const kyberIsPrimary = args.buyQuoteSource === "kyberswap";
+    return verifyCandidate(args, {
+      fetchCrossCheck: kyberIsPrimary
+        ? (c, i, o, a) => fetchDexQuote(c, i, o, a, apiKey).catch(() => null)
+        : fetchKyberQuote,
+      crossCheckSource: kyberIsPrimary ? "debridge" : "kyberswap",
+      getLiquidityUsd: getPoolLiquidityUsd,
+      fetchZeroEx: fetchZeroExQuote,
+    });
+  };
+}
+
 /** Wire the production scan dependencies (real quotes, fees, verification) onto the cached graph. */
 export async function buildScanDeps(): Promise<ScanDeps> {
   const graph = await getLockGraph();
@@ -35,14 +67,51 @@ export async function buildScanDeps(): Promise<ScanDeps> {
   }
 
   const apiKey = process.env.DEBRIDGE_API_KEY || undefined;
+  // Discord alerts (server-side, fired from whoever drives scans — incl. the headless worker). Active
+  // only when DISCORD_WEBHOOK_URL is set; alerts on net-profitable routes OR gross spread >= the optional
+  // ARB_ALERT_MIN_SPREAD_PCT. filterNewAlerts dedups so each opportunity pings once, not every tick.
+  const discordUrl = process.env.DISCORD_WEBHOOK_URL || undefined;
+  const alertMinSpread = parseAlertMinSpread(process.env.ARB_ALERT_MIN_SPREAD_PCT);
+  const notify: ScanDeps["notify"] = discordUrl
+    ? async (opps) => {
+        // Collapse to ONE row per token (strongest first) so a single profitable token can't emit an alert
+        // per ladder rung × direction (up to 8) and exhaust the cap. Cap BEFORE marking, so extras beyond
+        // the cap stay un-marked and get another chance next batch.
+        const candidates = bestPerToken(opps.filter((o) => shouldAlert(o, alertMinSpread))).slice(0, ALERT_BATCH_CAP);
+        if (candidates.length === 0) return;
+        // Dedup the cross-batch ping on the TOKEN (debridgeId), not the rung-specific opportunity id — so a
+        // token pings once even if a different rung/direction wins the next batch.
+        const fresh = new Set(await store.filterNewAlerts(candidates.map((o) => o.debridgeId)));
+        for (const o of candidates) {
+          if (fresh.has(o.debridgeId)) await sendDiscordAlert(discordUrl, { embeds: [formatOpportunityEmbed(o)] });
+        }
+      }
+    : undefined;
+
   return {
     getFamily: (id) => famMap.get(id),
-    fetchQuote: (c, i, o, a) => fetchDexQuote(c, i, o, a, apiKey),
+    // Per-chain source routing (scan-quote.ts): Jupiter for Solana, Kyber for its 10 slugged chains,
+    // deBridge estimation for the rest — with the optional 1inch last-resort rung on Kyber transients.
+    fetchQuote: makeScanQuoteFetcher(apiKey),
     getFeeUsd: async (chainId, dbId) => getFixedFeeUsd(chainId, dbId as Hex, await getNativeUsd(chainId)),
-    verify: (args) => verifyCandidate(args, { fetchKyber: fetchKyberQuote, getLiquidityUsd: getPoolLiquidityUsd }),
+    // Independent cross-check when an aggregator covers BOTH legs, else the GeckoTerminal path — it gates
+    // both legs' liquidity AND price-checks the buy and (when a sell quote is passed) the sell leg, so a
+    // depegged non-aggregator sell side can't slip through verifyCandidate's buy-leg-only cross-check.
+    // When the cross-check/GeckoTerminal can't corroborate a leg (a pool 1inch/0x route but they don't
+    // index — the MGLD/deMGLD false-negative class), both paths fall back to a 0x routability check
+    // (fetchZeroEx) and badge it `aggregatorRoutable` rather than hard-rejecting. Needs ZEROX_API_KEY;
+    // absent → degrades to routable. Source-independence logic lives in buildVerify above.
+    verify: buildVerify(apiKey),
+    // Tx simulation of the executable path (build → eth_call with state overrides). Gated upstream by
+    // ARB_SIMULATE in scanUnit; here we just supply the impl + the deBridge API key for the build calls.
+    simulate: (args) => simulateOpportunity({ ...args, apiKey }),
+    // Cached GeckoTerminal liquidity pre-filter for the cold sweep: skips units whose deAsset rep has no
+    // indexed pool at all, for 0 quote spend. Fails open; kill-switch ARB_PREFILTER=false.
+    prefilter: (chainId, address) => passesLiquidityPrefilter(chainId, address),
     store,
     budget: getBudget(),
     concurrency: Number(process.env.ARB_SCAN_CONCURRENCY ?? 8),
+    notify,
   };
 }
 
@@ -69,21 +138,22 @@ export async function runOptimize(debridgeId: string, buyChainId: number, sellCh
   const sellToken = member(sellChainId);
   if (!buyToken || !sellToken) return { error: "tokens not found on those chains" as const };
 
-  // optimizeRoute, like scanUnit, passes raw token units 1:1 across the redemption — both legs must
-  // share a known decimals or the size sweep is mis-scaled. Forward-found reps can lack/mismatch it.
+  // optimizeRoute mirrors scanUnit: the dePort move is 1:1 by VALUE, so the size sweep rescales the
+  // bridged amount by the buy→sell decimal delta. Decimals only need to be KNOWN (rep ≠ native is fine —
+  // e.g. an 18-dec EVM token ↔ its 8-dec Solana deAsset); forward-found reps can still lack them.
   const decimalsOf = (chainId: number) =>
     chainId === family.nativeChainId ? family.decimals : family.reps.find((r) => r.internalChainId === chainId)?.decimals;
   const buyDecimals = decimalsOf(buyChainId);
   const sellDecimals = decimalsOf(sellChainId);
-  if (buyDecimals === undefined || sellDecimals === undefined || buyDecimals !== sellDecimals) {
-    return { error: "token decimals unknown or mismatched — 1:1 redemption not size-safe" as const };
+  if (buyDecimals === undefined || sellDecimals === undefined) {
+    return { error: "token decimals unknown — 1:1 redemption not size-safe" as const };
   }
 
   const apiKey = process.env.DEBRIDGE_API_KEY || undefined;
   return optimizeRoute(
-    { debridgeId, buyChainId, sellChainId, buyToken, sellToken, symbol: family.symbol },
+    { debridgeId, buyChainId, sellChainId, buyToken, sellToken, symbol: family.symbol, buyDecimals, sellDecimals },
     {
-      fetchQuote: (c, i, o, a) => fetchDexQuote(c, i, o, a, apiKey),
+      fetchQuote: makeScanQuoteFetcher(apiKey),
       getFeeUsd: async (chainId, dbId) => getFixedFeeUsd(chainId, dbId as Hex, await getNativeUsd(chainId)),
     }
   );

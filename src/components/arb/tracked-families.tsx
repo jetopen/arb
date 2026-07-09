@@ -11,10 +11,23 @@ function short(addr: string): string {
 }
 
 function RepPill({ rep }: { rep: TrackedRep }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(rep.address);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      /* clipboard unavailable (e.g. insecure context) — ignore */
+    }
+  };
   return (
-    <span
-      className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/20 px-2 py-0.5 text-xs"
-      title={`${rep.chainName} · ${rep.address}${rep.decimals != null ? ` · ${rep.decimals} dec` : ""}`}
+    <button
+      type="button"
+      onClick={copy}
+      aria-label={`Copy ${rep.chainName} address ${rep.address}`}
+      title={`Click to copy · ${rep.chainName} · ${rep.address}${rep.decimals != null ? ` · ${rep.decimals} dec` : ""}`}
+      className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/20 px-2 py-0.5 text-xs transition-colors hover:border-accent/40 hover:bg-muted/50"
     >
       {rep.isNativeRoot && (
         <span className="text-accent" aria-label="native root">
@@ -23,7 +36,10 @@ function RepPill({ rep }: { rep: TrackedRep }) {
       )}
       <span className="font-medium text-foreground">{rep.chainName}</span>
       <span className="font-mono text-muted">{short(rep.address)}</span>
-    </span>
+      <span className={`ml-0.5 ${copied ? "text-green-700" : "text-muted/60"}`} aria-hidden="true">
+        {copied ? "✓" : "⧉"}
+      </span>
+    </button>
   );
 }
 

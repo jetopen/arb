@@ -1,0 +1,94 @@
+# Watchdog: pings the deployed UI's /api/health every 30 min and alerts Discord when the scanner goes
+# stale/down — the signal the scan loop itself can NEVER send (a dead loop can't alert; /api/health flips
+# 503 on the same freshness gate the dashboard uses, but nothing was calling it). Deliberately a separate
+# tiny workflow so it survives every failure mode of scan.yml.
+#
+# Alerting is TRANSITION-GATED via the previous completed run's conclusion (gh run list): one 🔴 ping on
+# the first unhealthy check, silence while it stays red (the red runs in the Actions tab carry the state),
+# one 🟢 ping on recovery. If DISCORD_WEBHOOK_URL isn't set, the red run itself is still the signal.
+#
+# Platform caveats (same exposure scan.yml already carries): GitHub cron is best-effort (ticks can slip
+# minutes — fine at 30-min cadence), and scheduled workflows pause after ~60 days of repo inactivity.
+name: arb-watchdog
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a test ping to Discord and exit (verifies webhook wiring)"
+        type: boolean
+        default: false
+
+permissions:
+  actions: read # gh run list (transition dedup)
+
+concurrency:
+  group: arb-watchdog
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      GH_TOKEN: ${{ github.token }}
+      HEALTH_URL: https://arb-scanner-gamma.vercel.app/api/health
+    steps:
+      - name: Health check + transition-gated Discord alert
+        run: |
+          post() { # best-effort Discord post; skips (with a visible notice) when the secret is unset
+            if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+              echo "::notice::DISCORD_WEBHOOK_URL secret not set - skipping Discord ping (red run is the only signal)"
+              return 0
+            fi
+            curl -sS --max-time 15 -H "Content-Type: application/json" \
+              -d "$(jq -cn --arg c "$1" '{content:$c}')" "$DISCORD_WEBHOOK_URL" >/dev/null \
+              || echo "::warning::Discord post failed"
+          }
+
+          if [ "${{ inputs.test_alert }}" = "true" ]; then
+            post "🧪 arb watchdog test ping — webhook wiring OK"
+            exit 0
+          fi
+
+          # DEBOUNCE a single transient blip (a slow response / one-off Supabase read hiccup is NOT a dead
+          # loop): probe up to 3× 20s apart; healthy if ANY probe is 200, unhealthy only if all fail. Keeps
+          # the same spirit as scan.yml's 5-tick storm gate — one flaky sample must not page.
+          code=000
+          for attempt in 1 2 3; do
+            code=$(curl -sS --max-time 20 -o body.json -w "%{http_code}" "$HEALTH_URL") || code=000
+            [ "$code" = "200" ] && break
+            [ "$attempt" -lt 3 ] && sleep 20
+          done
+          age=$(jq -r '.lastScanAgeMs // empty' body.json 2>/dev/null || true)
+          gate=$(jq -r '.gateMs // empty' body.json 2>/dev/null || true)
+          sha=$(jq -r '.gitSha // "unknown"' body.json 2>/dev/null || echo unknown)
+          agoM=unknown; gateM=unknown
+          [ -n "$age" ] && agoM=$((age / 60000))
+          [ -n "$gate" ] && gateM=$((gate / 60000))
+
+          # Dedup state = the last SCHEDULED run's conclusion only. Scoping to --event schedule means a manual
+          # test_alert / workflow_dispatch (which concludes 'success') can't poison the outage state machine.
+          prev=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "watchdog.yml" --event schedule \
+            --status completed --limit 1 --json conclusion -q '.[0].conclusion' || echo "")
+          echo "health=$code lastScanAge=${agoM}m gate=${gateM}m sha=$sha prevScheduledRun=${prev:-none}"
+
+          if [ "$code" = "200" ]; then
+            # Recovery ping only when we were definitely red (prev scheduled run failed).
+            if [ "$prev" = "failure" ]; then
+              post "🟢 arb scanner recovered — last scan ${agoM}m ago"
+            fi
+            exit 0
+          fi
+
+          # Page ONLY on a clean transition from healthy (prev 'success' or first-ever). A prior 'failure'
+          # (already paged) or 'cancelled' (ambiguous — could have paged) stays silent to avoid duplicate reds.
+          if [ "$prev" = "success" ] || [ -z "$prev" ]; then
+            post "🔴 arb scanner DOWN/stale — health HTTP $code, last scan ${agoM}m ago (gate ${gateM}m), sha $sha, https://arb-scanner-gamma.vercel.app/arbitrage"
+          else
+            echo "still unhealthy (prev scheduled='$prev') — staying red without re-pinging"
+          fi
+          exit 1

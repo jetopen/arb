@@ -1,9 +1,16 @@
-import type { Family, Opportunity, OpportunityFilter, ScanUnit } from "../types";
-import type { Store, ScanRunRecord, ScanOutcome } from "./store";
-import { DEAD_ROUTE_PENALTY_MS, workUnitId } from "./store";
+import type { Family, LockGraph, Opportunity, OpportunityFilter, ScanUnit } from "../types";
+import type { Store, ScanRunRecord, ScanOutcome, OpportunityHistoryPoint } from "./store";
+import { TRANSIENT_RETRY_MS, HOT_RATIO, HOT_MIN_INTERVAL_MS, PROVEN_MAX_AGE_MS, workUnitId } from "./store";
 import { getServiceClient } from "./supabase";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
+
+/** True when an RPC error means the function isn't in the DB yet (migration 0003 not applied). Used to
+ *  fall back to JS-side grouping so the page keeps working until the migration runs. */
+function isMissingFunction(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false;
+  return error.code === "PGRST202" || /could not find the function|function .* does not exist/i.test(error.message ?? "");
+}
 
 export function rowToOpp(r: any): Opportunity {
   return {
@@ -17,6 +24,7 @@ export function rowToOpp(r: any): Opportunity {
     tierUsd: r.tier_usd,
     edge: r.edge,
     verification: r.verification ?? null,
+    ...(r.simulation ? { simulation: r.simulation } : {}),
     lockPath: r.lock_path ?? [],
     computedAt: r.computed_at ? new Date(r.computed_at).getTime() : 0,
     timesSeen: r.times_seen ?? undefined,
@@ -40,6 +48,7 @@ export function oppToItem(o: Opportunity) {
     gross_spread_pct: o.edge.grossSpreadPct,
     edge: o.edge,
     verification: o.verification,
+    simulation: o.simulation ?? null,
     lock_path: o.lockPath,
     // The authoritative cross-check result — distinct from edge.profitable.
     verified: o.verification?.verified ?? false,
@@ -53,6 +62,34 @@ export function rowToUnit(r: any): ScanUnit {
     sellChainId: r.sell_chain_id,
     tierUsd: r.tier_usd,
     kind: r.kind,
+  };
+}
+
+/** Family -> arb_families row (snake_case; reps stays jsonb). Undefined optionals become null. */
+export function famToRow(f: Family) {
+  return {
+    debridge_id: f.debridgeId,
+    native_chain_id: f.nativeChainId,
+    native_address: f.nativeAddress,
+    symbol: f.symbol ?? null,
+    name: f.name ?? null,
+    decimals: f.decimals ?? null,
+    native_on_home_chain: f.nativeOnHomeChain,
+    reps: f.reps,
+  };
+}
+
+/** arb_families row (as emitted by arb_load_graph) -> Family. Null optionals become undefined. */
+export function rowToFamily(r: any): Family {
+  return {
+    debridgeId: r.debridge_id,
+    nativeChainId: r.native_chain_id,
+    nativeAddress: r.native_address,
+    symbol: r.symbol ?? undefined,
+    name: r.name ?? undefined,
+    decimals: r.decimals ?? undefined,
+    nativeOnHomeChain: r.native_on_home_chain,
+    reps: r.reps ?? [],
   };
 }
 
@@ -73,18 +110,104 @@ export class SupabaseStore implements Store {
     const page = filter.page ?? 1;
     const take = filter.take ?? 50;
     const start = (page - 1) * take;
-    let q = this.db.from("arb_opportunities").select("*", { count: "exact" });
-    if (filter.minNetPct != null && Number.isFinite(filter.minNetPct)) q = q.gte("net_edge_pct", filter.minNetPct);
-    if (filter.tierUsd != null && Number.isFinite(filter.tierUsd)) q = q.eq("tier_usd", filter.tierUsd);
-    if (filter.chainId != null && Number.isFinite(filter.chainId)) {
-      const cid = Math.trunc(filter.chainId);
-      q = q.or(`buy_chain_id.eq.${cid},sell_chain_id.eq.${cid}`);
+
+    const computedAfter =
+      filter.maxAgeMs != null && Number.isFinite(filter.maxAgeMs)
+        ? new Date(Date.now() - filter.maxAgeMs).toISOString()
+        : null;
+    // Fresh-first band for the per-token pick (0017): a re-RANK boundary, not an exclusion.
+    const freshAfter =
+      filter.freshBandMs != null && Number.isFinite(filter.freshBandMs) && filter.freshBandMs > 0
+        ? new Date(Date.now() - filter.freshBandMs).toISOString()
+        : null;
+    const minSpread = filter.minSpreadPct != null && Number.isFinite(filter.minSpreadPct) ? filter.minSpreadPct : null;
+    const chainId = filter.chainId != null && Number.isFinite(filter.chainId) ? Math.trunc(filter.chainId) : null;
+    const tierUsd = filter.tierUsd != null && Number.isFinite(filter.tierUsd) ? Math.trunc(filter.tierUsd) : null;
+
+    // Shared predicate builder for the ungrouped path and the grouped fallback (identical filters).
+    const applyFilters = (q: any) => {
+      if (minSpread != null) q = q.gte("gross_spread_pct", minSpread);
+      if (chainId != null) q = q.or(`buy_chain_id.eq.${chainId},sell_chain_id.eq.${chainId}`);
+      if (tierUsd != null) q = q.eq("tier_usd", tierUsd);
+      if (filter.verifiedOnly) q = q.eq("verified", true);
+      if (filter.executableOnly) q = q.eq("simulation->>executable", "true");
+      if (computedAfter != null) q = q.gte("computed_at", computedAfter);
+      return q;
+    };
+
+    // Spread screener, one row per token: collapse server-side via the distinct-on RPC (migration 0003)
+    // so we fetch only the page we return and get an exact distinct-token total.
+    if (filter.groupByToken) {
+      // Only send p_executable_only when the filter is ON, so a default query still matches the pre-0011
+      // RPC signature (graceful degradation until migration 0011 is applied; if it's on without the
+      // migration, the param-mismatch trips the isMissingFunction JS fallback below, which also filters).
+      const rpcArgs: Record<string, unknown> = {
+        p_min_spread_pct: minSpread,
+        p_chain_id: chainId,
+        p_tier_usd: tierUsd,
+        p_verified_only: !!filter.verifiedOnly,
+        p_computed_after: computedAfter,
+        p_limit: take,
+        p_offset: start,
+      };
+      if (filter.executableOnly) rpcArgs.p_executable_only = true;
+      // Same conditional-send pattern: omit p_fresh_after unless set, so a default query still matches
+      // the pre-0017 RPC signature (param-mismatch would trip the isMissingFunction fallback below).
+      if (freshAfter != null) rpcArgs.p_fresh_after = freshAfter;
+      const { data, error } = await this.db.rpc("arb_top_opportunities_by_token", rpcArgs);
+      if (!error) {
+        // The RPC returns a single jsonb object { total, rows } so the exact distinct-token total
+        // survives even an out-of-range (empty) page.
+        const payload = (data ?? {}) as { total?: number | string; rows?: unknown[] };
+        const rows = Array.isArray(payload.rows) ? payload.rows : [];
+        return { opportunities: rows.map((r) => rowToOpp(r)), total: Number(payload.total ?? 0) };
+      }
+      // Fallback when 0003 (the RPC) isn't applied yet: collapse in JS so the page keeps working. Bounded
+      // by max-rows and less efficient — the RPC is the real fix once the migration runs.
+      if (!isMissingFunction(error)) throw new Error(`topOpportunities: ${error.message}`);
+      const { data: fbData, error: fbErr } = await applyFilters(this.db.from("arb_opportunities").select("*"))
+        .order("gross_spread_pct", { ascending: false })
+        .order("id", { ascending: true })
+        .limit(1000);
+      if (fbErr) throw new Error(`topOpportunities: ${fbErr.message}`);
+      // Mirror the RPC's fresh-first pick (0017): within a token, a fresh row beats ANY stale row; among
+      // all-stale rows the most RECENT wins (then gross) — the last-known state, not the best-ever gross.
+      const rows = [...(fbData ?? [])];
+      if (freshAfter != null) {
+        // Compare NUMERICALLY: r.computed_at is PostgREST's timestamptz ('+00:00', µs) while freshAfter is
+        // a JS toISOString ('Z', ms) — a raw string compare is format-mismatched near the cutoff. Recency
+        // between two same-format PostgREST strings is fine lexicographically, but parse both to be safe.
+        const freshMs = Date.parse(freshAfter);
+        const ms = (r: any) => Date.parse(r.computed_at);
+        const isFresh = (r: any) => (ms(r) >= freshMs ? 1 : 0);
+        rows.sort(
+          (a: any, b: any) =>
+            isFresh(b) - isFresh(a) ||
+            (isFresh(a) === 0 ? ms(b) - ms(a) : 0) || // both stale → most recent first
+            b.gross_spread_pct - a.gross_spread_pct ||
+            (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+        );
+      }
+      const seen = new Set<string>();
+      const grouped = rows.filter((r: any) => {
+        if (seen.has(r.debridge_id)) return false;
+        seen.add(r.debridge_id);
+        return true;
+      });
+      // Outward page order stays gross desc (parity with the RPC's unchanged `page` CTE).
+      if (freshAfter != null) {
+        grouped.sort(
+          (a: any, b: any) => b.gross_spread_pct - a.gross_spread_pct || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+        );
+      }
+      return { opportunities: grouped.slice(start, start + take).map(rowToOpp), total: grouped.length };
     }
-    if (filter.verifiedOnly) q = q.eq("verified", true);
-    if (filter.maxAgeMs != null && Number.isFinite(filter.maxAgeMs)) {
-      q = q.gte("computed_at", new Date(Date.now() - filter.maxAgeMs).toISOString());
-    }
-    q = q.order("net_edge_pct", { ascending: false }).range(start, start + take - 1);
+
+    // Ungrouped (tests / future callers): exact count + DB pagination, id tiebreaker for determinism.
+    const q = applyFilters(this.db.from("arb_opportunities").select("*", { count: "exact" }))
+      .order("gross_spread_pct", { ascending: false })
+      .order("id", { ascending: true })
+      .range(start, start + take - 1);
     const { data, count, error } = await q;
     if (error) throw new Error(`topOpportunities: ${error.message}`);
     return { opportunities: (data ?? []).map(rowToOpp), total: count ?? 0 };
@@ -106,7 +229,13 @@ export class SupabaseStore implements Store {
   }
 
   async dequeue(n: number): Promise<ScanUnit[]> {
-    const { data, error } = await this.db.rpc("arb_dequeue_work", { n });
+    // Hot-lane split: reserve ceil(n*HOT_RATIO) slots for the proven set (priority>=1) so live routes
+    // refresh fast. The RPC leases the hot rows in its first statement, so the cold fill (second statement)
+    // can't re-grab them — one round-trip, no double-lease.
+    const n_hot = Math.ceil(Math.max(0, n) * HOT_RATIO);
+    // hot_min_interval_ms makes the ARB_HOT_MIN_INTERVAL_MS knob authoritative on the SQL path too
+    // (migration 0015; before that the RPC hard-coded 10 min and the env only affected MemoryStore).
+    const { data, error } = await this.db.rpc("arb_dequeue_batch", { n, n_hot, hot_min_interval_ms: HOT_MIN_INTERVAL_MS });
     if (error) throw new Error(`dequeue: ${error.message}`);
     return (data ?? []).map(rowToUnit);
   }
@@ -115,35 +244,55 @@ export class SupabaseStore implements Store {
     if (outcomes.length === 0) return;
     const now = Date.now();
     const liveIds = outcomes.filter((o) => o.live).map((o) => workUnitId(o.unit));
-    const deadIds = outcomes.filter((o) => !o.live).map((o) => workUnitId(o.unit));
+    const failed = outcomes.filter((o) => !o.live);
+    const failedIds = failed.map((o) => workUnitId(o.unit));
 
-    // A dead route that has ever produced an opportunity is "proven" — a single failure is a transient
-    // blip, not a dead pool, so it keeps cycling. Only UNproven-dead routes get time-demoted.
-    let provenDead: string[] = [];
-    if (deadIds.length > 0) {
-      const { data, error } = await this.db.from("arb_opportunities").select("id").in("id", deadIds);
+    // A failed route that produced an opportunity WITHIN PROVEN_MAX_AGE_MS is "proven" — a single failure is
+    // a blip, not a dead pool, so it keeps cycling. The freshness bound (4c) stops a route that quoted once
+    // long ago and has failed since from holding a hot slot forever. Among the non-kept: a TRANSIENT upstream
+    // error (5xx/429/network) gets a short backoff; a permanent no-route gets exponential dead-route backoff.
+    let provenSet = new Set<string>();
+    if (failedIds.length > 0) {
+      const { data, error } = await this.db
+        .from("arb_opportunities")
+        .select("id")
+        .in("id", failedIds)
+        .gte("computed_at", new Date(now - PROVEN_MAX_AGE_MS).toISOString());
       if (error) throw new Error(`markScanned(proven): ${error.message}`);
-      provenDead = (data ?? []).map((r: any) => r.id as string);
+      provenSet = new Set((data ?? []).map((r: any) => r.id as string));
     }
-    const provenSet = new Set(provenDead);
-    const keepIds = [...liveIds, ...provenDead]; // cycle normally (now)
-    const demoteIds = deadIds.filter((id) => !provenSet.has(id)); // push into the future
+    const keepIds = [...liveIds];
+    const transientIds: string[] = [];
+    const demoteIds: string[] = [];
+    for (const o of failed) {
+      const id = workUnitId(o.unit);
+      if (provenSet.has(id)) keepIds.push(id); // proven & fresh → cycle normally
+      else if (o.transient) transientIds.push(id); // transient blip → short backoff
+      else demoteIds.push(id); // permanent no-route → exponential dead-route backoff (4d)
+    }
 
-    // Two bulk updates (no RPC/DDL needed). Clearing the lease lets a kept route re-enter immediately.
-    if (keepIds.length > 0) {
+    // Bulk time-stamp updates. Clearing the lease lets a kept route re-enter immediately; keep also resets
+    // fail_count so a route that recovers restarts its backoff (4d).
+    const bump = async (ids: string[], whenMs: number, label: string, extra: Record<string, unknown> = {}) => {
+      if (ids.length === 0) return;
       const { error } = await this.db
         .from("arb_work_queue")
-        .update({ last_scanned_at: new Date(now).toISOString(), leased_until: null })
-        .in("id", keepIds);
-      if (error) throw new Error(`markScanned(keep): ${error.message}`);
-    }
-    if (demoteIds.length > 0) {
-      const { error } = await this.db
-        .from("arb_work_queue")
-        .update({ last_scanned_at: new Date(now + DEAD_ROUTE_PENALTY_MS).toISOString(), leased_until: null })
-        .in("id", demoteIds);
+        .update({ last_scanned_at: new Date(whenMs).toISOString(), leased_until: null, ...extra })
+        .in("id", ids);
+      if (error) throw new Error(`markScanned(${label}): ${error.message}`);
+    };
+    // Dead routes get per-row exponential backoff (6h·2^fail_count, capped 72h) via the RPC — a bulk column
+    // update can't compute a per-row interval from the row's own fail_count.
+    const demoteDead = async () => {
+      if (demoteIds.length === 0) return;
+      const { error } = await this.db.rpc("arb_demote_dead", { p_ids: demoteIds });
       if (error) throw new Error(`markScanned(demote): ${error.message}`);
-    }
+    };
+    await Promise.all([
+      bump(keepIds, now, "keep", { fail_count: 0 }),
+      bump(transientIds, now + TRANSIENT_RETRY_MS, "transient"),
+      demoteDead(),
+    ]);
   }
 
   async requeueFresh(ids: string[]): Promise<void> {
@@ -159,6 +308,16 @@ export class SupabaseStore implements Store {
         .update({ priority: 1 })
         .in("id", slice);
       if (error) throw new Error(`requeueFresh: ${error.message}`);
+    }
+  }
+
+  async deleteUnitsByDebridgeIds(debridgeIds: string[]): Promise<void> {
+    // Majors-denylist cleanup: drop every queued unit for these families. Chunked like requeueFresh so a
+    // large denylist can't blow the URL/param limits. arb_opportunities rows are deliberately untouched.
+    for (let i = 0; i < debridgeIds.length; i += 500) {
+      const slice = debridgeIds.slice(i, i + 500);
+      const { error } = await this.db.from("arb_work_queue").delete().in("debridge_id", slice);
+      if (error) throw new Error(`deleteUnitsByDebridgeIds: ${error.message}`);
     }
   }
 
@@ -186,13 +345,15 @@ export class SupabaseStore implements Store {
   }
 
   async recordScanRun(run: ScanRunRecord): Promise<void> {
-    const { error } = await this.db.from("arb_scan_runs").insert({
-      started_at: new Date(run.startedAt).toISOString(),
-      finished_at: new Date(run.finishedAt).toISOString(),
-      units_processed: run.unitsProcessed,
-      quotes_spent: run.quotesSpent,
-      opportunities_found: run.opportunitiesFound,
-      partial: run.partial,
+    // RPC (0016) inserts AND prunes the >14d tail in one round trip — the table was append-only
+    // (~6-9k rows/day, unbounded) before. Requires migration 0016 applied ahead of this code.
+    const { error } = await this.db.rpc("arb_record_scan_run", {
+      p_started_at: new Date(run.startedAt).toISOString(),
+      p_finished_at: new Date(run.finishedAt).toISOString(),
+      p_units_processed: run.unitsProcessed,
+      p_quotes_spent: run.quotesSpent,
+      p_opportunities_found: run.opportunitiesFound,
+      p_partial: run.partial,
     });
     if (error) throw new Error(`recordScanRun: ${error.message}`);
   }
@@ -216,35 +377,53 @@ export class SupabaseStore implements Store {
     };
   }
 
-  async saveFamilies(families: Family[]): Promise<void> {
-    if (families.length === 0) return;
-    const rows = families.map((f) => ({
-      debridge_id: f.debridgeId,
-      native_chain_id: f.nativeChainId,
-      native_address: f.nativeAddress,
-      symbol: f.symbol ?? null,
-      name: f.name ?? null,
-      decimals: f.decimals ?? null,
-      native_on_home_chain: f.nativeOnHomeChain,
-      reps: f.reps,
-    }));
-    const { error } = await this.db.from("arb_families").upsert(rows, { onConflict: "debridge_id" });
-    if (error) throw new Error(`saveFamilies: ${error.message}`);
+  async saveGraph(graph: LockGraph): Promise<void> {
+    // An empty graph means discovery wholly failed — don't clobber the high-water-mark snapshot (the
+    // RPC never deletes anyway) or stamp the meta row with a broken build. Mirrors the old length guard.
+    if (graph.families.length === 0) return;
+    const { error } = await this.db.rpc("arb_save_graph", {
+      p_meta: { built_at: graph.builtAt, chains_scanned: graph.chainsScanned, partial: graph.partial },
+      p_families: graph.families.map(famToRow),
+    });
+    if (error) throw new Error(`saveGraph: ${error.message}`);
   }
 
-  async loadFamilies(): Promise<Family[] | null> {
-    const { data, error } = await this.db.from("arb_families").select("*");
-    if (error) throw new Error(`loadFamilies: ${error.message}`);
-    if (!data || data.length === 0) return null;
-    return data.map((r: any) => ({
-      debridgeId: r.debridge_id,
-      nativeChainId: r.native_chain_id,
-      nativeAddress: r.native_address,
-      symbol: r.symbol ?? undefined,
-      name: r.name ?? undefined,
-      decimals: r.decimals ?? undefined,
-      nativeOnHomeChain: r.native_on_home_chain,
-      reps: r.reps ?? [],
+  async filterNewAlerts(ids: string[]): Promise<string[]> {
+    if (ids.length === 0) return [];
+    const { data, error } = await this.db.rpc("arb_filter_new_alerts", { p_ids: ids });
+    if (error) throw new Error(`filterNewAlerts: ${error.message}`);
+    return (data ?? []).map((r: any) => (typeof r === "string" ? r : r.id));
+  }
+
+  async opportunityHistory(unitId: string, limit: number): Promise<OpportunityHistoryPoint[]> {
+    const { data, error } = await this.db
+      .from("arb_opportunity_history")
+      .select("ts, gross_spread_pct, net_usd, tier_usd")
+      .eq("unit_id", unitId)
+      .order("ts", { ascending: false })
+      .limit(limit);
+    if (error) throw new Error(`opportunityHistory: ${error.message}`);
+    return (data ?? []).map((r: any) => ({
+      ts: new Date(r.ts).getTime(),
+      grossSpreadPct: r.gross_spread_pct,
+      netUsd: r.net_usd,
+      tierUsd: r.tier_usd,
     }));
+  }
+
+  async loadGraph(): Promise<LockGraph | null> {
+    // Single jsonb value (not a row select) so the family list can't hit PostgREST's 1000-row cap.
+    const { data, error } = await this.db.rpc("arb_load_graph");
+    if (error) throw new Error(`loadGraph: ${error.message}`);
+    const payload = (data ?? {}) as { meta?: any; families?: any[] };
+    if (!payload.meta) return null; // snapshot never written → caller rebuilds
+    const builtAt = Number(payload.meta.built_at);
+    if (!Number.isFinite(builtAt)) return null; // corrupt/missing builtAt → treat as no snapshot, never NaN
+    return {
+      families: (payload.families ?? []).map(rowToFamily),
+      builtAt,
+      chainsScanned: Array.isArray(payload.meta.chains_scanned) ? payload.meta.chains_scanned.map(Number) : [],
+      partial: !!payload.meta.partial,
+    };
   }
 }

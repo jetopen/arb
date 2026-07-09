@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { summarizeCurve, optimizeRoute, type SizePoint, type OptimizeDeps, type OptimizeRoute } from "../arb/optimize";
+import { summarizeCurve, optimizeRoute, DEFAULT_SIZE_GRID, type SizePoint, type OptimizeDeps, type OptimizeRoute } from "../arb/optimize";
 import type { DexQuote } from "../types";
 
 const pt = (sizeUsd: number, grossPct: number, netUsd: number): SizePoint => ({
@@ -87,5 +87,14 @@ describe("optimizeRoute", () => {
     const noBase = await optimizeRoute({ ...route, buyChainId: 999999 }, deps, [100]);
     expect(noBase.curve).toEqual([]);
     expect(noBase.best).toBeNull();
+  });
+});
+
+describe("DEFAULT_SIZE_GRID", () => {
+  it("covers the micro range down to $10 (matches the screener's small-capital focus)", () => {
+    expect(DEFAULT_SIZE_GRID[0]).toBe(10);
+    expect(DEFAULT_SIZE_GRID).toContain(25);
+    // strictly ascending
+    expect([...DEFAULT_SIZE_GRID].sort((a, b) => a - b)).toEqual(DEFAULT_SIZE_GRID);
   });
 });

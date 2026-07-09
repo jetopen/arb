@@ -2,8 +2,10 @@
 
 import { useEffect, useState } from "react";
 import type { Opportunity } from "@/lib/types";
-import { chainName, getChainByInternalId } from "@/lib/deport/registry";
-import { getExplorerAddressUrl } from "@/lib/chains";
+import { chainName } from "@/lib/deport/registry";
+import { timeAgo } from "@/lib/time";
+import { executeLinks } from "@/lib/arb/deep-links";
+import { LegAddress } from "./leg-address";
 
 function money(n: number): string {
   return `${n < 0 ? "-" : ""}$${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
@@ -39,26 +41,39 @@ export function OpportunityDetail({ opp, onClose }: { opp: Opportunity; onClose:
         className={`fixed top-0 right-0 h-full w-full max-w-lg bg-white shadow-xl z-50 transition-transform duration-200 ${visible ? "translate-x-0" : "translate-x-full"}`}
       >
         <div className="flex items-center justify-between px-6 py-4 border-b border-border">
-          <h2 className="text-lg font-semibold text-foreground">
-            {opp.symbol ?? "Opportunity"} · {chainName(opp.buyChainId)} → {chainName(opp.sellChainId)}
-          </h2>
+          <div>
+            <h2 className="text-lg font-semibold text-foreground">
+              {opp.symbol ?? "Opportunity"} · {chainName(opp.buyChainId)} → {chainName(opp.sellChainId)}
+            </h2>
+            <p className="text-xs text-muted mt-0.5">
+              Quote computed {timeAgo(opp.computedAt)} — a time-sensitive snapshot, re-check before sizing.
+            </p>
+          </div>
           <button onClick={close} className="text-muted hover:text-foreground text-lg">✕</button>
         </div>
 
         <div className="overflow-y-auto h-[calc(100%-64px)] px-6 py-4 space-y-6">
           <Section title="Edge">
-            <Row label="Net edge %">
-              <span className={e.netEdgePct > 0 ? "text-accent font-semibold" : "text-red-600"}>
+            <Row label="Gross spread">
+              <span className={e.grossSpreadPct > 0 ? "text-accent font-semibold" : "text-red-600"}>
+                {e.grossSpreadPct >= 0 ? "+" : ""}{e.grossSpreadPct.toFixed(3)}%
+              </span>
+            </Row>
+            <Row label="Probe size">${opp.tierUsd.toLocaleString()}</Row>
+            <Row label="Net edge % (after fees)">
+              <span className={e.netEdgePct > 0 ? "text-accent" : "text-red-600"}>
                 {e.netEdgePct >= 0 ? "+" : ""}{e.netEdgePct.toFixed(3)}%
               </span>
             </Row>
             <Row label="Net (optimistic)">{money(e.netUsd)}</Row>
             <Row label="Net (after slippage)">{money(e.netUsdConservative)}</Row>
-            <Row label="Gross spread">{e.grossSpreadPct.toFixed(3)}%</Row>
-            <Row label="Tier (notional)">${opp.tierUsd.toLocaleString()}</Row>
           </Section>
 
+          <ExecuteSection opp={opp} />
+
           <OptimizeSection opp={opp} />
+
+          <HistorySection opp={opp} />
 
           <Section title="Itemized costs">
             <Row label="dePort fixed fee">{money(e.deportFeeUsd)}</Row>
@@ -74,6 +89,10 @@ export function OpportunityDetail({ opp, onClose }: { opp: Opportunity; onClose:
                 <Row label="Status">
                   {v.verified ? (
                     <span className="text-accent">✓ corroborated ({v.sourcesAgreed.join(" + ")})</span>
+                  ) : v.aggregatorRoutable ? (
+                    <span className="text-amber-600" title="No independent pool/spot source could corroborate this, but a DEX aggregator (deBridge/1inch, 0x) routes it. Real but unverified — hand-check before sizing up.">
+                      ⚡ 1inch-routable (no independent pool/spot; aggregator routes it)
+                    </span>
                   ) : (
                     <span className="text-muted">{v.rejectReason ?? "unverified"}</span>
                   )}
@@ -99,22 +118,12 @@ export function OpportunityDetail({ opp, onClose }: { opp: Opportunity; onClose:
           )}
 
           <Section title="Lock path">
-            {opp.lockPath.map((leg, i) => {
-              const evmId = getChainByInternalId(leg.chainId)?.evmChainId ?? leg.chainId;
-              const url = getExplorerAddressUrl(evmId, leg.address);
-              return (
-                <div key={i} className="text-sm">
-                  <div className="text-muted">{i + 1}. {chainName(leg.chainId)} — {leg.role}</div>
-                  {url ? (
-                    <a href={url} target="_blank" rel="noopener noreferrer" className="font-mono text-xs text-accent hover:underline break-all">
-                      {leg.address}
-                    </a>
-                  ) : (
-                    <span className="font-mono text-xs break-all">{leg.address}</span>
-                  )}
-                </div>
-              );
-            })}
+            {opp.lockPath.map((leg, i) => (
+              <div key={i} className="text-sm">
+                <div className="text-muted">{i + 1}. {chainName(leg.chainId)} — {leg.role}</div>
+                <LegAddress chainId={leg.chainId} address={leg.address} />
+              </div>
+            ))}
           </Section>
 
           <p className="text-xs text-muted border-t border-border pt-4">
@@ -157,7 +166,7 @@ function OptimizeSection({ opp }: { opp: Opportunity }) {
 
   return (
     <Section title="Best trade size (small-capital)">
-      {loading && <p className="text-sm text-muted">Sweeping $25–$5k across live quotes…</p>}
+      {loading && <p className="text-sm text-muted">Sweeping $10–$5k across live quotes…</p>}
       {!loading && !data && <p className="text-sm text-muted">Couldn&apos;t size this route (one leg has no route).</p>}
       {!loading && data && (
         <>
@@ -204,6 +213,77 @@ function OptimizeSection({ opp }: { opp: Opportunity }) {
           </p>
         </>
       )}
+    </Section>
+  );
+}
+
+interface HistoryPoint { ts: number; grossSpreadPct: number; netUsd: number; tierUsd: number }
+
+/** Spread trajectory for this route (fetched on open) — a sparkline + persistence count so a real,
+ *  persistent edge is distinguishable from a one-quote artifact. */
+function HistorySection({ opp }: { opp: Opportunity }) {
+  const [state, setState] = useState<{ id: string; points: HistoryPoint[] } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetch(`/api/arb/history?id=${encodeURIComponent(opp.id)}&limit=100`)
+      .then((r) => r.json())
+      .then((d: { points?: HistoryPoint[] }) => alive && setState({ id: opp.id, points: d.points ?? [] }))
+      .catch(() => alive && setState({ id: opp.id, points: [] }));
+    return () => { alive = false; };
+  }, [opp.id]);
+
+  const loading = !state || state.id !== opp.id;
+  const points = loading ? [] : state.points;
+
+  if (loading) return <Section title="Spread history"><p className="text-sm text-muted">Loading…</p></Section>;
+  if (points.length < 2)
+    return <Section title="Spread history"><p className="text-sm text-muted">Not enough history yet — needs ≥2 scans of this route.</p></Section>;
+
+  const asc = [...points].reverse(); // oldest → newest for the chart
+  const vals = asc.map((p) => p.grossSpreadPct);
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const span = max - min || 1;
+  const W = 240;
+  const H = 40;
+  const y = (v: number) => H - ((v - min) / span) * H;
+  const path = asc.map((p, i) => `${((i / (asc.length - 1)) * W).toFixed(1)},${y(p.grossSpreadPct).toFixed(1)}`).join(" ");
+  const positive = points.filter((p) => p.grossSpreadPct > 0).length;
+
+  return (
+    <Section title="Spread history">
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="w-full h-10" aria-label="gross spread over time">
+        {min < 0 && max > 0 && (
+          <line x1="0" x2={W} y1={y(0)} y2={y(0)} stroke="currentColor" className="text-border" strokeWidth="0.5" />
+        )}
+        <polyline points={path} fill="none" stroke="currentColor" className="text-accent" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+      </svg>
+      <Row label="Positive spread">{positive} of last {points.length} scans</Row>
+      <Row label="Range (gross)">{min.toFixed(2)}% … {max.toFixed(2)}%</Row>
+    </Section>
+  );
+}
+
+/** Prefilled execution deep-links (bridge + per-leg swaps) built from the route's addresses + registry. */
+function ExecuteSection({ opp }: { opp: Opportunity }) {
+  const links = executeLinks(opp);
+  if (links.length === 0) return null;
+  return (
+    <Section title="Execute">
+      <div className="flex flex-col gap-1.5">
+        {links.map((l) => (
+          <a
+            key={l.url}
+            href={l.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex w-fit items-center gap-1 text-sm text-accent hover:underline"
+          >
+            {l.label} ↗
+          </a>
+        ))}
+      </div>
+      <p className="mt-1 text-xs text-muted">Prefilled — verify amounts before signing. Screener, not an executor.</p>
     </Section>
   );
 }
