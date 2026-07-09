@@ -47,13 +47,7 @@ export default function ArbitragePage() {
 
   const opportunities = data?.opportunities ?? [];
   const total = data?.total ?? 0;
-  // Fresh-vs-all-time context chip: the row count used to carry this signal by omission (stale rows were
-  // hidden); now that all-time rows show, say explicitly how many are inside the freshness gate.
   const gateMs = data?.gateMs;
-  const freshCount = useMemo(
-    () => (gateMs && gateMs > 0 ? opportunities.filter((o) => o.computedAt && Date.now() - o.computedAt <= gateMs).length : opportunities.length),
-    [opportunities, gateMs]
-  );
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   // Offer exactly the rungs the scanner actually probed (from the API), falling back before first load.
   const capitalTiers = data?.tiers ?? CAPITAL_TIERS_FALLBACK;
@@ -65,6 +59,13 @@ export default function ArbitragePage() {
     const val = sortKey === "net" ? (o: Opportunity) => o.edge.netUsdConservative : (o: Opportunity) => o.edge.grossSpreadPct;
     return [...list].sort((a, b) => val(b) - val(a));
   }, [opportunities, netPositiveOnly, sortKey]);
+  // Fresh-vs-all-time context chip: how many of the SHOWN tokens are inside the freshness gate. Must be
+  // derived from `displayed` (post the client Net-positive/sort filters), not the raw page — otherwise the
+  // count can exceed the tokens on screen (e.g. "3 tokens · 40 fresh") once Net-positive is toggled.
+  const freshCount = useMemo(
+    () => (gateMs && gateMs > 0 ? displayed.filter((o) => o.computedAt && Date.now() - o.computedAt <= gateMs).length : displayed.length),
+    [displayed, gateMs]
+  );
   // Chain selector options: the scanned-chain set (stable regardless of the active chain filter).
   const chainOptions = useMemo(
     () => (graph?.chainsScanned ?? []).map((id) => ({ id, name: chainName(id) })).sort((a, b) => a.name.localeCompare(b.name)),

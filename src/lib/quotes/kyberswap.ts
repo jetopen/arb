@@ -133,12 +133,19 @@ function deadQuote(internalChainId: number, tokenIn: string, tokenOut: string, a
 
 /**
  * SCAN face — matches the deBridge fetchDexQuote contract that scanUnit's transient/dead classification
- * depends on (scanner.ts catch → isTransientQuoteError):
- *  - 429/5xx → THROW QuoteHttpError (transient: 10-min retry, NOT the 6h dead-route penalty)
- *  - 4xx / ok-without-routeSummary → dead quote (amountOut "0" → genuine no-route, demote)
- *  - network/parse failure → rethrow (default-transient)
- * Never call this for a chain without a kyberSlug — that's a routing bug, so it fails loud rather than
- * silently dead-marking a scannable route.
+ * depends on (scanner.ts catch → isTransientQuoteError). The load-bearing rule: only a CLEANLY-PARSED
+ * response that Kyber itself answers as "no route" is DEAD; everything that smells systemic is TRANSIENT.
+ * A too-eager dead-classification is dangerous here — a Kyber outage would mass-demote every route for 6h
+ * AND, because dead != transient, would never trip the loop's transient-storm alarm (silent empty dashboard).
+ *  - 429 / 5xx → THROW QuoteHttpError → transient (isTransientQuoteError's 5xx/429 branch → 10-min retry)
+ *  - 403 / 408 / 409 (block / Cloudflare / timeout / conflict) OR an UNPARSEABLE body (json === null:
+ *    truncated stream, HTML interstitial) → THROW a PLAIN Error → transient via isTransientQuoteError's
+ *    DEFAULT-transient path. (Crucially NOT a QuoteHttpError: a QuoteHttpError with a non-5xx/429 status is
+ *    classified PERMANENT — quote-error.ts:34 — which would re-create the very 6h-demote this guards against.
+ *    deBridge lets the same res.json() SyntaxError propagate as a bare error, i.e. default-transient too.)
+ *  - a parsed 4xx (Kyber's structured 4008 route-not-found / 4011 token-not-found) OR a parsed 200 with no
+ *    routeSummary → dead quote (amountOut "0" → genuine no-route, 6h demote)
+ * Never call this for a chain without a kyberSlug — that's a routing bug, so it fails loud.
  */
 export async function fetchKyberScanQuote(
   internalChainId: number,
@@ -150,10 +157,15 @@ export async function fetchKyberScanQuote(
   if (!slug) throw new Error(`kyber scan quote requested for unsupported chain ${internalChainId}`);
   const { res, json } = await fetchKyberRoute(slug, tokenIn, tokenOut, amountIn);
   if (res.status === 429 || res.status >= 500) {
-    throw new QuoteHttpError(res.status, `kyber ${res.status} for chain ${internalChainId}`);
+    throw new QuoteHttpError(res.status, `kyber ${res.status} for chain ${internalChainId}`); // 5xx/429 → transient
   }
-  if (!res.ok || !json?.data?.routeSummary) {
-    return deadQuote(internalChainId, tokenIn, tokenOut, amountIn); // 4xx / no route → genuinely dead
+  if (res.status === 403 || res.status === 408 || res.status === 409 || json === null) {
+    // Systemic block/timeout or an unparseable body — NOT a per-route verdict. Plain Error → default-transient,
+    // so the route keeps its short-retry cadence and (when widespread) trips the storm alarm instead of vanishing.
+    throw new Error(`kyber transient ${res.status}${json === null ? " unparseable-body" : ""} for chain ${internalChainId}`);
+  }
+  if (!res.ok || !json.data?.routeSummary) {
+    return deadQuote(internalChainId, tokenIn, tokenOut, amountIn); // cleanly-parsed no-route → genuinely dead
   }
   return parseKyberRoute(json, { internalChainId, tokenIn, tokenOut });
 }

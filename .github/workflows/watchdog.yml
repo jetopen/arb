@@ -54,7 +54,15 @@ jobs:
             exit 0
           fi
 
-          code=$(curl -sS --max-time 30 -o body.json -w "%{http_code}" "$HEALTH_URL") || code=000
+          # DEBOUNCE a single transient blip (a slow response / one-off Supabase read hiccup is NOT a dead
+          # loop): probe up to 3× 20s apart; healthy if ANY probe is 200, unhealthy only if all fail. Keeps
+          # the same spirit as scan.yml's 5-tick storm gate — one flaky sample must not page.
+          code=000
+          for attempt in 1 2 3; do
+            code=$(curl -sS --max-time 20 -o body.json -w "%{http_code}" "$HEALTH_URL") || code=000
+            [ "$code" = "200" ] && break
+            [ "$attempt" -lt 3 ] && sleep 20
+          done
           age=$(jq -r '.lastScanAgeMs // empty' body.json 2>/dev/null || true)
           gate=$(jq -r '.gateMs // empty' body.json 2>/dev/null || true)
           sha=$(jq -r '.gitSha // "unknown"' body.json 2>/dev/null || echo unknown)
@@ -62,21 +70,25 @@ jobs:
           [ -n "$age" ] && agoM=$((age / 60000))
           [ -n "$gate" ] && gateM=$((gate / 60000))
 
-          # Previous completed run's conclusion — the dedup state. Empty on the first ever run.
-          prev=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "watchdog.yml" \
+          # Dedup state = the last SCHEDULED run's conclusion only. Scoping to --event schedule means a manual
+          # test_alert / workflow_dispatch (which concludes 'success') can't poison the outage state machine.
+          prev=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "watchdog.yml" --event schedule \
             --status completed --limit 1 --json conclusion -q '.[0].conclusion' || echo "")
-          echo "health=$code lastScanAge=${agoM}m gate=${gateM}m sha=$sha prevRun=${prev:-none}"
+          echo "health=$code lastScanAge=${agoM}m gate=${gateM}m sha=$sha prevScheduledRun=${prev:-none}"
 
           if [ "$code" = "200" ]; then
+            # Recovery ping only when we were definitely red (prev scheduled run failed).
             if [ "$prev" = "failure" ]; then
               post "🟢 arb scanner recovered — last scan ${agoM}m ago"
             fi
             exit 0
           fi
 
-          if [ "$prev" != "failure" ]; then
+          # Page ONLY on a clean transition from healthy (prev 'success' or first-ever). A prior 'failure'
+          # (already paged) or 'cancelled' (ambiguous — could have paged) stays silent to avoid duplicate reds.
+          if [ "$prev" = "success" ] || [ -z "$prev" ]; then
             post "🔴 arb scanner DOWN/stale — health HTTP $code, last scan ${agoM}m ago (gate ${gateM}m), sha $sha, https://arb-scanner-gamma.vercel.app/arbitrage"
           else
-            echo "still unhealthy - already alerted on a previous run, staying red without re-pinging"
+            echo "still unhealthy (prev scheduled='$prev') — staying red without re-pinging"
           fi
           exit 1

@@ -38,6 +38,33 @@ describe("fetchKyberScanQuote (scan face)", () => {
     expect((await fetchKyberScanQuote(56, "0xusdc", "0xtkn", "1")).amountOut).toBe("0");
   });
 
+  it("classifies a block/timeout status (403/408/409) as TRANSIENT, not a per-route dead verdict", async () => {
+    for (const s of [403, 408, 409]) {
+      stubFetch(s, { message: "blocked" });
+      const err = await fetchKyberScanQuote(56, "0xusdc", "0xtkn", "1").catch((e) => e);
+      // The load-bearing property is transient classification (NOT a QuoteHttpError, which for a 4xx would
+      // be treated PERMANENT and re-create the 6h mass-demote); a plain Error → default-transient.
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(QuoteHttpError);
+      expect(isTransientQuoteError(err)).toBe(true);
+    }
+  });
+
+  it("classifies a 2xx with an unparseable body as TRANSIENT — a network hiccup, NOT a dead route", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => {
+          throw new SyntaxError("Unexpected end of JSON input");
+        },
+      }) as unknown as Response)
+    );
+    const err = await fetchKyberScanQuote(42161, "0xusdc", "0xtkn", "1").catch((e) => e);
+    expect(isTransientQuoteError(err)).toBe(true);
+  });
+
   it("parses a good route with real USD fields", async () => {
     stubFetch(200, ROUTE_OK);
     const q = await fetchKyberScanQuote(56, "0xUSDC", "0xTKN", "25000000");

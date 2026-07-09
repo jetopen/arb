@@ -147,12 +147,21 @@ describe("normalizeScanQuote", () => {
     expect(priced.amountOutUsd).toBe(24.5);
   });
 
-  it("applies the slippage floor only when the source returned 0 (default 50, env-overridable, clamps garbage)", () => {
-    expect(normalizeScanQuote(q("kyberswap", { recommendedSlippageBps: 0 }), 56).recommendedSlippageBps).toBe(50);
-    expect(normalizeScanQuote(q("debridge", { recommendedSlippageBps: 80 }), 56).recommendedSlippageBps).toBe(80);
+  it("derives slippage = max(floor, priceImpactBps) when the source returned 0, capped; leaves a real rec untouched", () => {
+    // liquid pair (impact below the floor) → floor
+    expect(normalizeScanQuote(q("kyberswap", { recommendedSlippageBps: 0, priceImpactBps: 20 }), 56).recommendedSlippageBps).toBe(50);
+    // thin pair (impact above the floor) → route-specific impact, the whole point of the fix
+    expect(normalizeScanQuote(q("kyberswap", { recommendedSlippageBps: 0, priceImpactBps: 300 }), 56).recommendedSlippageBps).toBe(300);
+    // runaway impact on a near-dead pool → capped at 1000bps
+    expect(normalizeScanQuote(q("kyberswap", { recommendedSlippageBps: 0, priceImpactBps: 5000 }), 56).recommendedSlippageBps).toBe(1000);
+    // a source that DID recommend a slippage is never overwritten
+    expect(normalizeScanQuote(q("debridge", { recommendedSlippageBps: 80, priceImpactBps: 400 }), 56).recommendedSlippageBps).toBe(80);
+  });
+
+  it("honors the env floor override and clamps garbage (impact 0 → pure floor)", () => {
     process.env.ARB_SCAN_SLIPPAGE_FLOOR_BPS = "25";
-    expect(normalizeScanQuote(q("kyberswap", { recommendedSlippageBps: 0 }), 56).recommendedSlippageBps).toBe(25);
+    expect(normalizeScanQuote(q("kyberswap", { recommendedSlippageBps: 0, priceImpactBps: 0 }), 56).recommendedSlippageBps).toBe(25);
     process.env.ARB_SCAN_SLIPPAGE_FLOOR_BPS = "garbage";
-    expect(normalizeScanQuote(q("kyberswap", { recommendedSlippageBps: 0 }), 56).recommendedSlippageBps).toBe(50);
+    expect(normalizeScanQuote(q("kyberswap", { recommendedSlippageBps: 0, priceImpactBps: 0 }), 56).recommendedSlippageBps).toBe(50);
   });
 });

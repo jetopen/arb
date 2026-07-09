@@ -174,11 +174,16 @@ export class SupabaseStore implements Store {
       // all-stale rows the most RECENT wins (then gross) — the last-known state, not the best-ever gross.
       const rows = [...(fbData ?? [])];
       if (freshAfter != null) {
-        const isFresh = (r: any) => (r.computed_at >= freshAfter ? 1 : 0);
+        // Compare NUMERICALLY: r.computed_at is PostgREST's timestamptz ('+00:00', µs) while freshAfter is
+        // a JS toISOString ('Z', ms) — a raw string compare is format-mismatched near the cutoff. Recency
+        // between two same-format PostgREST strings is fine lexicographically, but parse both to be safe.
+        const freshMs = Date.parse(freshAfter);
+        const ms = (r: any) => Date.parse(r.computed_at);
+        const isFresh = (r: any) => (ms(r) >= freshMs ? 1 : 0);
         rows.sort(
           (a: any, b: any) =>
             isFresh(b) - isFresh(a) ||
-            (isFresh(a) === 0 ? (a.computed_at < b.computed_at ? 1 : a.computed_at > b.computed_at ? -1 : 0) : 0) ||
+            (isFresh(a) === 0 ? ms(b) - ms(a) : 0) || // both stale → most recent first
             b.gross_spread_pct - a.gross_spread_pct ||
             (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
         );

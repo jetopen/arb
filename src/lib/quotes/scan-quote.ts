@@ -34,13 +34,17 @@ function oneInchFallbackEnabled(internalChainId: number): boolean {
   return process.env.ARB_SCAN_1INCH_FALLBACK !== "false" && oneInchSupported(internalChainId);
 }
 
-/** Conservative-haircut floor for sources that return no slippage recommendation (Kyber/1inch return 0,
+/** Conservative-haircut FLOOR for sources that return no slippage recommendation (Kyber/1inch return 0,
  *  which would silently make netUsdConservative === netUsd). Clamped; default 50bps ≈ deBridge's typical
- *  recommendation for liquid pairs. */
+ *  recommendation for LIQUID pairs. Thin pairs get more via the route's own price impact (see below). */
 function slippageFloorBps(): number {
   const raw = Number(process.env.ARB_SCAN_SLIPPAGE_FLOOR_BPS);
   return Number.isFinite(raw) && raw >= 0 ? raw : 50;
 }
+
+/** Upper clamp so a near-dead pool's runaway impact can't produce an absurd haircut (a genuinely dead
+ *  route is already filtered by amountOut "0"; this bounds the merely-very-thin ones). */
+const MAX_DERIVED_SLIPPAGE_BPS = 1000;
 
 /**
  * PURE-ish (reads env + registry): normalize a non-deBridge scan quote so the edge math sees the same
@@ -49,7 +53,11 @@ function slippageFloorBps(): number {
  *      oracle-free: the USDC side's USD value is just its raw amount over the chain's base decimals
  *      (PER-CHAIN: BSC's base USDC is 18-dec, most others 6). Fixes 1inch (never returns USD) and the
  *      rare Kyber response with a missing/zero routeSummary USD.
- *  (b) slippage floor — see slippageFloorBps.
+ *  (b) slippage haircut — a source that returns no recommendation gets a ROUTE-SPECIFIC one:
+ *      max(floor, its own price impact), capped. deBridge (displaced primary) gave a per-route slippage;
+ *      a flat floor alone was strictly LESS conservative on thin pairs, so netUsdConservative could read
+ *      positive on a trade a proper haircut shows negative (the net-positive filter would wrongly pass it).
+ *      Impact scales with pool thinness, so it's a sound proxy for adverse movement between quote and fill.
  */
 export function normalizeScanQuote(q: DexQuote, internalChainId: number): DexQuote {
   const base = baseToken(internalChainId);
@@ -63,7 +71,10 @@ export function normalizeScanQuote(q: DexQuote, internalChainId: number): DexQuo
       out.amountOutUsd = Number(out.amountOut) / 10 ** base.decimals;
     }
   }
-  if (out.recommendedSlippageBps === 0) out.recommendedSlippageBps = slippageFloorBps();
+  if (out.recommendedSlippageBps === 0) {
+    const impact = Number.isFinite(out.priceImpactBps) ? Math.max(0, out.priceImpactBps) : 0;
+    out.recommendedSlippageBps = Math.min(MAX_DERIVED_SLIPPAGE_BPS, Math.max(slippageFloorBps(), Math.round(impact)));
+  }
   return out;
 }
 
