@@ -169,16 +169,36 @@ export class MemoryStore implements Store {
     // Spread screener: rank by the raw round-trip gross spread (the price gap), highest first; break
     // ties by id (code-unit order, mirroring the RPC's `order by …, id`) so the order — and the
     // per-token winner kept below — is deterministic.
-    list.sort((a, b) => b.edge.grossSpreadPct - a.edge.grossSpreadPct || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-    // One row per token (family): keep the highest-spread row per debridgeId. The list is already
-    // sorted by spread desc, so the first occurrence of each debridgeId is its best.
+    const byGross = (a: Opportunity, b: Opportunity) =>
+      b.edge.grossSpreadPct - a.edge.grossSpreadPct || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    list.sort(byGross);
+    // One row per token (family): keep the highest-spread row per debridgeId — FRESH-FIRST when
+    // freshBandMs is set (0017 parity): a row inside the band beats ANY older row of the same token, so
+    // a stale-but-flattering quote can't shadow the token's current data on the all-time dashboard view.
+    // Among ALL-STALE rows the pick is MOST-RECENT-first (then gross): a dead token's honest
+    // representative is its last-known state, not its best-ever gross (re-rank, not exclusion).
     if (filter.groupByToken) {
+      const freshCutoff =
+        filter.freshBandMs != null && Number.isFinite(filter.freshBandMs) && filter.freshBandMs > 0
+          ? Date.now() - filter.freshBandMs
+          : null;
+      if (freshCutoff != null) {
+        const isFresh = (o: Opportunity) => (o.computedAt >= freshCutoff ? 1 : 0);
+        list.sort(
+          (a, b) =>
+            isFresh(b) - isFresh(a) ||
+            (isFresh(a) === 0 ? b.computedAt - a.computedAt : 0) || // both stale → most recent first
+            byGross(a, b)
+        );
+      }
       const seen = new Set<string>();
       list = list.filter((o) => {
         if (seen.has(o.debridgeId)) return false;
         seen.add(o.debridgeId);
         return true;
       });
+      // Outward page order stays gross desc (parity with the RPC's unchanged `page` CTE).
+      if (freshCutoff != null) list.sort(byGross);
     }
     const total = list.length;
     const page = filter.page ?? 1;

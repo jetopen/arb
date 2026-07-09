@@ -467,3 +467,48 @@ describe("hot-lane dequeue (Fix 3)", () => {
     expect(new Set(ids).size).toBe(2); // no duplicate across hot + cold
   });
 });
+
+describe("MemoryStore fresh-first per-token pick (freshBandMs, 0017 parity)", () => {
+  const BAND = 4 * 60 * 60 * 1000; // 4h, mirroring the configured dashboard gate
+  const now = Date.now();
+  // PING scenario: same token, stale row is numerically "better" (-99.99 > -100) but 3 days old.
+  const staleBetter = () => opp("ping-stale", -99.99, { debridgeId: "0xping", computedAt: now - 3 * 24 * 60 * 60 * 1000 });
+  const freshWorse = () => opp("ping-fresh", -100, { debridgeId: "0xping", computedAt: now });
+
+  it("a fresh row beats ANY stale row of the same token when freshBandMs is set", async () => {
+    const s = new MemoryStore();
+    await s.upsertOpportunities([staleBetter(), freshWorse()]);
+    const { opportunities } = await s.topOpportunities({ groupByToken: true, freshBandMs: BAND });
+    expect(opportunities.map((o) => o.id)).toEqual(["ping-fresh"]);
+  });
+
+  it("without freshBandMs the pick stays pure max-gross (back-compat)", async () => {
+    const s = new MemoryStore();
+    await s.upsertOpportunities([staleBetter(), freshWorse()]);
+    const { opportunities } = await s.topOpportunities({ groupByToken: true });
+    expect(opportunities.map((o) => o.id)).toEqual(["ping-stale"]);
+  });
+
+  it("a token with ONLY stale rows returns its MOST RECENT row, not its best-ever gross (still shown — re-rank, not exclusion)", async () => {
+    const s = new MemoryStore();
+    // The flattering row (-60) is OLDER than the honest one (-90): last-known state wins the slot.
+    await s.upsertOpportunities([
+      opp("dead-newer", -90, { debridgeId: "0xdead", computedAt: now - 20 * 24 * 60 * 60 * 1000 }),
+      opp("dead-flattering", -60, { debridgeId: "0xdead", computedAt: now - 21 * 24 * 60 * 60 * 1000 }),
+    ]);
+    const { opportunities, total } = await s.topOpportunities({ groupByToken: true, freshBandMs: BAND });
+    expect(total).toBe(1);
+    expect(opportunities[0].id).toBe("dead-newer");
+  });
+
+  it("outward list order stays gross desc across fresh and stale winners", async () => {
+    const s = new MemoryStore();
+    await s.upsertOpportunities([
+      opp("live", 2, { debridgeId: "0xlive", computedAt: now }),
+      opp("fossil", 5, { debridgeId: "0xfossil", computedAt: now - 10 * 24 * 60 * 60 * 1000 }),
+    ]);
+    const { opportunities } = await s.topOpportunities({ groupByToken: true, freshBandMs: BAND });
+    // fossil (5%) still sorts above live (2%) in the page — fresh-first governs the per-token PICK only.
+    expect(opportunities.map((o) => o.id)).toEqual(["fossil", "live"]);
+  });
+});

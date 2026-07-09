@@ -249,6 +249,23 @@ describe("SupabaseStore.markScanned (fake-client contract)", () => {
     expect(transientUpd?.filters.in.vals).toEqual([wid("blip")]);
   });
 
+  it("topOpportunities(groupByToken) sends p_fresh_after only when freshBandMs is set (0017)", async () => {
+    const { client, calls } = makeFakeClient();
+    dbHolder.client = client;
+    const store = new SupabaseStore();
+
+    await store.topOpportunities({ groupByToken: true, freshBandMs: 4 * 60 * 60 * 1000 });
+    const withBand = calls.find((c) => c.rpc === "arb_top_opportunities_by_token");
+    expect(typeof withBand?.args.p_fresh_after).toBe("string"); // ISO cutoff
+    expect(Date.parse(withBand?.args.p_fresh_after)).toBeGreaterThan(Date.now() - 5 * 60 * 60 * 1000);
+
+    calls.length = 0;
+    await store.topOpportunities({ groupByToken: true });
+    const withoutBand = calls.find((c) => c.rpc === "arb_top_opportunities_by_token");
+    // Conditional-send: absent (not null) so a pre-0017 DB still matches the old signature.
+    expect("p_fresh_after" in (withoutBand?.args ?? {})).toBe(false);
+  });
+
   it("recordScanRun dispatches the 0016 RPC (insert + 14d inline prune) with mapped p_ params", async () => {
     const { client, calls } = makeFakeClient();
     dbHolder.client = client;

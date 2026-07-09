@@ -259,6 +259,12 @@ export interface OpportunityFilter {
   executableOnly?: boolean;
   /** Exclude opportunities whose computedAt is older than this many ms (freshness gate). */
   maxAgeMs?: number;
+  /** Fresh-first band (ms) for the groupByToken pick: rows within this window outrank ALL older rows
+   *  and compete on gross; among all-stale rows the MOST RECENT wins (a dead token's honest
+   *  representative is its last-known state, not its best-ever gross). Opt-in — unset keeps the pure
+   *  max-gross pick. NOT an exclusion: unlike maxAgeMs, stale rows still appear when a token has no
+   *  fresh row (the all-time dashboard view). */
+  freshBandMs?: number;
   /** Collapse to one row per token (family): keep the highest-spread row per debridgeId. */
   groupByToken?: boolean;
   page?: number;

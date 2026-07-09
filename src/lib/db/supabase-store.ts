@@ -115,6 +115,11 @@ export class SupabaseStore implements Store {
       filter.maxAgeMs != null && Number.isFinite(filter.maxAgeMs)
         ? new Date(Date.now() - filter.maxAgeMs).toISOString()
         : null;
+    // Fresh-first band for the per-token pick (0017): a re-RANK boundary, not an exclusion.
+    const freshAfter =
+      filter.freshBandMs != null && Number.isFinite(filter.freshBandMs) && filter.freshBandMs > 0
+        ? new Date(Date.now() - filter.freshBandMs).toISOString()
+        : null;
     const minSpread = filter.minSpreadPct != null && Number.isFinite(filter.minSpreadPct) ? filter.minSpreadPct : null;
     const chainId = filter.chainId != null && Number.isFinite(filter.chainId) ? Math.trunc(filter.chainId) : null;
     const tierUsd = filter.tierUsd != null && Number.isFinite(filter.tierUsd) ? Math.trunc(filter.tierUsd) : null;
@@ -146,6 +151,9 @@ export class SupabaseStore implements Store {
         p_offset: start,
       };
       if (filter.executableOnly) rpcArgs.p_executable_only = true;
+      // Same conditional-send pattern: omit p_fresh_after unless set, so a default query still matches
+      // the pre-0017 RPC signature (param-mismatch would trip the isMissingFunction fallback below).
+      if (freshAfter != null) rpcArgs.p_fresh_after = freshAfter;
       const { data, error } = await this.db.rpc("arb_top_opportunities_by_token", rpcArgs);
       if (!error) {
         // The RPC returns a single jsonb object { total, rows } so the exact distinct-token total
@@ -162,12 +170,31 @@ export class SupabaseStore implements Store {
         .order("id", { ascending: true })
         .limit(1000);
       if (fbErr) throw new Error(`topOpportunities: ${fbErr.message}`);
+      // Mirror the RPC's fresh-first pick (0017): within a token, a fresh row beats ANY stale row; among
+      // all-stale rows the most RECENT wins (then gross) — the last-known state, not the best-ever gross.
+      const rows = [...(fbData ?? [])];
+      if (freshAfter != null) {
+        const isFresh = (r: any) => (r.computed_at >= freshAfter ? 1 : 0);
+        rows.sort(
+          (a: any, b: any) =>
+            isFresh(b) - isFresh(a) ||
+            (isFresh(a) === 0 ? (a.computed_at < b.computed_at ? 1 : a.computed_at > b.computed_at ? -1 : 0) : 0) ||
+            b.gross_spread_pct - a.gross_spread_pct ||
+            (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+        );
+      }
       const seen = new Set<string>();
-      const grouped = (fbData ?? []).filter((r: any) => {
+      const grouped = rows.filter((r: any) => {
         if (seen.has(r.debridge_id)) return false;
         seen.add(r.debridge_id);
         return true;
       });
+      // Outward page order stays gross desc (parity with the RPC's unchanged `page` CTE).
+      if (freshAfter != null) {
+        grouped.sort(
+          (a: any, b: any) => b.gross_spread_pct - a.gross_spread_pct || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+        );
+      }
       return { opportunities: grouped.slice(start, start + take).map(rowToOpp), total: grouped.length };
     }
 

@@ -33,6 +33,9 @@ export async function GET(request: NextRequest) {
       // Keep only rows whose tx simulation proved the executable path (sim is opt-in via ARB_SIMULATE).
       executableOnly: searchParams.get("executableOnly") === "true",
       maxAgeMs: maxAgeMs > 0 ? maxAgeMs : undefined,
+      // Fresh-first pick boundary (0017): with the gate disabled (all-time view), a token that quoted
+      // recently must still show its CURRENT row, not a more flattering ancient one.
+      freshBandMs: configuredGateMs > 0 ? configuredGateMs : undefined,
       // Spread screener collapses to one row per token (highest spread per debridgeId).
       groupByToken: true,
       page: Math.max(1, finite("page") ?? 1),
